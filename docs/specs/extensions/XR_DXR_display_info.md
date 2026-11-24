@@ -1656,7 +1656,8 @@ displays --claims`), read by the process that sizes the instance (the app in-pro
 for IPC clients), leaves those screens out; a window on one of them is resampled from the union.
 
 A screen claimed **after** the instance was created whose modes do not fit is shown clamped and
-resampled until the app restarts (`dp mode list` reports its entries as `applies: restart_app`);
+resampled until the app restarts (`dp mode list` reports its entries as `applies: restart_app`;
+`dp mode set` stores such a choice and it is honoured at the next start);
 recreation is a later stage (ADR-066 C2).
 
 ### Example Code: Querying Display Mode Support and Requesting 2D

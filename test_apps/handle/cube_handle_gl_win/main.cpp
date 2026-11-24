@@ -1344,7 +1344,20 @@ static void RenderThreadFunc(
                 // ADR-041: submit the located count; eyeCount is what was
                 // rendered.
                 uint32_t submitViewCount = locatedCount;
-                if (g_l2dActive && g_panel1.swapchain != XR_NULL_HANDLE) {
+                if (!frameState.shouldRender) {
+                    // Not visible: xrEndFrame is still required (keeps the frame
+                    // loop paced) but with NO layers - the projection views were
+                    // never located this frame and would be rejected
+                    // (POSE_INVALID, #2802). Same as cube_handle_d3d11_win.
+                    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                    endInfo.displayTime = frameState.predictedDisplayTime;
+                    endInfo.environmentBlendMode = xr->runtimeSupportsAlphaBlend
+                        ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                    endInfo.layerCount = 0;
+                    endInfo.layers = nullptr;
+                    xrEndFrame(xr->session, &endInfo);
+                } else if (g_l2dActive && g_panel1.swapchain != XR_NULL_HANDLE) {
                     // #439 cases 2/3/4: manual projection + Local2D layer list
                     // (the shared EndFrame helpers don't carry the Local2D type).
                     XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};

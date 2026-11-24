@@ -91,7 +91,7 @@
   },
   {
    "id": "leia-conversion",
-   "name": "Leia conversion provider",
+   "name": "Leia conversion",
    "class": "conversion_provider",
    "registered_id": "leia-conversion",
    "publisher": "displayxr",
@@ -102,7 +102,7 @@
    "installable": true,
    "receipt": true,
    "can_uninstall": true,
-   "summary": "2D-to-3D conversion with Leia's NeurD module.",
+   "summary": "2D-to-3D conversion from the display maker.",
    "aliases": [
     "leia_conversion"
    ],
@@ -113,7 +113,7 @@
    "compatible": true,
    "prerequisites": [
     {
-     "name": "NeurD runtime (Leia)",
+     "name": "Leia conversion runtime",
      "met": true,
      "installable": false
     }

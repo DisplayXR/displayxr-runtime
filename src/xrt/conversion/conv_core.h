@@ -177,6 +177,28 @@ void
 conv_core_set_provider_enabled(struct conv_core *core, const char *provider_id, bool enabled);
 
 /*!
+ * The provider's registration row changed under a running core (discovery
+ * spec §3.8.1): take probe_order, supersedes and the binary key (path, size,
+ * mtime) from @p desc (conv_registry_rebind). Nothing else of @p desc is
+ * read; the host is not touched (a satellite proxy is rebound by its owner,
+ * conv_host_proxy_rebind). Follow with conv_core_provider_changed to
+ * re-describe. Returns true when the binary key changed.
+ */
+bool
+conv_core_rebind_provider(struct conv_core *core, const struct conv_provider_desc *desc);
+
+/*!
+ * The provider's registration row is gone / back (conv_registry_set_registered).
+ * The core cannot remove a provider: its slot, host and lanes stay until the
+ * service restarts. Gone means: no capability rows, never selected, hides
+ * nothing, not in the status snapshot. A live stream bound to it finds its
+ * capability absent and moves once to the next candidate, flagged
+ * `discontinuity` (spec §3.4 rule 5), as after any terminal failure.
+ */
+void
+conv_core_set_provider_registered(struct conv_core *core, const char *provider_id, bool registered);
+
+/*!
  * Replace the selection policy the core was created with (#2051 / #2029, the
  * #2025 item): `PreferredProvider\<task>` per task and `AllowResearchOnly`.
  * @p preferred has XRT_CONV_TASK_RESERVED_FIRST entries (NULL / "" = none;

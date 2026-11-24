@@ -27,7 +27,7 @@
 			"declared":	true,
 			"type":	"enum",
 			"default":	"anaglyph",
-			"help":	"the 3D kind mode 1 draws: anaglyph, sbs, squeezed|squeezed_sbs, quad (4 views: an inspection kind, stereo apps fall back to 2D), interlaced, blend; 2d|passthrough = anaglyph and start in 2D",
+			"help":	"the default 3D mode (slot 1) of a screen with no 'dp mode set' choice, applied live: Same as 2D (default|same_as_2d: one sharp full-resolution view, the default; 2d and passthrough are aliases of it, no longer 'anaglyph, start in 2D'), anaglyph, sbs, squeezed|squeezed_sbs, interlaced, blend, quad (4 views: declared only when it is the 3D mode at start-up, here or as the screen's 'dp mode set' choice, so switching TO quad applies at the next start; stereo apps fall back to 2D)",
 			"secret":	false,
 			"value":	"quad",
 			"source":	"user"
@@ -36,7 +36,7 @@
 			"declared":	true,
 			"type":	"bool",
 			"default":	"0",
-			"help":	"start in the 3D kind (mode 1) instead of 2D (mode 0); ignored with OUTPUT=2d",
+			"help":	"start in the 3D mode (mode 1) instead of 2D (mode 0); read at start",
 			"secret":	false,
 			"value":	null,
 			"source":	"absent"
@@ -45,7 +45,7 @@
 			"declared":	true,
 			"type":	"int",
 			"default":	"-1",
-			"help":	"pin the rendering mode for every app: 0 = 2D, 1 = the 3D kind OUTPUT names; -1 = off (other values are ignored)",
+			"help":	"pin the rendering mode for every app: 0 = 2D, 1 = the 3D mode OUTPUT names; -1 = off (other values are ignored)",
 			"secret":	false,
 			"value":	"1",
 			"source":	"user"

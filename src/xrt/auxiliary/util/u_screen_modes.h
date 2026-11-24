@@ -225,6 +225,32 @@ u_screen_modes_table_apply_choice(struct u_screen_mode_table *t, const char *cho
 }
 
 /*!
+ * At system creation: a stored choice @p choice that names a START-UP-ONLY
+ * entry of @p t joins the envelope for this instance (its flag cleared, the
+ * envelope recomputed), so @ref u_screen_modes_table_apply_choice can honour
+ * it - the per-screen twin of u_device_rendering_modes_promote_choice. Pure.
+ *
+ * @return true when an entry was promoted.
+ */
+static inline bool
+u_screen_modes_table_promote_choice(struct u_screen_mode_table *t, const char *choice)
+{
+	if (t == NULL || choice == NULL || choice[0] == '\0') {
+		return false;
+	}
+	for (uint32_t i = 1; i < t->count; i++) {
+		struct xrt_rendering_mode *m = &t->modes[i];
+		if ((m->mode_flags & XRT_RENDERING_MODE_FLAG_START_UP_ONLY) != 0 && u_rendering_mode_is_3d(m) &&
+		    m->view_count <= XRT_MAX_VIEWS && u_rendering_mode_matches_choice(m, choice)) {
+			m->mode_flags &= ~XRT_RENDERING_MODE_FLAG_START_UP_ONLY;
+			t->envelope_count = u_rendering_modes_envelope_of(t->modes, t->count);
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
  * The entry run-time slot @p slot (0 = 2D, 1 = the 3D mode) of @p t maps to;
  * NULL for an empty table. A table with no 3D entry answers slot 1 with entry 0.
  */

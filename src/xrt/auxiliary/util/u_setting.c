@@ -1201,6 +1201,35 @@ u_setting_get_mode_3d_for_screen(const char *key, char *buf, size_t cap, enum u_
 	return NULL;
 }
 
+uint64_t
+u_setting_user_stamp(void)
+{
+	char path[512];
+	if (!user_path(path, sizeof(path))) {
+		return 0;
+	}
+#ifdef XRT_OS_WINDOWS
+	WIN32_FILE_ATTRIBUTE_DATA fa;
+	if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
+		return 0;
+	}
+	const uint64_t t = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+	const uint64_t sz = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+	return t ^ (sz << 1) ^ 1ull;
+#else
+	struct stat st;
+	if (stat(path, &st) != 0) {
+		return 0;
+	}
+#if defined(__APPLE__)
+	const uint64_t ns = (uint64_t)st.st_mtimespec.tv_nsec;
+#else
+	const uint64_t ns = (uint64_t)st.st_mtim.tv_nsec;
+#endif
+	return ((uint64_t)st.st_mtime * 1000000000ull + ns) ^ ((uint64_t)st.st_size << 1) ^ 1ull;
+#endif
+}
+
 bool
 u_setting_user_set_mode_3d_for_screen(const char *key, const char *mode_name)
 {

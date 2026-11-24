@@ -82,10 +82,12 @@ display zones compose with it.
 **`quad` is an inspection kind, declared only at start-up (interim rule).** A 4-view entry in the
 declared list would make every `PRIMARY_MULTIVIEW_DXR` session locate 4 views on a box with no 3D
 display, and an app that submits only the active count would be refused at the default
-`DXR_UNDER_SUBMIT`. So Quad is part of the envelope only when `OUTPUT=quad` at start-up (then it
-behaves as before); otherwise it is listed last as start-up-only
-(`XRT_RENDERING_MODE_FLAG_START_UP_ONLY`), `dp mode list` reports it `applies: restart_app`, and
-`dp mode set quad` is refused. A stereo session (`PRIMARY_STEREO`, every legacy app, the engine
+`DXR_UNDER_SUBMIT`. So Quad is part of the envelope only when it is the 3D mode at start-up — `OUTPUT=quad`, or the
+screen's stored `dp mode set quad` choice (then it behaves as before); otherwise it is listed last
+as start-up-only (`XRT_RENDERING_MODE_FLAG_START_UP_ONLY`) and `dp mode list` reports it
+`applies: restart_app`. `dp mode set quad` then **stores** the choice and exits 0 ("stored; applies
+the next time the app starts"): running apps keep drawing their current 3D mode (`mode_3d.active`),
+`mode_3d.setting` is `quad`, and the next start declares Quad for that screen. A stereo session (`PRIMARY_STEREO`, every legacy app, the engine
 plug-ins, the browser) cannot fill four tiles: the session-begin floor drops it to 2D, a request
 for slot 1 is denied, and a live switch to Quad while it is in 3D floors it to 2D with an index
 1 → 0 event. A `PRIMARY_MULTIVIEW_DXR` session fills all four. To hold a stereo app in Quad anyway

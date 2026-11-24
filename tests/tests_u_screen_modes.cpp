@@ -562,3 +562,119 @@ TEST_CASE("screen modes: a manager follows the window from its desktop rect (the
 	CHECK_FALSE(vs.eff.valid);
 	u_screen_modes_clear();
 }
+
+#ifndef _WIN32
+#include "util/u_setting.h"
+#include <cstdlib>
+#include <unistd.h>
+
+namespace {
+//! The target layer's resolver (target_screen_modes_choice), over the real store.
+bool
+store_resolver(const char *key, char *out, size_t cap, uint32_t *src)
+{
+	enum u_setting_source s = U_SETTING_SOURCE_DEFAULT;
+	if (u_setting_get_mode_3d_for_screen(key, out, cap, &s) == nullptr) {
+		return false;
+	}
+	*src = s == U_SETTING_SOURCE_MACHINE ? XRT_STATUS_MODE_3D_SOURCE_MACHINE : XRT_STATUS_MODE_3D_SOURCE_USER;
+	return true;
+}
+} // namespace
+
+TEST_CASE("screen modes: ONE store write (the CLI's writer) is applied within the next second's re-read")
+{
+	char tmpl[] = "/tmp/dxr_sm_cfg_XXXXXX";
+	REQUIRE(mkdtemp(tmpl) != nullptr);
+	setenv("XDG_CONFIG_HOME", tmpl, 1);
+
+	u_screen_mode_table t[2] = {panel_table(1, 3840, 2160), sim_table(7, 2880, 1800)};
+	u_screen_modes_publish(t, 2);
+	u_screen_modes_set_choice_resolver(store_resolver);
+	const uint64_t s = 1000ull * 1000ull * 1000ull;
+	const uint64_t base = 100 * s;
+	(void)u_screen_modes_refresh_choices(base, true); // the poll that stamped the second
+	const uint64_t g0 = u_screen_modes_generation();
+
+	// Nothing written: inside the second, the re-read is throttled.
+	CHECK_FALSE(u_screen_modes_refresh_choices(base + s / 4, false));
+	REQUIRE(u_setting_user_set_mode_3d_for_screen("SIM-7", "anaglyph"));
+	// Written: the store's stamp moved, so the NEXT poll re-reads it, inside
+	// the second (no waiting out the throttle); the generation moves at once.
+	CHECK(u_screen_modes_refresh_choices(base + s / 2, false));
+	CHECK(u_screen_modes_generation() > g0);
+	u_screen_mode_table got;
+	REQUIRE(u_screen_modes_get(7, &got));
+	CHECK(got.slot1 == 2);
+
+	// The same value written again changes nothing.
+	REQUIRE(u_setting_user_set_mode_3d_for_screen("SIM-7", "anaglyph"));
+	CHECK_FALSE(u_screen_modes_refresh_choices(base + 3 * s, false));
+
+	// A re-publish (a hotplug sweep rebuilding every table from its plug-in)
+	// keeps the honoured choice: the target layer re-applies the store before
+	// publishing; a bare publish of driver-default tables is re-read here.
+	u_screen_mode_table fresh[2] = {panel_table(1, 3840, 2160), sim_table(7, 2880, 1800)};
+	u_screen_modes_publish(fresh, 2);
+	(void)u_screen_modes_refresh_choices(base + 5 * s, false);
+	REQUIRE(u_screen_modes_get(7, &got));
+	CHECK(got.slot1 == 2);
+
+	(void)u_setting_user_clear_mode_3d_per_screen();
+	u_screen_modes_set_choice_resolver(nullptr);
+	u_screen_modes_clear();
+	std::string f = std::string(tmpl) + "/displayxr/settings.json";
+	std::remove(f.c_str());
+	rmdir((std::string(tmpl) + "/displayxr").c_str());
+	rmdir(tmpl);
+	unsetenv("XDG_CONFIG_HOME");
+}
+#endif
+
+#include "util/u_status_snapshot.h"
+#include <cjson/cJSON.h>
+
+TEST_CASE("screen modes: a stored start-up-only choice is declared at the next start")
+{
+	u_screen_mode_table t = sim_table(7, 2880, 1800);
+	// Live: Quad is listed START_UP_ONLY and not honoured.
+	(void)u_screen_modes_table_apply_choice(&t, "quad", XRT_STATUS_MODE_3D_SOURCE_USER);
+	CHECK(t.slot1 == 1);
+	xrt_status_mode_3d st;
+	u_screen_modes_fill_status(&t, true, &st);
+	CHECK(st.choices[3].applies == XRT_STATUS_MODE_3D_APPLIES_RESTART_APP);
+	// At the next start (the initial publish): declared, honoured, applies now.
+	CHECK(u_screen_modes_table_promote_choice(&t, "quad"));
+	CHECK(t.envelope_count == 5);
+	CHECK(u_screen_modes_table_apply_choice(&t, "quad", XRT_STATUS_MODE_3D_SOURCE_USER));
+	CHECK(t.slot1 == 4);
+	u_screen_modes_fill_status(&t, true, &st);
+	CHECK(std::string(st.active) == "quad");
+	CHECK(st.choices[3].applies == XRT_STATUS_MODE_3D_APPLIES_NOW);
+	// Only start-up-only entries are promoted; nothing else changes.
+	CHECK_FALSE(u_screen_modes_table_promote_choice(&t, "anaglyph"));
+	CHECK_FALSE(u_screen_modes_table_promote_choice(&t, ""));
+}
+
+TEST_CASE("screen modes: a stored choice on a screen with no table stays visible, with a reason")
+{
+	xrt_status_mode_3d m;
+	std::memset(&m, 0, sizeof(m));
+	std::snprintf(m.setting, sizeof(m.setting), "%s", "anaglyph");
+	m.source = XRT_STATUS_MODE_3D_SOURCE_USER;
+	std::snprintf(m.reason, sizeof(m.reason), "%s", "this display's driver declares no 3D modes now");
+	cJSON *j = u_status_mode_3d_to_cjson(&m);
+	char *txt = cJSON_PrintUnformatted(j);
+	std::printf("no-table mode_3d JSON: %s\n", txt);
+	CHECK(std::string(txt) ==
+	      "{\"active\":null,\"setting\":\"anaglyph\",\"source\":\"user\",\"reason\":\"this "
+	      "display's driver declares no 3D modes now\",\"choices\":[]}");
+	cJSON_free(txt);
+	cJSON_Delete(j);
+
+	// A machine-wide choice reports source "machine" (the Dashboard's "for everyone on this PC").
+	m.source = XRT_STATUS_MODE_3D_SOURCE_MACHINE;
+	j = u_status_mode_3d_to_cjson(&m);
+	CHECK(std::string(cJSON_GetObjectItem(j, "source")->valuestring) == "machine");
+	cJSON_Delete(j);
+}

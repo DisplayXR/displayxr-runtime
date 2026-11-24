@@ -54,7 +54,7 @@ def write(path, doc):
 
 
 EDID = "display EDID 44048/16711 DELL_8K32 (high confidence)"
-NEURD = {"name": "NeurD runtime (Leia)", "met": True, "installable": False}
+CONV_RUNTIME = {"name": "Leia conversion runtime", "met": True, "installable": False}
 LEAP = {"name": "Ultraleap tracking software", "met": False, "installable": False,
         "info_url": "https://www.ultraleap.com/downloads/"}
 
@@ -70,10 +70,10 @@ v2 = {"schema": 2, "items": [
     item("open-conversion", "Open conversion provider", "conversion_provider", registered_id="open-conversion",
          available="0.3.0", summary="2D-to-3D conversion with open models. Needs no vendor software.",
          aliases=["conversion_open"], recommended=True, size=188743680),
-    item("leia-conversion", "Leia conversion provider", "conversion_provider", registered_id="leia-conversion",
+    item("leia-conversion", "Leia conversion", "conversion_provider", registered_id="leia-conversion",
          installed="0.5.0", available="0.5.0", state="current", receipt=True,
-         summary="2D-to-3D conversion with Leia's NeurD module.", aliases=["leia_conversion"], size=9437184,
-         prerequisites=[NEURD]),
+         summary="2D-to-3D conversion from the display maker.", aliases=["leia_conversion"], size=9437184,
+         prerequisites=[CONV_RUNTIME]),
     item("ultraleap", "Ultraleap hands", "input_provider", registered_id="ultraleap", available="1.2.0",
          summary="Hand tracking from an Ultraleap camera, as controllers and hand joints.", size=4194304,
          prerequisites=[LEAP]),
@@ -164,7 +164,7 @@ def licence(state, source=None, expires=None, message="", purchase_url="", key=F
 write("fixtures/conv-list.json", {
     "schema": 1, "source": "headless", "policy": {"policy_lock": False, "preferred": {}},
     "providers": [
-        provider("leia-conversion", "Leia conversion provider", "Leia, Inc.",
+        provider("leia-conversion", "Leia conversion", "Leia, Inc.",
                  licence("licensed", "hardware", message="Included with your Leia display")),
         provider("acme-depth", "Acme Depth Studio", "Acme",
                  licence("trial", "trial", "2026-12-21T00:00:00Z", "30-day trial, every feature unlocked",

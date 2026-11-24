@@ -124,6 +124,74 @@ conv_registry_set_usable(struct conv_registry *reg, uint32_t provider, bool usab
 }
 
 bool
+conv_registry_rebind(struct conv_registry *reg, uint32_t provider, const struct conv_provider_desc *desc)
+{
+	if (provider >= reg->provider_count || desc == NULL) {
+		return false;
+	}
+	struct conv_provider *p = &reg->providers[provider];
+	const char *path = desc->binary_path != NULL ? desc->binary_path : "";
+	char new_path[CONV_BINARY_PATH_MAX];
+	copy_str(new_path, sizeof(new_path), path);
+	const bool changed = strcmp(p->binary_path, new_path) != 0 || p->binary_size != desc->binary_size ||
+	                     p->binary_mtime != desc->binary_mtime;
+	p->probe_order = desc->probe_order;
+	copy_str(p->supersedes, sizeof(p->supersedes), desc->supersedes);
+	if (changed) {
+		copy_str(p->binary_path, sizeof(p->binary_path), path);
+		p->binary_size = desc->binary_size;
+		p->binary_mtime = desc->binary_mtime;
+		// The rows describe the previous binary until the new one answers.
+		p->rebound = p->described;
+	}
+	return changed;
+}
+
+void
+conv_registry_set_registered(struct conv_registry *reg, uint32_t provider, bool registered)
+{
+	if (provider >= reg->provider_count) {
+		return;
+	}
+	struct conv_provider *p = &reg->providers[provider];
+	if (registered) {
+		p->unregistered = false;
+		return;
+	}
+	p->unregistered = true;
+	p->enabled = false;
+	p->described = false;
+	p->rebound = false;
+	p->from_cache = false;
+	p->bad_descriptors = 0;
+	p->first_error = CONV_CAP_OK;
+	for (uint32_t i = reg->row_count; i > 0; i--) {
+		if (reg->rows[i - 1].provider == provider) {
+			remove_row(reg, i - 1);
+		}
+	}
+}
+
+enum conv_registration_action
+conv_registration_action(const struct conv_registration_change *c)
+{
+	enum conv_registration_action a = CONV_REGISTRATION_KEEP;
+	if (!c->known) {
+		a = c->present ? CONV_REGISTRATION_ADD : CONV_REGISTRATION_KEEP;
+	} else if (c->gone) {
+		a = c->present ? CONV_REGISTRATION_RESTORE : CONV_REGISTRATION_KEEP;
+	} else if (!c->present) {
+		a = CONV_REGISTRATION_REMOVE;
+	} else if (c->row_changed) {
+		a = CONV_REGISTRATION_REBIND;
+	}
+	if (a != CONV_REGISTRATION_KEEP && c->maintenance_held) {
+		return CONV_REGISTRATION_DEFER;
+	}
+	return a;
+}
+
+bool
 conv_registry_is_hidden(const struct conv_registry *reg, uint32_t provider)
 {
 	if (provider >= reg->provider_count) {
@@ -133,6 +201,9 @@ conv_registry_is_hidden(const struct conv_registry *reg, uint32_t provider)
 	for (uint32_t i = 0; i < reg->provider_count; i++) {
 		if (i == provider) {
 			continue; // a provider cannot hide itself
+		}
+		if (reg->providers[i].unregistered) {
+			continue; // its row is gone: it supersedes nothing
 		}
 		if (reg->providers[i].supersedes[0] != '\0' && strcmp(reg->providers[i].supersedes, id) == 0) {
 			return true;
@@ -297,6 +368,9 @@ conv_registry_describe(struct conv_registry *reg, uint32_t pi, uint64_t now_ns)
 		return -1;
 	}
 	struct conv_provider *p = &reg->providers[pi];
+	if (p->unregistered) {
+		return -1; // its row is gone: a late describe must not bring its rows back
+	}
 	const struct xrt_conversion_plugin_iface *iface = p->iface;
 	// A satellite provider is not loaded here: its host answers the [C] calls
 	// from the describe it got from the host process.
@@ -376,6 +450,7 @@ conv_registry_describe(struct conv_registry *reg, uint32_t pi, uint64_t now_ns)
 	uint32_t accepted = install_rows(reg, pi, caps, n, now_ns);
 	p->described = true;
 	p->from_cache = false;
+	p->rebound = false; // these are the bound binary's rows
 	p->generation = gen_after;
 	return (int32_t)accepted;
 }
@@ -546,8 +621,8 @@ conv_registry_cache_save(const struct conv_registry *reg, uint8_t *buf, size_t b
 	size_t need = CONV_CACHE_HEADER_SIZE;
 	uint32_t records = 0;
 	for (uint32_t pi = 0; pi < reg->provider_count; pi++) {
-		if (!reg->providers[pi].described) {
-			continue;
+		if (!reg->providers[pi].described || reg->providers[pi].rebound) {
+			continue; // (rebound: the rows are not this binary's)
 		}
 		need += CONV_CACHE_RECORD_HEAD + rows_of(reg, pi) * cap_size;
 		records++;
@@ -559,7 +634,7 @@ conv_registry_cache_save(const struct conv_registry *reg, uint8_t *buf, size_t b
 	size_t off = CONV_CACHE_HEADER_SIZE;
 	for (uint32_t pi = 0; pi < reg->provider_count; pi++) {
 		const struct conv_provider *p = &reg->providers[pi];
-		if (!p->described) {
+		if (!p->described || p->rebound) {
 			continue;
 		}
 		char id[CONV_ID_MAX];
@@ -668,7 +743,7 @@ conv_registry_cache_load(struct conv_registry *reg, const uint8_t *buf, size_t l
 			continue; // no longer registered
 		}
 		struct conv_provider *p = &reg->providers[pi];
-		if (p->described || strcmp(p->binary_path, path) != 0 || p->binary_size != bsize ||
+		if (p->unregistered || p->described || strcmp(p->binary_path, path) != 0 || p->binary_size != bsize ||
 		    p->binary_mtime != bmtime) {
 			continue; // live already, or a different binary: re-describe on demand
 		}

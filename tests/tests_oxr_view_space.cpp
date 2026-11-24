@@ -64,7 +64,12 @@
 #include "catch_amalgamated.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <cstdio>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -3112,4 +3117,180 @@ TEST_CASE("ADR-066 C1: a live 3D-mode switch sends the table-changed event, neve
 	CHECK_FALSE(more);
 
 	tear_down(rt);
+}
+
+/*
+ * ADR-047 Amendment 10 follow-up: ONE `dp mode set` write (the per-user
+ * settings file) is seen by a running in-process session within 2 s - the
+ * table-changed event arrives and the enumerate answers the new slot 1. The
+ * write is made the way the CLI makes it: one settings.json, keyed by the
+ * system-default screen's stable key, under a private XDG_CONFIG_HOME.
+ */
+TEST_CASE("ADR-047 A10: a single per-screen 3D-mode write reaches a running session within 2 s",
+          "[oxr][view_space][mode_table_write]")
+{
+	if (legacy_switch_set()) {
+		SUCCEED("legacy process");
+		return;
+	}
+#ifdef _WIN32
+	SUCCEED("the per-user store is %LOCALAPPDATA% on Windows; this arm runs on POSIX");
+#else
+	char dir_tmpl[] = "/tmp/dxr_a10_cfg_XXXXXX";
+	const char *cfg = mkdtemp(dir_tmpl);
+	REQUIRE(cfg != nullptr);
+	const char *old_cfg = getenv("XDG_CONFIG_HOME");
+	const std::string saved = old_cfg != nullptr ? old_cfg : "";
+	setenv("XDG_CONFIG_HOME", cfg, 1);
+
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	auto enumerate = rt.fn<PFN_xrEnumerateDisplaysDXR>("xrEnumerateDisplaysDXR");
+	uint32_t n = 0;
+	std::string key;
+	std::string plugin;
+	if (enumerate != nullptr && XR_SUCCEEDED(enumerate(rt.instance, rt.system, 0, &n, nullptr)) && n > 0) {
+		std::vector<XrDisplayStableKeyDXR> keys(n, {XR_TYPE_DISPLAY_STABLE_KEY_DXR});
+		std::vector<XrDisplayDXR> d(n, {XR_TYPE_DISPLAY_DXR});
+		for (uint32_t i = 0; i < n; i++) {
+			d[i].next = &keys[i];
+		}
+		if (XR_SUCCEEDED(enumerate(rt.instance, rt.system, n, &n, d.data()))) {
+			key = keys[0].key;
+			plugin = d[0].vendorPluginId;
+		}
+	}
+	const std::vector<XrDisplayRenderingModeInfoDXR> before = rt.rendering_modes();
+	if (key.empty() || plugin != "sim-display" || before.size() != 2 ||
+	    std::string(before[1].modeName) == "Cropped SBS") {
+		WARN("system-default screen key '" << key << "', plug-in '" << plugin << "' - arm inert");
+		SUCCEED("not a keyed sim-display screen");
+		tear_down(rt);
+		setenv("XDG_CONFIG_HOME", saved.c_str(), 1);
+		return;
+	}
+	(void)rt.drain_events();
+
+	const std::string dirpath = std::string(cfg) + "/displayxr";
+	mkdir(dirpath.c_str(), 0700);
+	{
+		FILE *f = fopen((dirpath + "/settings.json").c_str(), "w");
+		REQUIRE(f != nullptr);
+		fprintf(f, "{\"mode_3d_per_screen\": {\"%s\": \"cropped_sbs\"}}\n", key.c_str());
+		fclose(f);
+	}
+	const auto t0 = std::chrono::steady_clock::now();
+	bool seen = false;
+	double seen_s = 0.0;
+	for (int i = 0; i < 40 && !seen; i++) { // 2 s
+		for (const XrEventDataBuffer &ev : rt.drain_events()) {
+			if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR) {
+				seen = true;
+				seen_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			}
+		}
+		if (!seen) {
+			sleep_ms(50);
+		}
+	}
+	const std::vector<XrDisplayRenderingModeInfoDXR> after = rt.rendering_modes();
+	INFO("table-changed after " << seen_s << " s");
+	CHECK(seen);
+	REQUIRE(after.size() == 2);
+	CHECK(std::string(after[1].modeName) == "Cropped SBS");
+
+	tear_down(rt);
+	remove((dirpath + "/settings.json").c_str());
+	rmdir(dirpath.c_str());
+	rmdir(cfg);
+	if (old_cfg != nullptr) {
+		setenv("XDG_CONFIG_HOME", saved.c_str(), 1);
+	} else {
+		unsetenv("XDG_CONFIG_HOME");
+	}
+#endif
+}
+
+TEST_CASE("ADR-047 A10: a stored start-up-only 3D mode (Quad) is declared at the next start",
+          "[oxr][view_space][mode_table_next_start]")
+{
+	if (legacy_switch_set()) {
+		SUCCEED("legacy process");
+		return;
+	}
+#ifdef _WIN32
+	SUCCEED("the per-user store is %LOCALAPPDATA% on Windows; this arm runs on POSIX");
+#else
+	char dir_tmpl[] = "/tmp/dxr_a10_cfg_XXXXXX";
+	const char *cfg = mkdtemp(dir_tmpl);
+	REQUIRE(cfg != nullptr);
+	const char *old_cfg = getenv("XDG_CONFIG_HOME");
+	const std::string saved = old_cfg != nullptr ? old_cfg : "";
+	setenv("XDG_CONFIG_HOME", cfg, 1);
+
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	auto enumerate = rt.fn<PFN_xrEnumerateDisplaysDXR>("xrEnumerateDisplaysDXR");
+	uint32_t n = 0;
+	std::string key;
+	std::string plugin;
+	if (enumerate != nullptr && XR_SUCCEEDED(enumerate(rt.instance, rt.system, 0, &n, nullptr)) && n > 0) {
+		std::vector<XrDisplayStableKeyDXR> keys(n, {XR_TYPE_DISPLAY_STABLE_KEY_DXR});
+		std::vector<XrDisplayDXR> d(n, {XR_TYPE_DISPLAY_DXR});
+		for (uint32_t i = 0; i < n; i++) {
+			d[i].next = &keys[i];
+		}
+		if (XR_SUCCEEDED(enumerate(rt.instance, rt.system, n, &n, d.data()))) {
+			key = keys[0].key;
+			plugin = d[0].vendorPluginId;
+		}
+	}
+	const std::vector<XrDisplayRenderingModeInfoDXR> before = rt.rendering_modes();
+	if (key.empty() || plugin != "sim-display" || before.size() != 2 ||
+	    std::string(before[1].modeName) == "Cropped SBS") {
+		WARN("system-default screen key '" << key << "', plug-in '" << plugin << "' - arm inert");
+		SUCCEED("not a keyed sim-display screen");
+		tear_down(rt);
+		setenv("XDG_CONFIG_HOME", saved.c_str(), 1);
+		return;
+	}
+	tear_down(rt);
+
+	const std::string dirpath = std::string(cfg) + "/displayxr";
+	mkdir(dirpath.c_str(), 0700);
+	{
+		FILE *f = fopen((dirpath + "/settings.json").c_str(), "w");
+		REQUIRE(f != nullptr);
+		fprintf(f, "{\"mode_3d_per_screen\": {\"%s\": \"quad\"}}\n", key.c_str());
+		fclose(f);
+	}
+	// The next start honours it: Quad is declared, is slot 1, and the located
+	// view count covers it (as with OUTPUT=quad at start).
+	Runtime rt2;
+	REQUIRE(bring_up(rt2, opt));
+	const std::vector<XrDisplayRenderingModeInfoDXR> after = rt2.rendering_modes();
+	REQUIRE(after.size() == 2);
+	CHECK(std::string(after[1].modeName) == "Quad");
+	CHECK(after[1].viewCount == 4);
+	CHECK(rt2.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) >= 4);
+	tear_down(rt2);
+	remove((dirpath + "/settings.json").c_str());
+	rmdir(dirpath.c_str());
+	rmdir(cfg);
+	if (old_cfg != nullptr) {
+		setenv("XDG_CONFIG_HOME", saved.c_str(), 1);
+	} else {
+		unsetenv("XDG_CONFIG_HOME");
+	}
+#endif
 }

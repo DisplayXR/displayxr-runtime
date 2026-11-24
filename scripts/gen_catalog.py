@@ -882,8 +882,10 @@ V2_ITEMS = {
         "id": "leia-conversion",
         "class": "conversion_provider",
         "registered_id": "leia-conversion",
-        "name": "Leia conversion provider",
-        "summary": "2D-to-3D conversion with Leia's NeurD module.",
+        # User-facing strings name neither the vendor's converter technology nor
+        # how it works: the item, its summary and its prerequisite are plain.
+        "name": "Leia conversion",
+        "summary": "2D-to-3D conversion from the display maker.",
         # Declared and detected only (spec § Requires): NeurD has its own
         # installer, licence and update channel; DisplayXR never fetches it.
         # Facts confirmed with the provider's maintainers and read from its code
@@ -911,7 +913,7 @@ V2_ITEMS = {
         "external": [
             {
                 "kind": "external",
-                "name": "NeurD runtime (Leia)",
+                "name": "Leia conversion runtime",
                 "min_version": "0.4.6",
                 "detect": [
                     {"kind": "registry_sz_min", "key": "HKLM\\SOFTWARE\\LeiaInc\\NeurD",

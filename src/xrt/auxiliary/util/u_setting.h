@@ -244,6 +244,15 @@ u_setting_get_mode_3d_for_screen(const char *key, char *buf, size_t cap, enum u_
 bool
 u_setting_user_set_mode_3d_for_screen(const char *key, const char *mode_name);
 
+/*!
+ * A cheap stamp of the per-user settings file (its modification time and size,
+ * mixed; 0 when it does not exist). A poller that re-reads the store on a timer
+ * compares it first, so a write is honoured at the next poll instead of after
+ * the rest of its throttle interval (ADR-047 Amendment 10). One stat, no read.
+ */
+uint64_t
+u_setting_user_stamp(void);
+
 //! Remove every per-user per-screen 3D mode. Absent is success.
 bool
 u_setting_user_clear_mode_3d_per_screen(void);

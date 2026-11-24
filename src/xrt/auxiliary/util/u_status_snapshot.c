@@ -233,6 +233,11 @@ u_status_mode_3d_to_cjson(const struct xrt_status_mode_3d *m3)
 		cJSON_AddNullToObject(mo, "setting");
 	}
 	cJSON_AddStringToObject(mo, "source", u_status_mode_3d_source_str(m3->source));
+	if (m3->reason[0] != '\0') {
+		cJSON_AddStringToObject(mo, "reason", m3->reason);
+	} else {
+		cJSON_AddNullToObject(mo, "reason");
+	}
 	cJSON *ch = cJSON_AddArrayToObject(mo, "choices");
 	for (uint32_t i = 0; m3->valid && i < m3->choice_count && i < XRT_STATUS_MAX_MODE_3D_CHOICES; i++) {
 		const struct xrt_status_mode_3d_choice *c = &m3->choices[i];

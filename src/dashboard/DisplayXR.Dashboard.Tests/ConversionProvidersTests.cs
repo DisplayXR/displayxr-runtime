@@ -73,11 +73,14 @@ public class ConversionProvidersTests
         var sec = Components.Build(s, null).Single(c => c.Id == "conversion_providers");
         Assert.Equal(2, sec.Count);
         Assert.Equal(0, sec.Connected); // the selected task is WARMING, not READY
-        Assert.Contains("in use for 1 task", sec.ConnectedLine);
+        Assert.Equal($"2 installed{StatusText.Sep}in use for 1 task", sec.ConnectedLine); // "0 ready" is never printed
 
         var lift = sec.Items[0];
-        Assert.Equal("Display plug-in lift slots (legacy adapter)", lift.Name);
-        Assert.Contains(lift.Lines, l => l.StartsWith("views-mono: warming 50%") && l.Contains("selected") && l.Contains("1 streams"));
+        // The built-in adapter has a plain name; its registered name is a line of Details.
+        Assert.Equal("Converter in the display driver", lift.Name);
+        Assert.Contains(("Registered name", "Display plug-in lift slots (legacy adapter)"), lift.DetailFacts);
+        Assert.Contains(lift.Lines, l => l.StartsWith("3D from 2D video and photos: warming 50%") && l.Contains("selected") && l.Contains("1 streams")
+                                         && l.EndsWith("id views-mono")); // plain words first, the id last
         Assert.Contains(lift.Lines, l => l.Contains("licence: grandfathered"));
 
         var sim = sec.Items[1];

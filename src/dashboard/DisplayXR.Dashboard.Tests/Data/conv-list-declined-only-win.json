@@ -1,0 +1,52 @@
+{
+ "schema": 1,
+ "source": "headless",
+ "generation": {
+  "conversion": 0,
+  "status": 0
+ },
+ "providers": [
+  {
+   "id": "sim-conversion",
+   "name": "DisplayXR Sim Conversion",
+   "vendor": "DisplayXR",
+   "version": "2.70.4",
+   "load": "PROBE_DECLINED",
+   "binary": "C:\\Program Files\\DisplayXR\\Runtime\\plugins\\DisplayXR-SimConversion.dll",
+   "abi": 0,
+   "probe_order": 250,
+   "hosting": "in_service",
+   "status": "UNKNOWN",
+   "hint": "probe returned -17",
+   "enabled": true,
+   "fallback": false,
+   "hidden": false,
+   "licence_exempt": false,
+   "research_opt_in": false,
+   "described": false,
+   "host_pid": 0,
+   "restarts": 0,
+   "last_exit_code": 0,
+   "adapter_luid": null,
+   "backend": "",
+   "vram_used_mb": 0,
+   "licence_class": "UNKNOWN",
+   "licence_spdx": "",
+   "cap_count": 0,
+   "bad_descriptors": 0,
+   "descriptor_error": null,
+   "provenance": "signed",
+   "provenance_reason": "",
+   "signer": "DisplayXR",
+   "enabled_source": "default",
+   "built_in": false
+  }
+ ],
+ "tasks": [],
+ "warnings": [],
+ "policy": {
+  "policy_lock": false,
+  "allow_research_only": false,
+  "preferred": {}
+ }
+}

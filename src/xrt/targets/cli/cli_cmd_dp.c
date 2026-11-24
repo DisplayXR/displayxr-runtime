@@ -992,12 +992,18 @@ cmd_mode_set(const char *name, const char *screen, bool machine)
 		free(snap);
 		return 1;
 	}
-	if (pick->applies != XRT_STATUS_MODE_3D_APPLIES_NOW) {
+	if (pick->applies == XRT_STATUS_MODE_3D_APPLIES_NOT_SUPPORTED) {
 		P("FAIL: '%s' cannot apply on screen '%s' (%s%s%s) — nothing written.\n", pick->name, sc->key,
 		  u_status_mode_3d_applies_str(pick->applies), pick->reason[0] != '\0' ? ": " : "", pick->reason);
 		free(snap);
 		return 1;
 	}
+	// restart_app (ADR-047 Amendment 10): the label is true - the choice is
+	// STORED and honoured the next time the app (and the service) starts; the
+	// running ones keep drawing what they draw now.
+	const bool next_start = pick->applies == XRT_STATUS_MODE_3D_APPLIES_RESTART_APP;
+	char next_reason[160];
+	(void)snprintf(next_reason, sizeof(next_reason), "%s", pick->reason);
 	char key[TARGET_SCREEN_KEY_MAX];
 	(void)snprintf(key, sizeof(key), "%s", sc->key);
 	char label[32];
@@ -1019,6 +1025,12 @@ cmd_mode_set(const char *name, const char *screen, bool machine)
 			return 1;
 		}
 		P("3D mode set: screen '%s' -> '%s' (%s).\n", key, stored, label);
+	}
+	if (next_start) {
+		P("Stored; applies the next time the app starts (and the service, for apps attached to it)%s%s. "
+		  "Running apps keep their current 3D mode.\n",
+		  next_reason[0] != '\0' ? ": " : "", next_reason);
+		return 0;
 	}
 	poke_service_ex(true);
 	return 0;
@@ -1107,7 +1119,8 @@ print_usage(void)
 	P("                                the driver's declared list (name, label, views, tracked, applies).\n");
 	P("  mode set <name> --screen <key> [--machine]\n");
 	P("                                The screen's 3D slot = <name>; applies LIVE (~1 s), per user by\n");
-	P("                                default. Refused, with the reason, when it cannot apply.\n");
+	P("                                default. A restart_app choice is stored and applies at the next\n");
+	P("                                app start; a not_supported one is refused, with the reason.\n");
 	P("  mode reset --screen <key>|all [--machine]\n");
 	P("                                Back to the driver's default 3D mode (sim-display: OUTPUT).\n");
 	P("A running service re-probes at once (secondary screens follow; the primary at the next session).\n");

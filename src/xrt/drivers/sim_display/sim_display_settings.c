@@ -50,10 +50,11 @@ static const struct knob g_knobs[] = {
     // (mode 1) maps to. It applies LIVE (the runtime polls it); mode 0 is
     // always full-screen 2D and not configurable.
     {{"OUTPUT", XRT_COMPONENT_SETTING_TYPE_ENUM, "default",
-      "the 3D mode (slot 1), applied live: default|same_as_2d (one sharp full-resolution view, the default; "
-      "2d|passthrough are aliases), anaglyph, sbs, squeezed|squeezed_sbs, interlaced, blend, quad (4 views: "
-      "declared only when selected at start-up, so switching TO quad applies at the next start; stereo apps "
-      "fall back to 2D)"},
+      "the default 3D mode (slot 1) of a screen with no 'dp mode set' choice, applied live: Same as 2D "
+      "(default|same_as_2d: one sharp full-resolution view, the default; 2d and passthrough are aliases of it, "
+      "no longer 'anaglyph, start in 2D'), anaglyph, sbs, squeezed|squeezed_sbs, interlaced, blend, quad (4 "
+      "views: declared only when it is the 3D mode at start-up, here or as the screen's 'dp mode set' choice, so "
+      "switching TO quad applies at the next start; stereo apps fall back to 2D)"},
      "OUTPUT"},
     {{"START_3D", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
       "start in the 3D mode (mode 1) instead of 2D (mode 0); read at start"},
