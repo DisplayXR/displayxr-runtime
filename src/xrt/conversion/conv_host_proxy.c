@@ -294,6 +294,11 @@ struct proxy
 	uint64_t raised_terminal_at;
 	uint64_t next_maintenance_ns;
 	bool maintenance_held; //!< the last probe's answer (logged on change)
+	/*! #2793: no spawn until the owner re-read the provider's row (it changed
+	 *  or went away under the maintenance mutex, or it is gone). Folded into
+	 *  the supervisor's maintenance gate. */
+	bool reg_pending;
+	uint32_t reg_gen; //!< bumped by every owner write of reg_pending (a late "stale" answer loses)
 	/*! #2798: the exit code of the last host start the supervisor latched as a
 	 *  terminal refusal (16 = probe declined, 10, 11, ...); 0 = none. Kept
 	 *  across a retry, cleared when a host comes up or the registration is
@@ -1463,6 +1468,50 @@ maintenance_probe(struct proxy *p)
 #endif
 }
 
+/*!
+ * #2793 (discovery spec §3.8.1): the supervisor wants to spawn. Ask the owner
+ * whether the provider's registration is still the one this proxy is bound
+ * to, so the spawn and the owner's rescan decide on the same row: an
+ * uninstaller (or an installer) changes the row under the maintenance mutex,
+ * and this thread sees the release before the owner's watch thread has
+ * re-read anything. Not current: the spawn is taken back (not an exit, no
+ * accounting) and nothing spawns until the owner re-read the row
+ * (conv_host_proxy_rebind / conv_host_proxy_set_registration_pending).
+ * Supervisor thread, no lock held. One registry read per host start.
+ */
+static bool
+registration_allows_spawn(struct proxy *p)
+{
+	if (p->cfg.registration_current == NULL) {
+		return true;
+	}
+	char binary[sizeof(p->provider_binary)];
+	os_mutex_lock(&p->m);
+	memcpy(binary, p->provider_binary, sizeof(binary));
+	const uint32_t gen = p->reg_gen;
+	os_mutex_unlock(&p->m);
+	if (p->cfg.registration_current(p->cfg.registration_ud, p->provider_id, binary)) {
+		return true;
+	}
+	os_mutex_lock(&p->m);
+	conv_supervisor_spawn_withheld(&p->sup);
+	// An owner write that landed during the question (a rebind, a "row
+	// re-read") is newer than the answer: the next pass asks again.
+	const bool hold = gen == p->reg_gen;
+	if (hold) {
+		p->reg_pending = true;
+	}
+	conv_supervisor_set_maintenance(&p->sup, p->maintenance_held || p->reg_pending);
+	os_mutex_unlock(&p->m);
+	if (hold) {
+		U_LOG_W(
+		    "[conv:%s] host spawn withheld: the registration is not the one this host was bound to (%s); "
+		    "waiting for it to be re-read",
+		    p->provider_id, binary);
+	}
+	return false;
+}
+
 static void *
 sup_main(void *ptr)
 {
@@ -1526,7 +1575,8 @@ sup_main(void *ptr)
 			os_mutex_lock(&p->m);
 			const bool changed = held != p->maintenance_held;
 			p->maintenance_held = held;
-			conv_supervisor_set_maintenance(&p->sup, held);
+			// #2793: a spawn withheld on the registration stays withheld.
+			conv_supervisor_set_maintenance(&p->sup, held || p->reg_pending);
 			p->next_maintenance_ns = t + PX_MAINTENANCE_POLL_NS;
 			os_mutex_unlock(&p->m);
 			if (changed) {
@@ -1560,6 +1610,9 @@ sup_main(void *ptr)
 
 		switch (a) {
 		case CONV_SUP_ACTION_SPAWN: {
+			if (!registration_allows_spawn(p)) {
+				continue;
+			}
 			int32_t code = CONV_SUP_EXIT_SPAWN_FAILED;
 			const bool ok = do_spawn(p, &code);
 			const bool started = ok || code != CONV_SUP_EXIT_SPAWN_FAILED;
@@ -3116,6 +3169,10 @@ conv_host_proxy_rebind(struct conv_host *h, const char *provider_binary, bool re
 	// #2798: what the previous binary's last start reported (its probe
 	// declined, ...) says nothing about this one.
 	p->load_failure = 0;
+	// #2793: the row was re-read; a spawn held on it may go (mutex permitting).
+	p->reg_pending = false;
+	p->reg_gen++;
+	conv_supervisor_set_maintenance(&p->sup, p->maintenance_held);
 	// A host still up is running the previous binary (Restart Manager did not
 	// reach it): the supervisor thread ends it as closed for update -- the
 	// adapter-change path (no backoff, no crash accounting, respawn owed).
@@ -3128,6 +3185,34 @@ conv_host_proxy_rebind(struct conv_host *h, const char *provider_binary, bool re
 	U_LOG_W("[conv:%s] registration rebound: the next host spawn loads %s%s", p->provider_id, next,
 	        alive ? "; closing the host still running the previous binary (closed for update)" : "");
 	return true;
+}
+
+void
+conv_host_proxy_set_registration_pending(struct conv_host *h, bool pending)
+{
+	struct proxy *p = px(h);
+	os_mutex_lock(&p->m);
+	const bool changed = p->reg_pending != pending;
+	p->reg_pending = pending;
+	p->reg_gen++;
+	conv_supervisor_set_maintenance(&p->sup, p->maintenance_held || pending);
+	os_cond_broadcast(&p->cond);
+	os_mutex_unlock(&p->m);
+	if (changed) {
+		U_LOG_W("[conv:%s] registration %s", p->provider_id,
+		        pending ? "is not current: no host spawn until it is re-read"
+		                : "re-read: host spawns may resume");
+	}
+}
+
+bool
+conv_host_proxy_registration_pending(struct conv_host *h)
+{
+	struct proxy *p = px(h);
+	os_mutex_lock(&p->m);
+	const bool pending = p->reg_pending;
+	os_mutex_unlock(&p->m);
+	return pending;
 }
 
 void

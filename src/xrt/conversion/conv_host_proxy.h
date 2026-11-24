@@ -134,6 +134,22 @@ struct conv_host_proxy_config
 	 *  OS substitute their own. Called on the supervisor thread, no lock held. */
 	bool (*maintenance_held)(void *ud, const char *provider_id);
 	void *maintenance_ud;
+
+	/*! #2793 (discovery spec §3.8.1): is the provider's registration still the
+	 *  one this proxy is bound to? Asked before EVERY host spawn (one registry
+	 *  read per start), so the spawn and the owner's rescan decide on the same
+	 *  row: an installer or an uninstaller changes the row while it holds the
+	 *  maintenance mutex, and the supervisor sees the release before the
+	 *  owner's rescan has run. false = the row changed or is gone: the spawn
+	 *  is taken back (no host on the binary that is leaving, no crash
+	 *  accounting) and nothing spawns until the owner has re-read the row --
+	 *  conv_host_proxy_rebind, or
+	 *  conv_host_proxy_set_registration_pending(h, false). @p provider_binary
+	 *  is the path the spawn would pass. NULL = always current. Called on the
+	 *  supervisor thread, no lock held; it must not call back into the
+	 *  proxy. */
+	bool (*registration_current)(void *ud, const char *provider_id, const char *provider_binary);
+	void *registration_ud;
 };
 
 //! Default (and floor) of conv_host_proxy_config::connect_timeout_ms.
@@ -190,6 +206,22 @@ conv_host_proxy_config_changed(struct conv_host *h);
  */
 bool
 conv_host_proxy_rebind(struct conv_host *h, const char *provider_binary, bool replaced);
+
+/*!
+ * #2793: hold (true) or release (false) host spawns on the provider's
+ * registration, independently of the maintenance mutex. The owner sets it
+ * when the row is gone (an uninstalled provider's host is never started) and
+ * clears it once it has re-read a row that is present; the proxy sets it
+ * itself when conv_host_proxy_config::registration_current answers false.
+ * conv_host_proxy_rebind clears it too. A host already running is not
+ * touched.
+ */
+void
+conv_host_proxy_set_registration_pending(struct conv_host *h, bool pending);
+
+//! Is a spawn held on the registration (conv_host_proxy_set_registration_pending)? Diagnostics, tests.
+bool
+conv_host_proxy_registration_pending(struct conv_host *h);
 
 //! The binary path the next spawn passes (diagnostics, tests).
 void

@@ -95,6 +95,17 @@ fake_maintenance(void *, const char *)
 	return g_maint_held.load();
 }
 
+//! The fake "is the provider's row still the one this proxy is bound to" (#2793).
+std::atomic<bool> g_reg_current{true};
+std::atomic<uint32_t> g_reg_checks{0};
+
+bool
+fake_registration(void *, const char *, const char *)
+{
+	g_reg_checks++;
+	return g_reg_current.load();
+}
+
 bool
 cpu_alloc(void *, const conv_image_request *req, xrt_conv_image *out)
 {
@@ -283,6 +294,7 @@ struct Fixture : CoreOps
 		pc.spawn_for_describe = spawn_for_describe; // these tests start with no describe cache
 		if (fake_mutex) {
 			pc.maintenance_held = fake_maintenance; // else the real OS check
+			pc.registration_current = fake_registration; // current unless a test says otherwise
 		}
 		REQUIRE(conv_host_proxy_create(&pc, &host) == XRT_SUCCESS);
 
@@ -639,6 +651,123 @@ TEST_CASE("proxy: a registration rebind makes the next host load the new binary;
 	}
 	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
 	std::remove(log.c_str());
+}
+
+TEST_CASE("proxy: a row removed or rewritten under the maintenance mutex is re-read before any spawn (#2793)",
+          "[conv_proxy]")
+{
+	// Discovery spec §3.8.1. An uninstaller holds the provider's maintenance
+	// mutex, Restart Manager closes the host (exit 20), the binary and the
+	// row are removed, the mutex is released. The supervisor polls the mutex
+	// itself and used to respawn at the release -- one short-lived host on the
+	// binary that was leaving -- before the service's rescan marked the
+	// provider gone. The scripted host logs the binary each start was given.
+	const std::string log = temp_marker() + ".binaries";
+	const std::string marker = temp_marker() + ".update";
+	std::remove(log.c_str());
+	g_maint_held = false;
+	g_reg_current = true;
+	g_reg_checks = 0;
+	Fixture fx({"--fake-binary-log", log, "--fake-update-after", "3", "--fake-update-once", marker}, 0, 5,
+	           CONV_PROXY_HOST, "sat-test", "old-binary", true, nullptr, true);
+	const uint64_t sid = fx.stream();
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x61, &r));
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	REQUIRE(fx.convert(sid, 0x62, &r));
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	const uint32_t spawns = fx.sup().spawns;
+	REQUIRE(spawns == 1u);
+	CHECK(g_reg_checks.load() == 1u); // the row is read once per host start
+	CHECK_FALSE(conv_host_proxy_registration_pending(fx.host));
+
+	// The uninstaller takes the mutex, then closes the host.
+	g_maint_held = true;
+	REQUIRE(fx.submit(sid, 0x63));
+	REQUIRE(wait_until([&] { return fx.sup().last_exit == CONV_HOST_EXIT_UPDATE; }, 10000));
+	REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_UPDATING; }, 5000));
+	// It removes the row and releases the mutex. Nothing has told the proxy
+	// (the service's rescan has not run); the stream keeps submitting, so the
+	// respawn is owed and due the moment the mutex reads free.
+	g_reg_current = false;
+	g_maint_held = false;
+	for (int i = 0; i < 40; i++) { // 2 s: well past the 1 Hz probe
+		(void)fx.submit(sid, 0x64);
+		sleep_ms(50);
+	}
+	// Zero spawns between the release and the "registration is gone"
+	// transition: the spawn was taken back, not performed.
+	CHECK(fx.sup().spawns == spawns);
+	CHECK(fx.sup().restarts == 0u);
+	CHECK(fx.sup().last_exit == CONV_HOST_EXIT_UPDATE); // no later exit: no process was started
+	CHECK(read_lines(log).size() == 1u);
+	CHECK(conv_host_proxy_registration_pending(fx.host));
+	CHECK(g_reg_checks.load() == 2u); // asked once more, then held: not re-read on every pass
+	CHECK(conv_host_is_down(fx.host));
+	CHECK(fx.row_state() == XRT_CONV_STATE_WARMING); // still "updating", not FAILED
+
+	SECTION("the row is gone (uninstall): never a host again until it is back")
+	{
+		// What the service's rescan does on REMOVE.
+		conv_host_proxy_set_registration_pending(fx.host, true);
+		conv_core_set_provider_enabled(fx.c, "sat-test", false);
+		conv_core_set_provider_registered(fx.c, "sat-test", false);
+		g_reg_current = true; // even if a later read would say "current"
+		for (int i = 0; i < 30; i++) {
+			(void)fx.submit(sid, 0x65);
+			sleep_ms(50);
+		}
+		CHECK(fx.sup().spawns == spawns);
+		CHECK(read_lines(log).size() == 1u);
+		CHECK(fx.sup().restarts == 0u);
+
+		// Reinstalled at a new path (RESTORE): the rebind releases the hold.
+		conv_core_set_provider_registered(fx.c, "sat-test", true);
+		conv_core_set_provider_enabled(fx.c, "sat-test", true);
+		CHECK(conv_host_proxy_rebind(fx.host, "new-binary", false));
+		conv_host_proxy_config_changed(fx.host);
+		CHECK_FALSE(conv_host_proxy_registration_pending(fx.host));
+		REQUIRE(wait_until([&] { return fx.sup().spawns == spawns + 1u; }, 20000));
+		REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_RUNNING; }, 40000));
+		const auto lines = read_lines(log);
+		REQUIRE(lines.size() == 2u);
+		CHECK(lines[1] == "new-binary");
+	}
+	SECTION("the row names another binary (update): the first spawn after the release is the new binary")
+	{
+		// What the service's rescan does on REBIND.
+		g_reg_current = true;
+		CHECK(conv_host_proxy_rebind(fx.host, "new-binary", false));
+		conv_host_proxy_config_changed(fx.host);
+		CHECK_FALSE(conv_host_proxy_registration_pending(fx.host));
+		REQUIRE(fx.convert(sid, 0x66, &r, 20000));
+		check_views(r, 0x66);
+		conv_core_stream_release(fx.c, sid, r.ring_slot);
+		CHECK(fx.sup().spawns == spawns + 1u);
+		CHECK(fx.sup().restarts == 0u);
+		CHECK(fx.stats(sid).rebinds == 0u);
+		const auto lines = read_lines(log);
+		REQUIRE(lines.size() == 2u);
+		CHECK(lines[0] == "old-binary");
+		CHECK(lines[1] == "new-binary"); // "old-binary" was never started a second time
+	}
+	SECTION("the row reads the same after all: the owner releases the hold, the old binary respawns")
+	{
+		g_reg_current = true;
+		conv_host_proxy_set_registration_pending(fx.host, false);
+		REQUIRE(fx.convert(sid, 0x67, &r, 20000));
+		check_views(r, 0x67);
+		conv_core_stream_release(fx.c, sid, r.ring_slot);
+		CHECK(fx.sup().spawns == spawns + 1u);
+		CHECK(fx.sup().restarts == 0u);
+		const auto lines = read_lines(log);
+		REQUIRE(lines.size() == 2u);
+		CHECK(lines[1] == "old-binary");
+	}
+	g_reg_current = true;
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	std::remove(log.c_str());
+	std::remove(marker.c_str());
 }
 
 TEST_CASE("proxy: a declined probe (host exit 16) is a reported load failure: latched, one retry per change (#2798)",

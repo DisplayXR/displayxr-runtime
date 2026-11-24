@@ -782,6 +782,64 @@ resolve_hosting(const struct xrt_conversion_plugin_entry *e, bool *out_from_env)
 	return target_conversion_plugin_resolve_hosting(e->hosting, env_value, out_from_env);
 }
 
+#ifdef CONV_HAVE_HOST_PROXY
+/*!
+ * conv_host_proxy_config::registration_current (#2793, discovery spec §3.8.1).
+ * A satellite's supervisor is about to spawn its host and asks whether the
+ * row the service holds is still the registered one. An uninstaller removes
+ * the binary and the row under the provider's maintenance mutex; the
+ * supervisor polls that mutex itself, so without this it started one host on
+ * the binary that was leaving, between the release and the watch thread's
+ * rescan (the host exited 11, "before it was up").
+ *
+ * Reads the registrations afresh and compares what rescan compares (`Version`
+ * and `Binary`, and the row being there at all), so the spawn and the rescan
+ * decide on the same row. Not current: the proxy takes the spawn back and
+ * holds further ones, and the watch is poked so rescan re-reads the row now
+ * and releases the hold (a rebind, or a row that reads the same again) or
+ * keeps it (a removal). A provider the service holds no row for yet (its
+ * proxy is created before its row is stored) has nothing to compare: current.
+ * Supervisor thread; no proxy lock held; takes g.mtx only to read the held
+ * row. One registry read per host start.
+ */
+static bool
+sat_registration_current(void *ud, const char *id, const char *binary)
+{
+	(void)ud;
+	(void)binary; // the held row's Binary is the proxy's: rebind_entry writes both
+	struct xrt_conversion_plugin_entry *fresh = calloc(XRT_CONV_LOADER_MAX_ENTRIES, sizeof(*fresh));
+	if (fresh == NULL) {
+		return true; // cannot tell: as before this check existed
+	}
+	const int n = target_conversion_plugin_enumerate(fresh, XRT_CONV_LOADER_MAX_ENTRIES);
+	const struct xrt_conversion_plugin_entry *row = NULL;
+	for (int i = 0; i < n; i++) {
+		if (strcmp(fresh[i].id, id) == 0) {
+			row = &fresh[i];
+			break;
+		}
+	}
+	os_mutex_lock(&g.mtx);
+	const int k = find_entry_locked(id);
+	const bool gone = k >= 0 && g.entry_gone[k];
+	const bool current = k < 0 || (row != NULL && !gone && strcmp(g.entries[k].version, row->version) == 0 &&
+	                               strcmp(g.entries[k].binary_path, row->binary_path) == 0);
+	os_mutex_unlock(&g.mtx);
+	if (!current) {
+		U_LOG_W(
+		    "[conv] provider %s: its registration %s since the service last read it; no host is started "
+		    "until the service has re-read it",
+		    id,
+		    row == NULL ? "was removed"
+		    : gone      ? "is back"
+		                : "changed");
+		(void)service_component_watch_poke(TARGET_COMPONENT_CLASS_CONVERSION, SERVICE_COMPONENT_WATCH_POKED);
+	}
+	free(fresh);
+	return current;
+}
+#endif
+
 /*!
  * Build the satellite proxy for @p e: the provider DLL is NOT loaded in the
  * service; the proxy spawns `displayxr-conversion-host` (lazily) and answers
@@ -802,6 +860,7 @@ satellite_host_create(const struct xrt_conversion_plugin_entry *e, struct conv_h
 	cfg.provider_id = e->id;
 	cfg.provider_binary = e->binary_path;
 	cfg.host_exe = host_exe;
+	cfg.registration_current = sat_registration_current; // #2793
 	os_mutex_lock(&g.mtx);
 	cfg.adapter_luid = g.adapter_luid; // 0 until the GPU side attached (satellites_set_adapter)
 	os_mutex_unlock(&g.mtx);
@@ -1233,6 +1292,11 @@ rescan(void)
 		}
 #ifdef CONV_HAVE_HOST_PROXY
 		if (sat != NULL) {
+			// #2793: the row is present and was re-read with its maintenance
+			// mutex free (anything else was deferred above): a spawn the
+			// proxy held on it may go. A rebind released it already; this
+			// covers a row that reads the same again.
+			conv_host_proxy_set_registration_pending(sat, false);
 			bool clear_gate = reregistered;
 			if (!clear_gate) {
 				// #2153 (found live): a satellite whose host failed to LOAD --
@@ -1338,7 +1402,22 @@ rescan(void)
 		os_mutex_lock(&g.mtx);
 		g.entry_gone[k] = true;
 		g.entries[k].enabled = false;
+		struct conv_host *gone_sat = NULL;
+		for (uint32_t j = 0; j < g.sat_count; j++) {
+			if (strcmp(g.sat_ids[j], g.entries[k].id) == 0) {
+				gone_sat = g.sat_hosts[j];
+			}
+		}
 		os_mutex_unlock(&g.mtx);
+#ifdef CONV_HAVE_HOST_PROXY
+		if (gone_sat != NULL) {
+			// #2793: no host is started for a provider that is not registered
+			// (its binary is gone or leaving). Released when the row is back.
+			conv_host_proxy_set_registration_pending(gone_sat, true);
+		}
+#else
+		(void)gone_sat;
+#endif
 		conv_core_set_provider_enabled(g.core, g.entries[k].id, false);
 		conv_core_set_provider_registered(g.core, g.entries[k].id, false);
 		U_LOG_W(
