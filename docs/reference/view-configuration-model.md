@@ -22,7 +22,9 @@ types it advertises, how many views each reports, what `xrLocateViews` and
 > choice, else the driver's own default, e.g. sim-display's `OUTPUT`). The runtime
 > keeps the whole declared list as the envelope, so the device max view count —
 > what `PRIMARY_MULTIVIEW_DXR` locates — is the **maximum over the declared list**,
-> not over the two slots, and it is fixed for the instance, as OpenXR requires. A
+> not over the two slots, and it is fixed for the instance, as OpenXR requires. Slot 1
+> is the 3D mode **by position** — it may be a one-view passthrough entry — so never find
+> it by `viewCount >= 2` or `hardwareDisplay3D`. A
 > 3D-mode switch remaps slot 1 live (`XrEventDataRenderingModeTableChangedDXR`) and
 > never changes the located count; the active slot's view count moves, and
 > `XrViewActivityStateDXR.activeViewCount` reports it. On sim-display the default

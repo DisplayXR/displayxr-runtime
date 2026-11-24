@@ -96,7 +96,10 @@ worst case is taken over the driver's **full declared list**
 (ADR-066 (design PR #2792) C1.5): Same as
 2D (1920x1080), Anaglyph / Interlaced / Blend (1920x540), Cropped SBS (960x1080), Squeezed SBS
 (1920x1080), and Quad (1920x1080) when it is declared — **1920x1080** whichever 3D mode is
-selected, so every live switch fits the swapchain already allocated.
+selected, so every live switch fits the swapchain already allocated. That holds because every
+sim-display entry fits the panel: the runtime computes this worst case, but no API returns it yet
+(`XR_DXR_display_info` v27; the app-visible worst-case statement is ADR-066 stage 3), so apps size
+from the panel and the enumerated modes.
 System swapchain for Looking Glass: max(2560,1536) x max(1600,1280) = **2560x1600** (display res).
 System swapchain for the 3840x2160 display: max(3840,3840) x max(2160,1080) = **3840x2160** (display res).
 
@@ -105,8 +108,9 @@ tile smaller views that fit within. **That is a property of these tables, not a 
 multiview quilt whose tiles add up to more than the panel (e.g. a 3x3 quilt at 0.5x0.5 is
 1.5x the panel in each dimension) makes the 3D mode the worst case. Because only 2D and the
 whole declared list is sized for (ADR-066 C1, which restored the pre-ADR-065 rule), such a
-driver's allocation is the largest over every entry it declares, so a live 3D-mode switch to it
-never needs a reallocation. An entry the driver lists as start-up-only
+driver's runtime-side allocation is the largest over every entry it declares. An app cannot see
+that size yet (v27 exposes the panel, the per-view `maxImageRect*` and the two slots), so an entry
+larger than the panel is not app-visible until the stage-3 worst-case statement. An entry the driver lists as start-up-only
 (`XRT_RENDERING_MODE_FLAG_START_UP_ONLY`) is outside the envelope and cannot be switched to live.
 
 ---

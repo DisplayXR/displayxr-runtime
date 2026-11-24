@@ -91,6 +91,7 @@
 #include "target_screen_pin.h"
 
 #include "os/os_display_edid.h"
+#include "util/u_git_tag.h"
 #include "util/u_logging.h"
 #include "util/u_rendering_modes.h"
 #include "util/u_setting.h"
@@ -616,7 +617,25 @@ poke_service_ex(bool mode_3d)
 	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
 	struct ipc_connection ipc_c;
 	memset(&ipc_c, 0, sizeof(ipc_c));
-	if (cli_ipc_connect(&ipc_c, U_LOGGING_RAW, &ii) == XRT_SUCCESS) {
+	const xrt_result_t cret = cli_ipc_connect(&ipc_c, U_LOGGING_RAW, &ii);
+	if (cret == XRT_ERROR_IPC_VERSION_SKEW) {
+		// A service IS running, but a different build: it refuses this CLI's
+		// connection (the git-tag gate). The write above already landed in the
+		// store; say who sees it and who does not.
+		P("A DisplayXR service is running, but it is a different version than this displayxr-cli (%s) and\n",
+		  u_git_tag);
+		P("refused its connection (the log line above names both versions).\n");
+		if (mode_3d) {
+			P("The choice IS stored. That service, and the IPC apps attached to it, do not see it until it "
+			  "is\n");
+			P("restarted on a build that matches this CLI (and knows per-screen 3D modes, ADR-066 C1);\n");
+			P("in-process apps of this build pick it up within ~1 s.\n");
+		} else {
+			P("The preference IS stored; that service re-reads it at its next start.\n");
+		}
+		return;
+	}
+	if (cret == XRT_SUCCESS) {
 		const xrt_result_t xret = ipc_call_system_request_display_reprobe(&ipc_c);
 		ipc_client_connection_fini(&ipc_c);
 		if (xret == XRT_SUCCESS) {
