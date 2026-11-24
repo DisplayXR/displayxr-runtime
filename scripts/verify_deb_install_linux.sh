@@ -25,6 +25,10 @@
 #     installed service fails the headless smoke (scripts/smoke_service_linux.sh):
 #     detached start with no terminal, an IPC handshake, clean SIGTERM,
 #     stale-socket recovery, and socket activation + exit-when-idle.
+#   * an upgrade (a reinstall over itself, maintainer scripts run for real
+#     against a recording fake systemctl) does not try-restart a RUNNING user
+#     displayxr.service, or acts on one that is not running, or prerm stops
+#     it on upgrade (scripts/linux/test_restart_service.sh covers the helper);
 #   * VK_LAYER_DXR_queue_lock (#2036) is not installed: its manifest must sit
 #     in /usr/share/vulkan/explicit_layer.d with an absolute library_path to the
 #     installed .so, and `displayxr-cli info` must report it reachable;
@@ -190,6 +194,63 @@ grep -qx 'ListenStream=%t/displayxr_comp_ipc' "$UNIT_DIR/displayxr.socket" 2>/de
 echo "=== displayxr-service: headless smoke (installed binaries, sim-display)"
 "$(dirname "$(readlink -f "$0")")/smoke_service_linux.sh" ||
     { echo "error: displayxr-service smoke failed on $PRETTY_NAME." >&2; fail=1; }
+
+# --- an upgrade restarts a RUNNING user displayxr.service ---------------------
+# A service already running when the package is upgraded keeps the old
+# binaries mapped and refuses every new-version client at the version gate.
+# postinst must try-restart it in every user manager (and never start one that
+# is not running). A container has no user systemd, so this runs the INSTALLED
+# postinst + helper for real against a recording fake systemctl / loginctl: a
+# reinstall of the same .deb takes dpkg's upgrade path (prerm upgrade ->
+# postinst configure <old-version>).
+echo "=== upgrade: postinst restarts a running user displayxr.service"
+RESTART=/usr/lib/displayxr/bin/displayxr-restart-service
+if [ ! -x "$RESTART" ]; then
+    echo "error: $RESTART not installed" >&2
+    fail=1
+else
+    "$(dirname "$(readlink -f "$0")")/linux/test_restart_service.sh" "$RESTART" ||
+        { echo "error: displayxr-restart-service unit checks failed" >&2; fail=1; }
+    UPG="$(mktemp -d)"
+    useradd -M dxrupgrade 2>/dev/null || true
+    useradd -M dxridle 2>/dev/null || true
+    for u in dxrupgrade dxridle; do mkdir -p "/run/user/$(id -u "$u")/systemd"; done
+    cat >"$UPG/systemctl" <<EOF
+#!/bin/sh
+echo "\$*" >>"$UPG/log"
+case "\$*" in *"--machine=dxrupgrade@ is-active"*) exit 0 ;; *is-active*) exit 3 ;; esac
+exit 0
+EOF
+    cat >"$UPG/loginctl" <<EOF
+#!/bin/sh
+echo "\$(id -u dxrupgrade) dxrupgrade no active"
+echo "\$(id -u dxridle) dxridle no active"
+EOF
+    chmod +x "$UPG/systemctl" "$UPG/loginctl"
+    PATH="$UPG:$PATH" dpkg -i "$DEB" >"$UPG/dpkg.out" 2>&1 ||
+        { cat "$UPG/dpkg.out" >&2; echo "error: dpkg -i (upgrade path) failed" >&2; fail=1; }
+    if grep -qxF -- "--user --machine=dxrupgrade@ try-restart displayxr.service" "$UPG/log"; then
+        echo "    running service (dxrupgrade): try-restarted by postinst"
+    else
+        cat "$UPG/log" >&2
+        echo "error: the upgrade did not try-restart the RUNNING user displayxr.service" >&2
+        fail=1
+    fi
+    if grep -qE -- "--machine=dxridle@ (try-restart|restart|start) displayxr.service" "$UPG/log"; then
+        echo "error: the upgrade acted on a displayxr.service that was not running" >&2
+        fail=1
+    else
+        echo "    idle user (dxridle): service left to socket activation"
+    fi
+    if grep -qE -- " stop displayxr" "$UPG/log"; then
+        echo "error: prerm stopped the service on upgrade (it must only on remove)" >&2
+        fail=1
+    fi
+    grep -q "restarted displayxr.service for user dxrupgrade" "$UPG/dpkg.out" ||
+        { echo "error: postinst did not report the restart" >&2; fail=1; }
+    for u in dxrupgrade dxridle; do rm -rf "/run/user/$(id -u "$u")"; userdel "$u" 2>/dev/null || true; done
+    rm -rf "$UPG"
+fi
 
 # --- DisplayXR Dashboard ------------------------------------------------------
 echo "=== displayxr-dashboard: payload + --version (no display server)"

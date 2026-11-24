@@ -41,6 +41,12 @@
 #       the service on the first client that dials it, so a user who never runs
 #       a present-owner / workspace client never starts it; the service exits
 #       30 s after its last client leaves (IPC_EXIT_WHEN_IDLE).
+#   /usr/lib/displayxr/bin/displayxr-restart-service
+#       restarts a RUNNING displayxr.service in every user manager (never starts
+#       one). postinst runs it on every configure, so an upgrade does not leave
+#       a live service on the old binaries refusing every new client at the
+#       version gate. Sibling .debs that ship something the service loads (a
+#       display processor, a provider) call it from their own postinst.
 #   /usr/share/gnome-shell/extensions/window-geometry@displayxr.org/
 #       the GNOME Shell extension from contrib/gnome-shell/ (window geometry for
 #       windowed Wayland weaving; capture exclusion for transparency)
@@ -240,6 +246,8 @@ for f in $EXT_FILES; do
     [ -f "$EXT_SRC/$f" ] || { echo "error: missing $EXT_SRC/$f (GNOME Shell extension payload)" >&2; exit 1; }
 done
 [ -f "$EXT_ENABLE" ] || { echo "error: missing $EXT_ENABLE" >&2; exit 1; }
+RESTART_SVC="$ROOT/scripts/linux/displayxr-restart-service"
+[ -f "$RESTART_SVC" ] || { echo "error: missing $RESTART_SVC" >&2; exit 1; }
 
 # --- Version: what the binaries in $BUILD_DIR were BUILT as (#1790). ---------
 # cmake/DisplayXRVersion.cmake derives it once per configure and writes it next
@@ -331,6 +339,8 @@ install -m 0644 "$SYSTEMD_SRC/displayxr.socket" "$STAGE/usr/lib/systemd/user/dis
 sed 's|@SERVICE_BIN@|/usr/lib/displayxr/bin/displayxr-service|g' "$SYSTEMD_SRC/displayxr.service.in" \
     >"$STAGE/usr/lib/systemd/user/displayxr.service"
 chmod 0644 "$STAGE/usr/lib/systemd/user/displayxr.service"
+# The restart-on-upgrade helper: postinst below and sibling .debs' postinst.
+install -m 0755 "$RESTART_SVC" "$STAGE/usr/lib/displayxr/bin/displayxr-restart-service"
 
 # --- GNOME Shell extension + the per-user enable at login -------------------
 for f in $EXT_FILES; do
@@ -655,6 +665,12 @@ JSON
         systemctl --global enable displayxr.socket >/dev/null 2>&1 || true
         dxr_each_user_manager daemon-reload
         dxr_each_user_manager start displayxr.socket
+        # An upgrade replaced the binaries under a service that may be RUNNING
+        # (a live client keeps it from going idle): it would keep serving the
+        # old version and refuse every new client at the version gate. Restart
+        # the running ones; never start one that is not (socket activation
+        # brings up the new binary on first use).
+        /usr/lib/displayxr/bin/displayxr-restart-service try-restart || true
         echo "displayxr-runtime: displayxr-service is socket-activated per user (displayxr.socket)"
         echo "  check with  systemctl --user status displayxr.socket"
     fi
@@ -703,10 +719,11 @@ EOF
 cat > "$STAGE/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 # Before the unit files go away: stop displayxr-service in running user
-# sessions and drop the global enablement (#1744). NOT on upgrade: a live
-# service keeps serving its clients with the old binary and exits when idle,
-# and the next connect starts the new one — stopping it here would cut off a
-# running browser mid-session.
+# sessions and drop the global enablement (#1744). NOT on upgrade: postinst
+# restarts a running service once the new binaries are in place (the
+# displayxr-restart-service helper). Leaving it running on the old binaries
+# is not an option: the version gate refuses every client of the new version
+# for as long as any old client keeps it from going idle.
 set -e
 
 # Run `systemctl --user <args>` in every user manager running right now
