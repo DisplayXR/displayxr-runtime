@@ -838,6 +838,33 @@ struct xrt_display_processor_vk
 	 * @return true if the DP weaves @p encoding correctly.
 	 */
 	bool (*accepts_atlas_encoding)(struct xrt_display_processor_vk *xdp, enum xrt_atlas_encoding encoding);
+
+	/*!
+	 * Which declared rendering-mode entry this DP draws (ADR-047 Amendment
+	 * 10): @p mode_index is an index of the list the owning plug-in answered
+	 * through `xrt_plugin_iface::get_rendering_modes_for_monitor` for this
+	 * DP's screen, in that list's own order (0 = the flat 2D entry). The
+	 * runtime calls it on a segment DP made by a `create_dp_vk_for_screen`
+	 * factory whenever that screen's entry for the app's current slot
+	 * changes (the app moved between 2D and 3D, or the user picked another
+	 * per-screen 3D mode), before the next `process_atlas`, which then hands
+	 * the DP an atlas laid out as that entry's `tile_columns` x `tile_rows`.
+	 * A DP with this slot set draws that entry whatever the process-wide
+	 * state of its plug-in says, so two screens of one plug-in can show two
+	 * different 3D modes at once.
+	 *
+	 * Lives on the VK variant, not the base, for the reason
+	 * @ref get_eye_positions_at does.
+	 *
+	 * Optional — an absent slot (older plug-in `base.struct_size`) or NULL ⟹
+	 * the DP draws what it always drew for the atlas it is handed. Appended
+	 * after @ref accepts_atlas_encoding per ADR-020 (append-only within a
+	 * major; no version bump), announced by XRT_DP_VK_HAS_OUTPUT_ENTRY.
+	 *
+	 * @param xdp         Pointer to self.
+	 * @param mode_index  The entry to draw, in the plug-in's per-monitor numbering.
+	 */
+	void (*set_output_entry)(struct xrt_display_processor_vk *xdp, uint32_t mode_index);
 };
 
 /*!
@@ -953,7 +980,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d_filte
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_weave_sync)            == sizeof(struct xrt_display_processor) + 17 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_eye_positions_at)     == sizeof(struct xrt_display_processor) + 18 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, accepts_atlas_encoding)   == sizeof(struct xrt_display_processor) + 19 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 20 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_output_entry)         == sizeof(struct xrt_display_processor) + 20 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 21 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the @ref
@@ -1020,6 +1048,14 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * runtime can #ifdef-guard its implementation. Purely additive (ADR-020).
  */
 #define XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::set_output_entry slot (ADR-047 Amendment 10, a
+ * screen's own rendering-mode entry), so a plug-in built against an older
+ * runtime can #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_VK_HAS_OUTPUT_ENTRY 1
 // clang-format on
 
 /*!
@@ -1650,6 +1686,28 @@ xrt_display_processor_vk_accepts_atlas_encoding(struct xrt_display_processor_vk 
 		return false;
 	}
 	return xdp->accepts_atlas_encoding(xdp, encoding);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_output_entry
+ *
+ * Returns false if not supported (absent slot or NULL): the DP then draws what
+ * it always drew for the atlas it is handed.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_set_output_entry(struct xrt_display_processor_vk *xdp, uint32_t mode_index)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->set_output_entry + sizeof(xdp->set_output_entry);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_output_entry == NULL) {
+		return false;
+	}
+	xdp->set_output_entry(xdp, mode_index);
+	return true;
 }
 
 #ifdef __cplusplus

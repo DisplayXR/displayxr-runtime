@@ -76,6 +76,8 @@ static_assert(offsetof(xrt_display_processor_vk, get_eye_positions_at) ==
 static_assert(offsetof(xrt_display_processor_vk, get_eye_positions_at) + sizeof(void *) ==
               offsetof(xrt_display_processor_vk, accepts_atlas_encoding));
 static_assert(offsetof(xrt_display_processor_vk, accepts_atlas_encoding) + sizeof(void *) ==
+              offsetof(xrt_display_processor_vk, set_output_entry)); // ADR-047 Amendment 10 appended it
+static_assert(offsetof(xrt_display_processor_vk, set_output_entry) + sizeof(void *) ==
               sizeof(xrt_display_processor_vk));
 // And the base itself did NOT grow (that would be the silent break).
 static_assert(sizeof(xrt_display_processor) == offsetof(xrt_display_processor, clear_local_zone_mask) + sizeof(void *));

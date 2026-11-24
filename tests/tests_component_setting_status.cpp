@@ -48,9 +48,13 @@ static_assert(XRT_COMPONENT_SETTING_STATE_UNKNOWN == 0 && XRT_COMPONENT_SETTING_
 static_assert(offsetof(xrt_plugin_iface, get_setting_status) ==
                   offsetof(xrt_plugin_iface, activate) + sizeof(xrt_component_activate_fn_t),
               "get_setting_status must directly follow activate");
-static_assert(sizeof(xrt_plugin_iface) ==
+// ADR-047 Amendment 10 appended get_rendering_modes_for_monitor right after it.
+static_assert(offsetof(xrt_plugin_iface, get_rendering_modes_for_monitor) ==
                   offsetof(xrt_plugin_iface, get_setting_status) + sizeof(xrt_component_get_setting_status_fn_t),
-              "a slot was appended after get_setting_status: pin it here and in xrt_plugin_iface.md");
+              "get_rendering_modes_for_monitor must directly follow get_setting_status");
+static_assert(sizeof(xrt_plugin_iface) == offsetof(xrt_plugin_iface, get_rendering_modes_for_monitor) +
+                                              sizeof(((xrt_plugin_iface *)nullptr)->get_rendering_modes_for_monitor),
+              "a slot was appended after get_rendering_modes_for_monitor: pin it here and in xrt_plugin_iface.md");
 
 enum class Mode
 {
