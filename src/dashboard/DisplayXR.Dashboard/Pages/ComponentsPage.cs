@@ -315,7 +315,8 @@ public sealed class ComponentsPage : Page
         bool collapsed = s.Collapsed && !_expanded.Contains(s.Id);
         if (g.Rows.Count == 0)
         {
-            body.Children.Add(U.Wrapped(EmptyText(s), "empty"));
+            // Said once: the section line may already be this sentence ("No 2D-to-3D converter is installed.").
+            if (EmptyText(s) != s.ConnectedLine) body.Children.Add(U.Wrapped(EmptyText(s), "empty"));
         }
         else if (collapsed)
         {
@@ -490,7 +491,7 @@ public sealed class ComponentsPage : Page
         "workspace_controller" => "No spatial desktop is installed or running.",
         "input_providers" => "No input add-on reported.",
         "conversion" => "Your display driver reports no 2D-to-3D converter.",
-        "conversion_providers" => "No 2D-to-3D converter is installed.",
+        "conversion_providers" => Components.NoConverterInstalled,
         "tracking_providers" => "No camera head tracking is installed. A display that does not track you shows the picture for a viewer at the default position.",
         ComponentRows.AppsGroupId => "No app is installed.",
         ComponentRows.RuntimeGroupId => "DisplayXR is not installed.",
