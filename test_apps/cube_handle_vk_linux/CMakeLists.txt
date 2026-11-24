@@ -97,7 +97,9 @@ FetchContent_Declare(
     # buffer_device (displayxr-common#81, #1991); the aux guard needs the same bytes.
     # v2.32.0: DxrLinuxWindowDesc::start_hidden — the window is never mapped or made
     # fullscreen in a workspace session (displayxr-common#80, #2022); includes #78/#81.
-    GIT_TAG v2.32.0
+    # v2.36.0: DxrLinuxWindow drains XR_DXR_workspace_client_input, so the app gets
+    #   mouse + keyboard under the Linux workspace (displayxr-common#93, runtime#2779).
+    GIT_TAG v2.36.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
