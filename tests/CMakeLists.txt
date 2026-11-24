@@ -1449,9 +1449,9 @@ target_link_libraries(tests_oxr_input_providers_rule PRIVATE xrt-interfaces)
 # by hand, which is exactly why it is worth pinning.
 target_link_libraries(tests_xrt_active_mode_scale PRIVATE xrt-interfaces)
 
-# ADR-065 -- sim_display's two run-time modes (2D + the OUTPUT kind) and its
-# start-up rule (sim_display_modes.h, header-only), checked against the
-# runtime's two-mode rule (util/u_rendering_modes.h). No plug-in load.
+# ADR-066 C1 -- sim_display's declared list, its OUTPUT config (Same as 2D by
+# default) and start-up rule (sim_display_modes.h, header-only), run through
+# the runtime's selection + a live remap (util/u_rendering_modes). No plug-in load.
 target_link_libraries(tests_sim_display_modes PRIVATE xrt-interfaces)
 target_include_directories(tests_sim_display_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
 

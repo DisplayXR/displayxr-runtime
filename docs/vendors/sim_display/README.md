@@ -20,54 +20,88 @@
 | `sim_display_webcam.c` | The DEPRECATED `WEBCAM_TRACKING` alias (#1855): process glue only (refcounted tracker for the DPs, eye override, advertised caps, camera claim). The tracker core it runs lives in `../sim_tracking/` (`sim_webcam_*`: geometry + smoothing, capture worker, host-agnostic source + settings seam; `sim_face_*`: the estimator slot — `_none` by default, `_onnx` + `sim_webcam_onnx.cmake` with `XRT_SIM_WEBCAM_ESTIMATOR=onnx` — and YuNet pre/post-processing) |
 | `shaders/` | Side-by-side / anaglyph compositing shaders |
 
-## Rendering modes and 3D kinds
+## Rendering modes and the 3D mode
 
-Like every display driver, sim_display exposes **two rendering modes at run time**
-([ADR-065](../../adr/ADR-065-two-runtime-rendering-modes.md)):
+Like every display driver, sim_display shows apps **two rendering modes**
+([ADR-065](../../adr/ADR-065-two-runtime-rendering-modes.md)), but it declares its **full list**
+and the runtime keeps all of it as the sizing envelope
+(ADR-066 (design PR #2792) C1):
 
-| Index | Mode |
+| Slot | Mode |
 |---|---|
-| 0 | 2D — one view, full resolution |
-| 1 | the **3D kind** the `OUTPUT` setting names |
+| 0 | 2D — one view, full resolution (never configurable) |
+| 1 | the screen's **3D mode**: one entry of the list below |
 
-The kind is chosen once, when the device is created (the next app start in-process, the
-next service start out-of-process) and never changes while it lives. **The device starts
-in 2D**: a PC with no 3D display shows a normal picture until you press **V** (or **1**),
-or an app requests mode 1. `START_3D=1` starts it in the kind instead.
+**The 3D mode applies live.** Change it and every running app (in-process or IPC) is remapped
+within about a second: same slot index, no swapchain recreation, no restart. The app gets
+`XrEventDataRenderingModeTableChangedDXR` and re-reads the table. Who decides it, first match wins:
+
+1. the per-screen choice — `displayxr-cli dp mode set <name> --screen <key>` (per user, or
+   `--machine`); what the Dashboard's "3D mode" picker writes. `dp mode list` shows the choices;
+2. sim_display's own default, its `OUTPUT` setting (`displayxr-cli dp set sim-display OUTPUT
+   <value>`), also live;
+3. with neither: **Same as 2D**.
+
+**The device starts in 2D**: a PC with no 3D display shows a normal picture until you press
+**V** (or **1**), or an app requests slot 1. `START_3D=1` starts it in slot 1 instead.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `OUTPUT` | `anaglyph` | The 3D kind: `anaglyph`, `sbs`, `squeezed` (`squeezed_sbs`), `quad`, `interlaced`, `blend`. `2d` / `passthrough` choose no kind (mode 1 stays anaglyph) and force the start in 2D. |
-| `START_3D` | `0` | Start in mode 1 (the kind) instead of mode 0. Ignored with `OUTPUT=2d`. |
-| `FORCE_MODE` | `-1` | Developer pin: `0` (2D) or `1` (the kind), held against every request from every app. Any other value is ignored with a WARN. |
+| `OUTPUT` | `default` | The default 3D mode for a screen with no per-screen choice, applied live: `default` / `same_as_2d` (aliases `2d`, `passthrough`), `anaglyph`, `sbs`, `squeezed` (`squeezed_sbs`), `interlaced`, `blend`, `quad` (see below). |
+| `START_3D` | `0` | Start in slot 1 instead of slot 0. Read at start. |
+| `FORCE_MODE` | `-1` | Developer pin: `0` (2D) or `1` (slot 1), held against every request from every app. Any other value is ignored with a WARN. |
 
 Set them with `displayxr-cli dp set sim-display <KEY> <value>` (per user), or
 `DXR_DP_SIM_DISPLAY_<KEY>` in the hosting process's environment; the legacy
 `SIM_DISPLAY_<KEY>` names (`SIM_DISPLAY_OUTPUT`, `SIM_DISPLAY_START_3D`,
 `SIM_DISPLAY_FORCE_MODE`) still work for one release.
 
-| Kind | Mode-1 name | Views | Per-view scale | Tiles |
-|---|---|---|---|---|
-| `anaglyph` (default) | Anaglyph | 2 | 0.5 x 0.5 | 2x1 |
-| `sbs` | Cropped SBS | 2 | 0.5 x 0.5 | 1x2 |
-| `squeezed` | Squeezed SBS | 2 | 0.5 x 1.0 | 2x1 |
-| `quad` | Quad | 4 | 0.5 x 0.5 | 2x2 |
-| `interlaced` | Interlaced | 2 | 0.5 x 0.5 | 2x1 |
-| `blend` | Blend | 2 | 0.5 x 0.5 | 2x1 |
+**Behaviour change (ADR-066, 2026-11-23).** The default 3D mode was anaglyph and is now **Same as
+2D**: most apps ask for 3D at start, and an anaglyph on an ordinary screen reads as broken, so a 3D
+look is chosen on purpose. `OUTPUT=2d` / `passthrough` used to mean "anaglyph, start in 2D"; they
+are now aliases of Same as 2D (the device starts in 2D either way), and `START_3D` is no longer
+ignored with them.
 
-**`quad` is an inspection kind.** It is the only way to exercise an N-view path without
-hardware, but a stereo session (`PRIMARY_STEREO`, every legacy app, the engine plug-ins,
-the browser) cannot fill four tiles: the session-begin floor drops such a session to 2D
-and a request for mode 1 is denied with `XrEventDataDisplayModeRequestDeniedDXR`. A
-`PRIMARY_MULTIVIEW_DXR` session fills all four. To hold a stereo app in Quad anyway (the
-under-submit path), pin it: `OUTPUT=quad FORCE_MODE=1`.
+The declared list (choice names are what `dp mode set` takes; labels are what apps enumerate):
+
+| Choice name | Label (`modeName`) | `OUTPUT` | Views | Per-view scale | Tiles |
+|---|---|---|---|---|---|
+| `same_as_2d` (default) | Same as 2D | `default` | 1 | 1.0 x 1.0 | 1x1 |
+| `anaglyph` | Anaglyph | `anaglyph` | 2 | 0.5 x 0.5 | 2x1 |
+| `cropped_sbs` | Cropped SBS | `sbs` | 2 | 0.5 x 0.5 | 1x2 |
+| `squeezed_sbs` | Squeezed SBS | `squeezed` | 2 | 0.5 x 1.0 | 2x1 |
+| `interlaced` | Interlaced | `interlaced` | 2 | 0.5 x 0.5 | 2x1 |
+| `blend` | Blend | `blend` | 2 | 0.5 x 0.5 | 2x1 |
+| `quad` | Quad | `quad` | 4 | 0.5 x 0.5 | 2x2 |
+
+**Same as 2D** is a *passthrough* 3D entry (`XRT_RENDERING_MODE_FLAG_3D_PASSTHROUGH`): the app is
+in its 3D slot, the screen shows one sharp full-resolution view, and the lens state stays 2D
+(`hardwareDisplay3D` false). It is position-preserving, like anaglyph, interlaced and blend, so
+display zones compose with it.
+
+**`quad` is an inspection kind, declared only at start-up (interim rule).** A 4-view entry in the
+declared list would make every `PRIMARY_MULTIVIEW_DXR` session locate 4 views on a box with no 3D
+display, and an app that submits only the active count would be refused at the default
+`DXR_UNDER_SUBMIT`. So Quad is part of the envelope only when `OUTPUT=quad` at start-up (then it
+behaves as before); otherwise it is listed last as start-up-only
+(`XRT_RENDERING_MODE_FLAG_START_UP_ONLY`), `dp mode list` reports it `applies: restart_app`, and
+`dp mode set quad` is refused. A stereo session (`PRIMARY_STEREO`, every legacy app, the engine
+plug-ins, the browser) cannot fill four tiles: the session-begin floor drops it to 2D, a request
+for slot 1 is denied, and a live switch to Quad while it is in 3D floors it to 2D with an index
+1 → 0 event. A `PRIMARY_MULTIVIEW_DXR` session fills all four. To hold a stereo app in Quad anyway
+(the under-submit path), pin it: `OUTPUT=quad FORCE_MODE=1`. Whether Quad stays out of the default
+list is the project lead's decision (ADR-066 open question 2).
+
+**Tracking.** With `TRACKING=1` (or webcam tracking) every 3D entry is marked tracked; slot 0
+never is. The per-entry decision goes through one seam (`sim_display_entry_tracked()`), which the
+per-screen tracking setting (ADR-066 Part B) will drive.
 
 The kinds draw as follows:
 
 - **Side-by-side (SBS)** — left view in left half, right view in right half.
-- **Anaglyph (red/cyan)** — for use with red/cyan glasses. The default
-  (`SIM_DISPLAY_OUTPUT` unset), so 3D on sim_display is anaglyph: red from the
-  left view, green and blue from the right one. Without glasses that reads as
+- **Same as 2D** — the first view at full resolution (the default 3D mode).
+- **Anaglyph (red/cyan)** — for use with red/cyan glasses (`OUTPUT=anaglyph`, or
+  `dp mode set anaglyph`): red from the left view, green and blue from the right one. Without glasses that reads as
   red and cyan fringes, wider the further content sits from the display plane.
   In a transparent session (Vulkan) a transparent app keeps one silhouette over
   the desktop: the output alpha is where **both** views cover (#2121), so the

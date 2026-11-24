@@ -470,9 +470,10 @@ if [ "$BUILD_APPS" = "ON" ]; then
 # compositor is ready (fractional-scale + viewporter + the window-geometry
 # extension), else X11 (XWayland counts). --help lists the rest.
 # OXR_ENABLE_VK_NATIVE_COMPOSITOR=1 selects the native Vulkan compositor path;
-# SIM_DISPLAY_OUTPUT picks the sim-display 3D kind (anaglyph/sbs/...); sim-display
-# starts in 2D (ADR-065), so SIM_DISPLAY_START_3D=1 opens the app in the kind as
-# before. V toggles 2D <-> 3D; 0 / 1 select them.
+# sim-display's 3D mode is Same as 2D by default (ADR-066); pick another live with
+# 'displayxr-cli dp mode set anaglyph --screen <key>' (or SIM_DISPLAY_OUTPUT=...).
+# sim-display starts in 2D (ADR-065), so SIM_DISPLAY_START_3D=1 opens the app in
+# the 3D mode. V toggles 2D <-> 3D; 0 / 1 select them.
 export XR_RUNTIME_JSON="$BUILD_DIR/openxr_displayxr-dev.json"
 export LD_LIBRARY_PATH="$OPENXR_DIR/lib:\${LD_LIBRARY_PATH:-}"
 $PLUGIN_LINE
@@ -481,7 +482,6 @@ $PLUGIN_LINE
 # single-graphics-queue GPUs). Installed builds use the system manifest path.
 export VK_LAYER_PATH="$BUILD_DIR/src/xrt/targets/vk_layer\${VK_LAYER_PATH:+:\$VK_LAYER_PATH}"
 export OXR_ENABLE_VK_NATIVE_COMPOSITOR="\${OXR_ENABLE_VK_NATIVE_COMPOSITOR:-1}"
-export SIM_DISPLAY_OUTPUT="\${SIM_DISPLAY_OUTPUT:-anaglyph}"
 export SIM_DISPLAY_START_3D="\${SIM_DISPLAY_START_3D:-1}"
 $FORCE_IPC
 exec "$APP_DIR/build/$APP" "\$@"

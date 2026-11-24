@@ -12,7 +12,8 @@
  * sim-display` reads and writes. Values are resolved ONCE per key per
  * process and cached (the DEBUG_GET_ONCE contract these replaced; several
  * are read on hot paths), so a write applies to the next process that loads
- * the plug-in.
+ * the plug-in - except OUTPUT, the rendering-mode config, which is re-read
+ * live (@ref sim_display_setting_reread, ADR-066 C1).
  *
  * This file is the ONE place the legacy `SIM_DISPLAY_*` environment names
  * are still honoured (one release, with a deprecation WARN once per key):
@@ -57,6 +58,14 @@ sim_display_settings_bind(const struct xrt_plugin_host_iface *host);
  */
 bool
 sim_display_setting(const char *key, char *buf, size_t cap);
+
+/*!
+ * @ref sim_display_setting, but resolved afresh (the cache row for @p key is
+ * dropped first): for the one setting that applies LIVE, OUTPUT (ADR-066 C1),
+ * which the runtime polls through XRT_DEVICE_PROPERTY_CONFIGURED_3D_MODE.
+ */
+bool
+sim_display_setting_reread(const char *key, char *buf, size_t cap);
 
 //! Is anything (host or alias) setting @p key? The former "environment variable present" test.
 bool

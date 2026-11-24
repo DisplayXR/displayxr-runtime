@@ -35,10 +35,12 @@ struct xrt_eye_positions;
  *
  * @brief Simulates a tracked 3D display on any 2D screen.
  *
- * Supports multiple output modes selected via SIM_DISPLAY_OUTPUT env var:
- * - "2d": single-view full-resolution passthrough
+ * Declares one rendering mode per output kind (ADR-066 C1); the screen's 3D
+ * mode (a per-screen `dp mode set` choice, else the OUTPUT setting) picks which
+ * one the 3D slot maps to, live:
+ * - "default" / "same_as_2d" (default; "2d", "passthrough"): one full-resolution view
  * - "sbs": side-by-side left/right views
- * - "anaglyph" (default): red-cyan anaglyph stereoscopy
+ * - "anaglyph": red-cyan anaglyph stereoscopy
  * - "blend": 50/50 alpha blend of both views
  * - "interlaced": 1-pixel column interlace (phase-sensitive weave proxy, #817)
  *

@@ -12,12 +12,14 @@
 # Then run:
 #   XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json \
 #   DYLD_LIBRARY_PATH=/tmp/openxr-install-<OPENXR_VERSION>/lib \
-#   SIM_DISPLAY_OUTPUT=anaglyph SIM_DISPLAY_START_3D=1 \
+#   SIM_DISPLAY_START_3D=1 \
 #   ./test_apps/build/bin/cube_handle_vk_macos
 #
-# sim-display serves two modes, 2D and the 3D kind SIM_DISPLAY_OUTPUT names, and
-# starts in 2D (ADR-065); the generated run_*.sh scripts set
-# SIM_DISPLAY_START_3D=1 so they open in the kind, as they always did. V toggles.
+# sim-display shows two modes, 2D and the screen's 3D mode (ADR-065/066: Same as
+# 2D by default; `displayxr-cli dp mode set anaglyph --screen <key>` or
+# SIM_DISPLAY_OUTPUT=anaglyph picks another, live), and starts in 2D; the
+# generated run_*.sh scripts set SIM_DISPLAY_START_3D=1 so they open in the 3D
+# mode. The zones scripts default to sbs. V toggles.
 
 set -e
 
@@ -566,9 +568,8 @@ export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export VK_ICD_FILENAMES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
 export VK_DRIVER_FILES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
-export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
-echo "Starting cube_handle_vk_macos (Vulkan, window handle) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_handle_vk_macos (Vulkan, window handle) with ${SIM_DISPLAY_OUTPUT:-the default 3D mode} output..."
 exec "$DIR/bin/cube_handle_vk_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_handle_vk.sh"
@@ -580,9 +581,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
-export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
-echo "Starting cube_handle_metal_macos (Metal, window handle) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_handle_metal_macos (Metal, window handle) with ${SIM_DISPLAY_OUTPUT:-the default 3D mode} output..."
 exec "$DIR/bin/cube_handle_metal_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_handle_metal.sh"
@@ -596,7 +596,7 @@ export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-sbs}"
 export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
-echo "Starting cube_zones_metal_macos (Metal, XR_DXR_display_zones) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_zones_metal_macos (Metal, XR_DXR_display_zones) with ${SIM_DISPLAY_OUTPUT:-the default 3D mode} output..."
 exec "$DIR/bin/cube_zones_metal_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_zones_metal.sh"
@@ -612,7 +612,7 @@ export VK_ICD_FILENAMES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
 export VK_DRIVER_FILES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-sbs}"
 export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
-echo "Starting cube_zones_vk_macos (Vulkan, XR_DXR_display_zones) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_zones_vk_macos (Vulkan, XR_DXR_display_zones) with ${SIM_DISPLAY_OUTPUT:-the default 3D mode} output..."
 exec "$DIR/bin/cube_zones_vk_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_zones_vk.sh"
@@ -624,9 +624,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
-export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
-echo "Starting cube_handle_gl_macos (OpenGL, window handle) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_handle_gl_macos (OpenGL, window handle) with ${SIM_DISPLAY_OUTPUT:-the default 3D mode} output..."
 exec "$DIR/bin/cube_handle_gl_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_handle_gl.sh"
@@ -644,7 +643,7 @@ export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-sbs}"
 export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
-echo "Starting cube_zones_texture_metal_macos (Metal, texture-mode display-zones parity) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_zones_texture_metal_macos (Metal, texture-mode display-zones parity) with ${SIM_DISPLAY_OUTPUT:-the default 3D mode} output..."
 exec "$DIR/bin/cube_zones_texture_metal_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_zones_texture_metal.sh"
@@ -656,9 +655,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
-export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
-echo "Starting cube_hosted_metal_macos (Metal, hosted) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_hosted_metal_macos (Metal, hosted) with ${SIM_DISPLAY_OUTPUT:-the default 3D mode} output..."
 exec "$DIR/bin/cube_hosted_metal_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_hosted_metal.sh"
@@ -670,9 +668,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
-export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
-echo "Starting cube_hosted_legacy_metal_macos (Metal, legacy hosted) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_hosted_legacy_metal_macos (Metal, legacy hosted) with ${SIM_DISPLAY_OUTPUT:-the default 3D mode} output..."
 exec "$DIR/bin/cube_hosted_legacy_metal_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_hosted_legacy_metal.sh"
@@ -684,9 +681,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
-export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
-echo "Starting cube_hosted_legacy_gl_macos (OpenGL, legacy hosted) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_hosted_legacy_gl_macos (OpenGL, legacy hosted) with ${SIM_DISPLAY_OUTPUT:-the default 3D mode} output..."
 exec "$DIR/bin/cube_hosted_legacy_gl_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_hosted_legacy_gl.sh"
@@ -700,9 +696,8 @@ export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export VK_ICD_FILENAMES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
 export VK_DRIVER_FILES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
-export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
-echo "Starting cube_hosted_legacy_vk_macos (Vulkan, legacy hosted) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_hosted_legacy_vk_macos (Vulkan, legacy hosted) with ${SIM_DISPLAY_OUTPUT:-the default 3D mode} output..."
 exec "$DIR/bin/cube_hosted_legacy_vk_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_hosted_legacy_vk.sh"
@@ -758,5 +753,5 @@ echo "  XR_RUNTIME_JSON=$BUILD_DIR/openxr_displayxr-dev.json \\"
 echo "  DYLD_LIBRARY_PATH=$OPENXR_DIR/lib \\"
 echo "  VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \\"
 echo "  VK_DRIVER_FILES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \\"
-echo "  SIM_DISPLAY_OUTPUT=anaglyph SIM_DISPLAY_START_3D=1 \\"
+echo "  SIM_DISPLAY_START_3D=1 \\"
 echo "  $ROOT/test_apps/build/bin/cube_handle_vk_macos"

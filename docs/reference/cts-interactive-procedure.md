@@ -166,31 +166,35 @@ cover.
 
 ### 2.3 Set the sim-display output mode deliberately — the default will ruin the run
 
-sim-display serves two rendering modes, 2D (mode 0) and the 3D kind
-`SIM_DISPLAY_OUTPUT` names (mode 1), and **starts in 2D** unless
-`SIM_DISPLAY_START_3D=1` ([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md)).
-Both are read at device create (`sim_display_hmd_create`, table of kinds in
-`src/xrt/drivers/sim_display/sim_display_modes.h`). A CTS session is a legacy
+sim-display shows two rendering modes, 2D (mode 0) and the screen's 3D mode
+(mode 1: a per-screen `dp mode set` choice, else the entry `SIM_DISPLAY_OUTPUT`
+names, else **Same as 2D**), and **starts in 2D** unless
+`SIM_DISPLAY_START_3D=1` ([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md),
+ADR-066 (design PR #2792) C1). The 3D
+mode applies live; the start mode is read at device create (`sim_display_hmd_create`,
+declared list in `src/xrt/drivers/sim_display/sim_display_modes.h`). Clear any
+per-screen choice first (`displayxr-cli dp mode reset --screen all`): it outranks
+`SIM_DISPLAY_OUTPUT`. A CTS session is a legacy
 session that cannot change the mode (V is a thumbstick click in a CTS run, not the 2D/3D toggle), so
 whatever the device starts in is what the whole run sees:
 
 | Setting | What the panel shows | Use for |
 |---|---|---|
-| `SIM_DISPLAY_OUTPUT=2d` | mode 0: first view flat, full window | **everything except eye-visibility** |
+| `SIM_DISPLAY_OUTPUT=2d` (= `default`, Same as 2D) | first view flat, full window, in either mode | **everything except eye-visibility** |
 | `SIM_DISPLAY_OUTPUT=sbs` + `SIM_DISPLAY_START_3D=1` | mode 1: side-by-side, centre-cropped, 2 views | the `EyeVisibility`-shaped tests only |
 | `SIM_DISPLAY_OUTPUT=squeezed` + `SIM_DISPLAY_START_3D=1` | SBS, no crop, tiles as-is | rarely — cross-check a tiling doubt |
 | `anaglyph` | red/cyan, 2 views | **never for these runs** |
 | `blend` | 50/50 alpha blend of the views | never |
 | `quad` | 2×2, 4 views | **never** — see below |
 
-> **Set it explicitly.** With `SIM_DISPLAY_OUTPUT` unset the device now starts
-> flat (mode 0), but the 3D kind behind it is `anaglyph`, and any recipe that adds
-> `SIM_DISPLAY_START_3D=1` (or an old note that relied on sim-display starting in
-> 3D) lands in red/cyan. Anaglyph destroys every colour judgement in the
+> **Set it explicitly.** Since ADR-066 the default 3D mode is Same as 2D (one
+> flat view in mode 1 too), so an unset `SIM_DISPLAY_OUTPUT` no longer lands a
+> `SIM_DISPLAY_START_3D=1` recipe in red/cyan - but a per-screen `dp mode set` choice
+> or a stored `OUTPUT` would. Anaglyph destroys every colour judgement in the
 > composition set — `GradientFormatsLinearVsNonLinear` and the alpha-blending
 > tests become meaningless, and you would not necessarily notice, because a
-> red/cyan gradient still looks like *a* gradient. `2d` also forces the flat
-> start, whatever else is set.
+> red/cyan gradient still looks like *a* gradient. (`2d` no longer forces the flat
+> start; it names the Same-as-2D mode, which is flat in both modes anyway.)
 
 ```powershell
 $env:SIM_DISPLAY_OUTPUT = "2d"     # PowerShell sets the process env block;
