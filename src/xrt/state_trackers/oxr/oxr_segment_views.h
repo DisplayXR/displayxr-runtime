@@ -420,6 +420,32 @@ oxr_segment_views_alias_source(uint32_t i, uint32_t active_view_count)
 }
 
 /*!
+ * May this locate hand out one view set PER SEGMENT (M3)?
+ *
+ * Per-segment sets make `activeViewCount` the SUM over segments, and the
+ * compositor then routes views `[first, first + n)` of each set into its
+ * segment. An app can only render that many views when it can learn the sum:
+ * it chained XrViewActivityStateDXR (the count) or XrViewDisplayBindingsDXR
+ * (the ranges) on this call's XrViewState. An app that chains neither derives
+ * its view count from the rendering mode and submits ONE set; routed as
+ * per-segment sets, its first set (framed for the first segment only) would be
+ * drawn in every segment. Such an app keeps one view set for the whole window,
+ * framed from the majority screen and cropped per segment (M2) — the same
+ * outcome as PRIMARY_STEREO.
+ *
+ * @param is_multiview       The session runs PRIMARY_MULTIVIEW_DXR.
+ * @param rig_allows         The locate is display-centric and not zone-scoped
+ *                           (the caller's rig / zone test).
+ * @param chained_activity   XrViewActivityStateDXR is on the output chain.
+ * @param chained_bindings   XrViewDisplayBindingsDXR is on the output chain.
+ */
+static inline bool
+oxr_segment_views_can_split(bool is_multiview, bool rig_allows, bool chained_activity, bool chained_bindings)
+{
+	return is_multiview && rig_allows && (chained_activity || chained_bindings);
+}
+
+/*!
  * XR_DXR_cursor_depth (ADR-046) on a split window: the segment under the
  * pointer, and the pointer re-expressed in it. Each per-segment view set
  * frames ONE segment as its canvas, so the cursor is placed - and drawn -

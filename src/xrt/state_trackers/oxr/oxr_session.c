@@ -6377,7 +6377,32 @@ oxr_session_locate_views(struct oxr_logger *log,
 	 * per segment, each woven by its own screen's DP or flat 2D (M2). When
 	 * the majority is the primary screen this IS the single-screen path.
 	 */
-	if (!is_multiview || !locate_can_split(sess, viewLocateInfo)) {
+	// An app that cannot learn the per-segment sum (no XrViewActivityStateDXR,
+	// no XrViewDisplayBindingsDXR on this call) renders ONE set: it keeps the
+	// one-set path too (oxr_segment_views_can_split).
+	bool chained_activity = false;
+	bool chained_bindings = false;
+#ifdef OXR_HAVE_DXR_display_info
+	if (sess->sys->inst->extensions.DXR_display_info && viewState != NULL) {
+		chained_activity = OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_VIEW_ACTIVITY_STATE_DXR,
+		                                             XrViewActivityStateDXR) != NULL;
+		chained_bindings = OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR,
+		                                             XrViewDisplayBindingsDXR) != NULL;
+	}
+#endif
+	const bool rig_allows = is_multiview && locate_can_split(sess, viewLocateInfo);
+	const bool can_split =
+	    oxr_segment_views_can_split(is_multiview, rig_allows, chained_activity, chained_bindings);
+	if (is_multiview && rig_allows && !can_split && m.count > 1 && !sess->warned_split_needs_activity) {
+		sess->warned_split_needs_activity = true;
+		U_LOG_W(
+		    "per-segment views: the window spans %u screens but this app chains neither "
+		    "XrViewActivityStateDXR nor XrViewDisplayBindingsDXR on xrLocateViews, so it cannot render "
+		    "one view set per screen — one view set for the whole window, framed from the screen "
+		    "holding most of it and cropped per screen (ADR-047 M2). Logged once.",
+		    m.count);
+	}
+	if (!can_split) {
 		XrResult ret;
 		if (m.seg[mj].is_primary) {
 			ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput,

@@ -1409,11 +1409,15 @@ display holding most of the window (its eyes, the window relative to it), the ot
 display showing its own crop of them or a flat 2D copy; a camera-centric locate
 (`XrCameraRigDXR`, or the qwerty camera rig of a runtime-window session), which frames a
 fixed-FOV camera on the whole window; a zone-scoped locate (`XrDisplayZoneDXR`); a window
-covering more displays than `XRT_MAX_SEGMENTS`; a display of unknown physical size.
+covering more displays than `XRT_MAX_SEGMENTS`; a display of unknown physical size; a
+locate whose `XrViewState` chains neither `XrViewActivityStateDXR` nor
+`XrViewDisplayBindingsDXR` — such an app cannot learn that the active count is the sum over
+segments, so it would submit one set and have it drawn in every segment.
 
-**Scope (M3).** In-process Vulkan sessions on desktop Linux (X11/XWayland), the only
-compositor that segments today. IPC/service sessions never segment: their tables are
-always one set, `bindingCountOutput` 0. The rendering mode is session-wide, so every
+**Scope.** Every compositor that segments a window per screen (see
+`docs/architecture/comp-segments.md` for the list per platform; on desktop Linux the
+in-process Vulkan compositor on X11/XWayland and on native Wayland). A session whose
+compositor publishes no segment table always gets one set, `bindingCountOutput` 0. The rendering mode is session-wide, so every
 segment carries the same view count.
 
 ### Fixed-viewer locates — `XrViewLocateFixedViewerDXR` (v25)

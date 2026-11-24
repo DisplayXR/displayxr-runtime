@@ -1512,6 +1512,11 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 			// (#1595 / #1831), already applied to the frame's layout.
 			dp_of[k] = f->primary_dp;
 			weave[k] = f->primary_dp != NULL;
+			if (f->primary_gate_per_segment) {
+				// Native Wayland: its screen's 1:1 as well (see the field).
+				weave[k] = comp_segments_decide(f->primary_dp != NULL, f->primary_tolerates_resample,
+				                                g->screen_1to1) == COMP_SEG_RENDER_WEAVE;
+			}
 		} else if (st_of[k] != NULL) {
 			dp_of[k] = st_of[k]->dp;
 			weave[k] = comp_segments_decide(dp_of[k] != NULL, st_of[k]->tolerates_resample, g->screen_1to1) ==
@@ -1824,7 +1829,12 @@ comp_vk_native_segments_get_metrics(const struct comp_vk_native_segments *segs,
 		}
 	}
 	out->count = t->count;
-	out->canvas = (struct xrt_rect){{canvas->x, canvas->y}, {(int)canvas->w, (int)canvas->h}};
+	// The canvas the table was cut from — never the zero "whole window"
+	// sentinel, which the routing could not map (a native-Wayland window that
+	// has never been on the panel has no cached client size, so its weave
+	// canvas is that sentinel).
+	const struct comp_seg_rect cv = comp_segments_resolve_canvas(canvas, window_desktop->w, window_desktop->h);
+	out->canvas = (struct xrt_rect){{cv.x, cv.y}, {(int)cv.w, (int)cv.h}};
 	out->window_screen_left = window_desktop->x;
 	out->window_screen_top = window_desktop->y;
 	out->window_pixel_width = window_desktop->w;

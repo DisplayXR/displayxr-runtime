@@ -899,6 +899,40 @@ TEST_CASE("weave_screens Wayland: a window across the seam is cut per screen")
 	CHECK(zr_w == 420);
 }
 
+TEST_CASE("weave_screens Wayland: a straddle is cut in the BUFFER's px, not the window monitor's")
+{
+	const xrt_screen_list l = desk_ds1();
+	// The same window as above: its monitor is the 5/3 laptop (800x500 px
+	// there), but touching the 2.0 panel makes the compositor's preferred
+	// scale 2.0, so the app's buffer is 960x600 — 1:1 on the panel, resampled
+	// on the laptop.
+	comp_weave_monitor_window mw = wl_win(0, 0, 2880, 1800, LAPTOP_SCALE, 1500, 100, 800, 500);
+	REQUIRE(comp_weave_monitor_window_to_buffer(&mw, 960, 600));
+	CHECK(mw.w == 960);
+	CHECK(mw.monitor_w == 3456); // the laptop in buffer px: 1728 logical x 2
+	const wl_cut c = place_wl(l, mw);
+	REQUIRE(c.r == COMP_WEAVE_MONITOR_OK);
+	CHECK(c.monitor == 1); // still the laptop's window
+	REQUIRE(c.t.count == 2);
+	uint32_t edp_w = 0, zr_w = 0;
+	for (uint32_t k = 0; k < c.t.count; k++) {
+		const bool edp = c.t.seg[k].screen_id == EDP;
+		(edp ? edp_w : zr_w) = c.t.seg[k].window_rect.w;
+		// The panel's part is its own pixels; the laptop's is resampled.
+		CHECK(c.t.seg[k].screen_1to1 == (edp ? COMP_SEG_1TO1_NO : COMP_SEG_1TO1_YES));
+	}
+	CHECK(edp_w == 456); // 228 logical x 2
+	CHECK(zr_w == 504);  // 252 logical x 2
+	CHECK(edp_w + zr_w == 960);
+
+	// Nothing to do: unknown buffer, the content size itself, a non-uniform size.
+	comp_weave_monitor_window same = wl_win(0, 0, 2880, 1800, LAPTOP_SCALE, 1500, 100, 800, 500);
+	CHECK_FALSE(comp_weave_monitor_window_to_buffer(&same, 0, 0));
+	CHECK_FALSE(comp_weave_monitor_window_to_buffer(&same, 800, 500));
+	CHECK_FALSE(comp_weave_monitor_window_to_buffer(&same, 960, 500));
+	CHECK(same.w == 800);
+}
+
 TEST_CASE("weave_screens Wayland: a content rect one px off the conversion still places")
 {
 	const xrt_screen_list l = desk_ds1();

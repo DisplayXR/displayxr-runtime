@@ -379,6 +379,19 @@ TEST_CASE("views are contiguous per segment and the tail aliases view 0", "[oxr]
 	CHECK(oxr_segment_views_alias_source(7, 4) == 0);
 }
 
+TEST_CASE("per-segment view sets need an app that can learn the sum", "[oxr][segment_views]")
+{
+	// Chains the activity state (or the bindings): it can render n views per segment.
+	CHECK(oxr_segment_views_can_split(true, true, true, false));
+	CHECK(oxr_segment_views_can_split(true, true, false, true));
+	// Chains neither (derives its count from the rendering mode): ONE set,
+	// cropped per segment — never its first set drawn in every segment.
+	CHECK_FALSE(oxr_segment_views_can_split(true, true, false, false));
+	// PRIMARY_STEREO / a camera-centric or zone-scoped locate never split.
+	CHECK_FALSE(oxr_segment_views_can_split(false, true, true, true));
+	CHECK_FALSE(oxr_segment_views_can_split(true, false, true, true));
+}
+
 TEST_CASE("a segment takes its DP's eyes tracked or not, like the single-screen path", "[oxr][segment_views]")
 {
 	// Untracked but valid (sim_display): accepted — not replaced by the
