@@ -15597,27 +15597,6 @@ svc_seg_window_rect(HWND hwnd, struct comp_seg_rect *out)
  *
  */
 
-//! One WARN per change, the in-process vk_native wording (one grep on every platform).
-static void
-svc_view_size_log(const struct xrt_effective_mode_table *e)
-{
-	if (!e->valid) {
-		U_LOG_W(
-		    "view size: the window is on the session screen - its app is told the session display's "
-		    "table (ADR-047 Amendment 10)");
-		return;
-	}
-	U_LOG_W(
-	    "view size: the window covers %u screen(s), majority 0x%016llx - its app is told slot 0 "
-	    "'%s' %ux%u tiles x %.3f x %.3f, slot 1 '%s' %u view(s) %ux%u tiles x %.3f x %.3f%s "
-	    "(ADR-047 Amendment 10)",
-	    e->screen_count, (unsigned long long)e->majority_screen_id, e->slot[0].mode_name, e->slot[0].tile_columns,
-	    e->slot[0].tile_rows, (double)e->slot[0].view_scale_x, (double)e->slot[0].view_scale_y,
-	    e->slot[1].mode_name, e->slot[1].view_count, e->slot[1].tile_columns, e->slot[1].tile_rows,
-	    (double)e->slot[1].view_scale_x, (double)e->slot[1].view_scale_y,
-	    (e->clamped[0] || e->clamped[1]) ? " - clamped to the instance's worst case" : "");
-}
-
 //! The service's screen list as segment screens (the primary = the system-default screen).
 static uint32_t
 svc_view_size_screens(const struct xrt_screen_list *list, struct comp_segments_screen *out)
@@ -15692,9 +15671,51 @@ svc_view_size_follow_table(struct d3d11_service_system *sys,
 		c->view_eff_ns = (int64_t)now;
 	}
 	if (changed) {
-		svc_view_size_log(&next->eff);
+		comp_segments_view_size_log_change(&next->eff);
 	}
 	free(next);
+}
+
+/*!
+ * Client @p c's window @p win through segment manager @p segs (the direct
+ * pipeline's or the present-owner's): the manager holds the view-size state
+ * (comp_d3d11_segments_update_view_size, shared with the in-process D3D11
+ * compositor), so its segment DPs draw from the SAME table the app is told;
+ * the table is copied out for the IPC main loop. False when @p segs cannot
+ * (not built / not enabled): the caller falls back to
+ * svc_view_size_follow_window.
+ */
+static bool
+svc_view_size_follow_manager(struct d3d11_service_system *sys,
+                             struct d3d11_service_compositor *c,
+                             struct comp_d3d11_segments *segs,
+                             const struct comp_seg_rect *win)
+{
+	struct xrt_device *head = sys->xdev;
+	if (segs == nullptr || !comp_d3d11_segments_enabled(segs) || head == nullptr || win == nullptr ||
+	    head->rendering_mode_count == 0) {
+		return false;
+	}
+	const struct comp_seg_rect canvas = {0, 0, win->w, win->h};
+	// No view cap (0): the IPC client lays its views out from what it
+	// enumerates; the instance's worst case clamps.
+	(void)comp_d3d11_segments_update_view_size(segs, win, &canvas, head->rendering_modes,
+	                                           head->rendering_mode_count, 0, sys->base.info.atlas_width_pixels,
+	                                           sys->base.info.atlas_height_pixels);
+	struct xrt_effective_mode_table eff;
+	(void)comp_d3d11_segments_get_effective_table(segs, &eff);
+	std::lock_guard<std::mutex> lk(c->seg_mutex);
+	c->view_eff = eff;
+	c->view_eff_ns = (int64_t)os_monotonic_get_ns();
+	return true;
+}
+
+//! The head's run-time slot (0 = 2D, 1 = the 3D mode): each non-primary
+//! segment DP draws its own screen's entry for it.
+static uint32_t
+svc_active_slot(struct d3d11_service_system *sys)
+{
+	return (sys->xdev != nullptr && sys->xdev->hmd != nullptr) ? sys->xdev->hmd->active_rendering_mode_index : 0;
 }
 
 //! Client @p c's window @p win (desktop px) against its opted-in screen list.
@@ -15863,7 +15884,8 @@ pipeline_segments_weave(struct d3d11_service_system *sys,
 	// every direct weave of it, split or not, so the size follows it back.
 	if (kind == PRESENTER_APP_HWND) {
 		struct comp_seg_rect vwin = {};
-		if (svc_seg_window_rect(present_hwnd, &vwin)) {
+		if (svc_seg_window_rect(present_hwnd, &vwin) &&
+		    !svc_view_size_follow_manager(sys, fc, fc->segments, &vwin)) {
 			svc_view_size_follow_window(sys, fc, &vwin);
 		}
 	}
@@ -15921,6 +15943,10 @@ pipeline_segments_weave(struct d3d11_service_system *sys,
 	sf.atlas_encoding = (int)service_single_client_atlas_encoding(fc);
 	sf.primary_dp = dp;
 	sf.outcomp = fc->seg_outcomp;
+	// ADR-047 Amendment 10: each other screen's DP draws THAT screen's entry
+	// (the manager ran comp_d3d11_segments_update_view_size above).
+	sf.screen_entries = true;
+	sf.active_slot = svc_active_slot(sys);
 	// #2245: every segment DP paced at its own screen's period.
 	struct comp_segments_screen rate_screens[COMP_SEGMENTS_MAX_SCREENS];
 	float rate_hz[COMP_SEGMENTS_MAX_SCREENS];
@@ -32492,7 +32518,9 @@ weave_seg_update(struct d3d11_service_system *sys,
 	}
 	// ADR-047 Amendment 10: the present-owner's window's table (its enumerating
 	// session follows it through the IPC main loop).
-	svc_view_size_follow_window(sys, c, &win);
+	if (!svc_view_size_follow_manager(sys, c, c->weave_segs, &win)) {
+		svc_view_size_follow_window(sys, c, &win);
+	}
 	const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
 	const uint32_t mode_index =
 	    (sys->xdev != nullptr && sys->xdev->hmd != nullptr) ? sys->xdev->hmd->active_rendering_mode_index : 0;
@@ -32558,6 +32586,9 @@ weave_seg_record(struct d3d11_service_system *sys,
 	sf.transparent_background = true;
 	sf.client_presents = true;
 	sf.atlas_encoding = (int)service_single_client_atlas_encoding(c);
+	// ADR-047 Amendment 10: each other screen's DP draws THAT screen's entry.
+	sf.screen_entries = true;
+	sf.active_slot = svc_active_slot(sys);
 	sf.primary_dp = dp;
 	sf.outcomp = c->weave_seg_outcomp;
 	comp_d3d11_segments_record(c->weave_segs, &sf);
