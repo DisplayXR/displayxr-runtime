@@ -36,6 +36,42 @@ public static class StatusText
 
     public static Level Max(Level a, Level b) => (Level)Math.Max((int)a, (int)b);
 
+    // ── 2D-to-3D jobs: the one place a task id becomes words ────────────────
+
+    /// <summary>
+    /// The plain name of a conversion task, for every place a task is shown to a person. The feed
+    /// carries only the id (<c>depth-video</c>, the word <c>displayxr-cli conv use</c> takes), so the
+    /// id stays what commands and Details print. An id this list does not know is shown as it is.
+    /// </summary>
+    public static string ConversionTaskName(string taskId) => taskId switch
+    {
+        "depth-mono" => "depth from a photo",
+        "depth-video" => "depth from video",
+        "disparity-stereo" => "depth from a 3D photo or video",
+        "views-mono" => "3D from 2D video and photos",
+        "views-stereo" => "more views from a 3D photo or video",
+        "views-from-depth" => "3D from a picture and its depth",
+        "splats-mono" => "3D scene from a photo",
+        "splats-stereo" => "3D scene from a 3D photo",
+        _ => taskId,
+    };
+
+    /// <summary><see cref="ConversionTaskName"/> as the start of a line: a label in a row's Details.</summary>
+    public static string ConversionTaskLabel(string taskId)
+    {
+        string name = ConversionTaskName(taskId);
+        return name == taskId || name.Length == 0 ? name : char.ToUpperInvariant(name[0]) + name[1..];
+    }
+
+    /// <summary>The button that makes a converter the first choice for one task.</summary>
+    public static string PreferTaskButton(string taskId) => $"Use this one for {ConversionTaskName(taskId)}";
+
+    /// <summary>The chip on the converter the user chose for one task.</summary>
+    public static string TaskChoiceChip(string taskId) => $"Your choice for {ConversionTaskName(taskId)}";
+
+    /// <summary>The button that hands one task's choice back to DisplayXR.</summary>
+    public static string ResetTaskButton(string taskId) => $"Choose automatically for {ConversionTaskName(taskId)}";
+
     // ── Screens ─────────────────────────────────────────────────────────────
 
     /// <summary>

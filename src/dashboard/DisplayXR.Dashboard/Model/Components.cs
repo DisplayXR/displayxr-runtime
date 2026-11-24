@@ -831,8 +831,9 @@ public static class Components
                 var (text, _) = TaskChip(t);
                 string sel = t.Selected ? "selected" : t.Order is null ? t.Verdict : $"#{t.Order + 1} ({t.Verdict})";
                 string load = t.Streams + t.JobsQueued > 0 ? $"{Sep}{t.Streams} streams, {t.JobsQueued} jobs" : "";
-                string taskName = $"{t.Task}{(t.Composed ? " (depth + view synthesis)" : "")}";
-                string taskLine = $"{text}{Sep}{sel}{load}" + (t.CpuStaging ? $"{Sep}CPU staging" : "");
+                // The label is the task in plain words; its id (what `conv use` takes) ends the line.
+                string taskName = $"{StatusText.ConversionTaskLabel(t.Task)}{(t.Composed ? " (depth + view synthesis)" : "")}";
+                string taskLine = $"{text}{Sep}{sel}{load}" + (t.CpuStaging ? $"{Sep}CPU staging" : "") + $"{Sep}id {t.Task}";
                 lines.Add($"{taskName}: {taskLine}");
                 lineFacts.Add((taskName, taskLine));
             }

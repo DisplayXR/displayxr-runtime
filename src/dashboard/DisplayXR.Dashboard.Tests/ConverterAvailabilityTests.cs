@@ -161,7 +161,7 @@ public class ConverterAvailabilityTests
             Assert.DoesNotContain("0", providers.ConnectedLine);
             var leia = providers.Items.Single(i => i.Id == "leia-conversion");
             Assert.Equal(PlainState.Ready, leia.State);
-            Assert.Contains(leia.DetailFacts, f => f.Label == "depth-mono" && f.Text.StartsWith("warming 40%", System.StringComparison.Ordinal));
+            Assert.Contains(leia.DetailFacts, f => f.Label == "Depth from a photo" && f.Text.StartsWith("warming 40%", System.StringComparison.Ordinal));
             Assert.Equal(PlainState.NotAvailable, providers.Items.Single(i => i.Id == Sim).State);
             // The card does not claim that nothing is turned on.
             Assert.Equal("Converter", module.Items[0].Name);
