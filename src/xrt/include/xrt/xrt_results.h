@@ -370,4 +370,17 @@ typedef enum xrt_result
 	 * this: that reports XR_ERROR_INSTANCE_LOST, and the instance is fine.
 	 */
 	XRT_ERROR_COMPOSITOR_DEVICE_LOST = -49,
+
+	/*!
+	 * XR_DXR_stereo_camera v8: another stream holds this camera's controls.
+	 * Maps to XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR.
+	 */
+	XRT_ERROR_STEREO_CAMERA_CONTROL_HELD = -50,
+
+	/*!
+	 * A call made in the wrong order (XR_DXR_stereo_camera v8: controls or a
+	 * still on a stream that is not started, a still acquired before it is
+	 * ready). Maps to XR_ERROR_CALL_ORDER_INVALID.
+	 */
+	XRT_ERROR_CALL_ORDER_INVALID = -51,
 } xrt_result_t;

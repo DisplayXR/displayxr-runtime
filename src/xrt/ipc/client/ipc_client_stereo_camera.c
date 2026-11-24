@@ -48,16 +48,39 @@ ipc_client_stereo_camera_get_properties(struct ipc_connection *ipc_c,
 }
 
 xrt_result_t
-ipc_client_stereo_camera_get_calibration(struct ipc_connection *ipc_c,
-                                         uint64_t camera_id,
-                                         uint32_t output,
-                                         struct xrt_stereo_camera_calibration *out_calib)
+ipc_client_stereo_camera_get_calibration_mode(struct ipc_connection *ipc_c,
+                                              uint64_t camera_id,
+                                              uint32_t output,
+                                              uint32_t eye_width,
+                                              uint32_t eye_height,
+                                              struct xrt_stereo_camera_calibration *out_calib)
 {
 	U_ZERO(out_calib);
 	if (ipc_c == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_call_stereo_camera_get_calibration(ipc_c, camera_id, output, out_calib);
+	return ipc_call_stereo_camera_get_calibration(ipc_c, camera_id, output, eye_width, eye_height, out_calib);
+}
+
+xrt_result_t
+ipc_client_stereo_camera_get_refinement(struct ipc_connection *ipc_c,
+                                        uint64_t camera_id,
+                                        struct xrt_stereo_camera_refinement *out_refinement)
+{
+	U_ZERO(out_refinement);
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_stereo_camera_get_refinement(ipc_c, camera_id, out_refinement);
+}
+
+xrt_result_t
+ipc_client_stereo_camera_get_calibration(struct ipc_connection *ipc_c,
+                                         uint64_t camera_id,
+                                         uint32_t output,
+                                         struct xrt_stereo_camera_calibration *out_calib)
+{
+	return ipc_client_stereo_camera_get_calibration_mode(ipc_c, camera_id, output, 0, 0, out_calib);
 }
 
 xrt_result_t
@@ -131,23 +154,38 @@ ipc_client_stereo_camera_stream_get_transport(struct ipc_connection *ipc_c,
 }
 
 xrt_result_t
+ipc_client_stereo_camera_acquire_ex(struct ipc_connection *ipc_c,
+                                    uint64_t stream_id,
+                                    bool *out_ready,
+                                    struct xrt_stereo_camera_frame_info *out_frame,
+                                    struct xrt_app_share_frame_info *out_app,
+                                    struct xrt_stereo_camera_capture_result *out_result)
+{
+	*out_ready = false;
+	U_ZERO(out_frame);
+	struct xrt_app_share_frame_info app = {0};
+	struct xrt_stereo_camera_capture_result res = {0};
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	xrt_result_t xret = ipc_call_stereo_camera_acquire(ipc_c, stream_id, out_ready, out_frame, &app, &res);
+	if (out_app != NULL) {
+		*out_app = app;
+	}
+	if (out_result != NULL) {
+		*out_result = res;
+	}
+	return xret;
+}
+
+xrt_result_t
 ipc_client_stereo_camera_acquire(struct ipc_connection *ipc_c,
                                  uint64_t stream_id,
                                  bool *out_ready,
                                  struct xrt_stereo_camera_frame_info *out_frame,
                                  struct xrt_app_share_frame_info *out_app)
 {
-	*out_ready = false;
-	U_ZERO(out_frame);
-	struct xrt_app_share_frame_info app = {0};
-	if (ipc_c == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	xrt_result_t xret = ipc_call_stereo_camera_acquire(ipc_c, stream_id, out_ready, out_frame, &app);
-	if (out_app != NULL) {
-		*out_app = app;
-	}
-	return xret;
+	return ipc_client_stereo_camera_acquire_ex(ipc_c, stream_id, out_ready, out_frame, out_app, NULL);
 }
 
 xrt_result_t
@@ -200,6 +238,96 @@ ipc_client_stereo_camera_control(struct ipc_connection *ipc_c, uint32_t op, uint
 	return ipc_call_stereo_camera_control(ipc_c, op, arg, out_value);
 }
 
+xrt_result_t
+ipc_client_stereo_camera_get_modes(struct ipc_connection *ipc_c,
+                                   uint64_t camera_id,
+                                   struct xrt_stereo_camera_mode_list *out_modes)
+{
+	U_ZERO(out_modes);
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	xrt_result_t xret = ipc_call_stereo_camera_get_modes(ipc_c, camera_id, out_modes);
+	if (out_modes->count > XRT_STEREO_CAMERA_MAX_MODES) {
+		out_modes->count = XRT_STEREO_CAMERA_MAX_MODES;
+	}
+	return xret;
+}
+
+xrt_result_t
+ipc_client_stereo_camera_get_control_caps(struct ipc_connection *ipc_c,
+                                          uint64_t camera_id,
+                                          struct xrt_stereo_camera_control_caps *out_caps)
+{
+	U_ZERO(out_caps);
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_stereo_camera_get_control_caps(ipc_c, camera_id, out_caps);
+}
+
+xrt_result_t
+ipc_client_stereo_camera_set_controls(struct ipc_connection *ipc_c,
+                                      uint64_t stream_id,
+                                      const struct xrt_stereo_camera_controls *controls)
+{
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_stereo_camera_set_controls(ipc_c, stream_id, controls);
+}
+
+xrt_result_t
+ipc_client_stereo_camera_release_controls(struct ipc_connection *ipc_c, uint64_t stream_id)
+{
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_stereo_camera_release_controls(ipc_c, stream_id);
+}
+
+xrt_result_t
+ipc_client_stereo_camera_request_still(struct ipc_connection *ipc_c,
+                                       uint64_t stream_id,
+                                       const struct xrt_stereo_camera_still_request *req,
+                                       uint64_t *out_request_id)
+{
+	*out_request_id = 0;
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_stereo_camera_request_still(ipc_c, stream_id, req, out_request_id);
+}
+
+xrt_result_t
+ipc_client_stereo_camera_acquire_still(struct ipc_connection *ipc_c,
+                                       uint64_t stream_id,
+                                       uint64_t request_id,
+                                       struct xrt_stereo_camera_still_info *out_info,
+                                       xrt_shmem_handle_t *out_section)
+{
+	U_ZERO(out_info);
+	*out_section = XRT_SHMEM_HANDLE_INVALID;
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	xrt_shmem_handle_t section = XRT_SHMEM_HANDLE_INVALID;
+	xrt_result_t xret = ipc_call_stereo_camera_acquire_still(ipc_c, stream_id, request_id, out_info, &section, 1);
+	if (xret == XRT_SUCCESS) {
+		*out_section = section;
+	}
+	return xret;
+}
+
+xrt_result_t
+ipc_client_stereo_camera_release_still(struct ipc_connection *ipc_c, uint64_t stream_id, uint64_t request_id)
+{
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_stereo_camera_release_still(ipc_c, stream_id, request_id);
+}
+
 
 /*
  *
@@ -235,9 +363,11 @@ static xrt_result_t
 c_get_calibration(struct xrt_stereo_camera_client *c,
                   uint64_t camera_id,
                   uint32_t output,
+                  uint32_t eye_width,
+                  uint32_t eye_height,
                   struct xrt_stereo_camera_calibration *out)
 {
-	return ipc_client_stereo_camera_get_calibration(conn(c), camera_id, output, out);
+	return ipc_client_stereo_camera_get_calibration_mode(conn(c), camera_id, output, eye_width, eye_height, out);
 }
 
 static xrt_result_t
@@ -281,9 +411,10 @@ c_acquire(struct xrt_stereo_camera_client *c,
           uint64_t stream_id,
           bool *out_ready,
           struct xrt_stereo_camera_frame_info *out_frame,
-          struct xrt_app_share_frame_info *out_app)
+          struct xrt_app_share_frame_info *out_app,
+          struct xrt_stereo_camera_capture_result *out_result)
 {
-	return ipc_client_stereo_camera_acquire(conn(c), stream_id, out_ready, out_frame, out_app);
+	return ipc_client_stereo_camera_acquire_ex(conn(c), stream_id, out_ready, out_frame, out_app, out_result);
 }
 
 static xrt_result_t
@@ -310,6 +441,61 @@ c_control(struct xrt_stereo_camera_client *c, uint32_t op, uint32_t arg, uint32_
 	return ipc_client_stereo_camera_control(conn(c), op, arg, out_value);
 }
 
+static xrt_result_t
+c_get_modes(struct xrt_stereo_camera_client *c, uint64_t camera_id, struct xrt_stereo_camera_mode_list *out)
+{
+	return ipc_client_stereo_camera_get_modes(conn(c), camera_id, out);
+}
+
+static xrt_result_t
+c_get_control_caps(struct xrt_stereo_camera_client *c, uint64_t camera_id, struct xrt_stereo_camera_control_caps *out)
+{
+	return ipc_client_stereo_camera_get_control_caps(conn(c), camera_id, out);
+}
+
+static xrt_result_t
+c_set_controls(struct xrt_stereo_camera_client *c, uint64_t stream_id, const struct xrt_stereo_camera_controls *ctl)
+{
+	return ipc_client_stereo_camera_set_controls(conn(c), stream_id, ctl);
+}
+
+static xrt_result_t
+c_release_controls(struct xrt_stereo_camera_client *c, uint64_t stream_id)
+{
+	return ipc_client_stereo_camera_release_controls(conn(c), stream_id);
+}
+
+static xrt_result_t
+c_request_still(struct xrt_stereo_camera_client *c,
+                uint64_t stream_id,
+                const struct xrt_stereo_camera_still_request *req,
+                uint64_t *out_request_id)
+{
+	return ipc_client_stereo_camera_request_still(conn(c), stream_id, req, out_request_id);
+}
+
+static xrt_result_t
+c_acquire_still(struct xrt_stereo_camera_client *c,
+                uint64_t stream_id,
+                uint64_t request_id,
+                struct xrt_stereo_camera_still_info *out_info,
+                xrt_shmem_handle_t *out_section)
+{
+	return ipc_client_stereo_camera_acquire_still(conn(c), stream_id, request_id, out_info, out_section);
+}
+
+static xrt_result_t
+c_release_still(struct xrt_stereo_camera_client *c, uint64_t stream_id, uint64_t request_id)
+{
+	return ipc_client_stereo_camera_release_still(conn(c), stream_id, request_id);
+}
+
+static xrt_result_t
+c_get_refinement(struct xrt_stereo_camera_client *c, uint64_t camera_id, struct xrt_stereo_camera_refinement *out)
+{
+	return ipc_client_stereo_camera_get_refinement(conn(c), camera_id, out);
+}
+
 struct xrt_stereo_camera_client *
 ipc_client_stereo_camera_client_create(struct ipc_connection *ipc_c)
 {
@@ -318,6 +504,7 @@ ipc_client_stereo_camera_client_create(struct ipc_connection *ipc_c)
 	c->base.count = c_count;
 	c->base.get_properties = c_get_properties;
 	c->base.get_calibration = c_get_calibration;
+	c->base.get_refinement = c_get_refinement;
 	c->base.stream_create = c_stream_create;
 	c->base.stream_destroy = c_stream_destroy;
 	c->base.stream_start = c_stream_start;
@@ -328,5 +515,12 @@ ipc_client_stereo_camera_client_create(struct ipc_connection *ipc_c)
 	c->base.stats = c_stats;
 	c->base.poll_event = c_poll_event;
 	c->base.control = c_control;
+	c->base.get_modes = c_get_modes;
+	c->base.get_control_caps = c_get_control_caps;
+	c->base.set_controls = c_set_controls;
+	c->base.release_controls = c_release_controls;
+	c->base.request_still = c_request_still;
+	c->base.acquire_still = c_acquire_still;
+	c->base.release_still = c_release_still;
 	return &c->base;
 }

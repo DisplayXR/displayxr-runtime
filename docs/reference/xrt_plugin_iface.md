@@ -1213,6 +1213,32 @@ everything that was on `main` before them: `… vk_bundle_fn_table_offset` → `
 after lift, the camera block right after platform-state and ending the struct), so a reorder or a
 slot squeezed in between fails on the host, not on a vendor box.
 
+### Stereo camera v8: modes, controls, stills (spec v8 §9b)
+
+Eight more optional slots, appended after `get_setting_status` (now the last members; gated by
+`struct_size`, no API bump; `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES` / `_CONTROLS` / `_STILL`):
+
+```c
+uint32_t     (*stereo_camera_enumerate_modes)(inst, index, capacity, struct xrt_plugin_stereo_camera_mode *out);
+xrt_result_t (*stereo_camera_set_mode)(cam, uint32_t mode_index);
+xrt_result_t (*stereo_camera_get_control_caps)(inst, index, struct xrt_plugin_stereo_camera_control_caps *out);
+xrt_result_t (*stereo_camera_set_controls)(cam, const struct xrt_plugin_stereo_camera_controls *controls);
+xrt_result_t (*stereo_camera_get_capture_result)(cam, struct xrt_plugin_stereo_camera_capture_result *out);
+xrt_result_t (*stereo_camera_request_still)(cam, const struct xrt_plugin_stereo_camera_still_request *req);
+uint32_t     (*stereo_camera_poll_still)(cam, struct xrt_plugin_stereo_camera_still *out,
+                                         struct xrt_plugin_stereo_camera_capture_result *out_result);
+void         (*stereo_camera_release_still)(cam);
+```
+
+Each is optional on its own (NULL = that feature as in v7). Slots taking `cam` run on the camera's
+own runtime thread, never concurrently with `wait_frame`. The rules — mode 0 = the default, one
+field of view per camera, lazy session setup because `set_mode` follows `open` before the first
+frame, the whole control state on every `set_controls`, AF edge-triggered by `focus_trigger`, the
+metering point in the raw left eye, at most one still in flight, frames paused ≤ 1 s around a still
+— are in [spec §9b](../specs/extensions/XR_DXR_stereo_camera.md#9b-plug-in-contract-spec-v8-modes-controls-stills).
+`sim_display`'s fake implements all eight. `tests_stereo_camera` pins the order;
+`sizeof(struct xrt_plugin_iface)` grew by 64 bytes on 64-bit.
+
 ## Aux surface — separate from the iface
 
 Logging, debug-variable tracking, frame metrics, Perfetto tracing, and unique-ID generation are **not** plumbed through this iface. Plug-ins reach them by linking the runtime DLL's import library (`DisplayXRClient.lib`) and getting `__declspec(dllimport)`'d symbols. See [ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md) for the rationale.

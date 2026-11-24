@@ -101,6 +101,69 @@ ipc_client_stereo_camera_poll_event(struct ipc_connection *ipc_c,
 xrt_result_t
 ipc_client_stereo_camera_control(struct ipc_connection *ipc_c, uint32_t op, uint32_t arg, uint32_t *out_value);
 
+/*
+ * Spec v8 (modes, controls, stills).
+ */
+
+//! get_calibration for the mode of per-eye size @p eye_width x @p eye_height (0 x 0 = default).
+xrt_result_t
+ipc_client_stereo_camera_get_calibration_mode(struct ipc_connection *ipc_c,
+                                              uint64_t camera_id,
+                                              uint32_t output,
+                                              uint32_t eye_width,
+                                              uint32_t eye_height,
+                                              struct xrt_stereo_camera_calibration *out_calib);
+
+//! Spec v8 §5.9: the online vertical-alignment correction of camera @p camera_id.
+xrt_result_t
+ipc_client_stereo_camera_get_refinement(struct ipc_connection *ipc_c,
+                                        uint64_t camera_id,
+                                        struct xrt_stereo_camera_refinement *out_refinement);
+
+//! acquire, plus the frame's capture state (@p out_result may be NULL).
+xrt_result_t
+ipc_client_stereo_camera_acquire_ex(struct ipc_connection *ipc_c,
+                                    uint64_t stream_id,
+                                    bool *out_ready,
+                                    struct xrt_stereo_camera_frame_info *out_frame,
+                                    struct xrt_app_share_frame_info *out_app,
+                                    struct xrt_stereo_camera_capture_result *out_result);
+
+xrt_result_t
+ipc_client_stereo_camera_get_modes(struct ipc_connection *ipc_c,
+                                   uint64_t camera_id,
+                                   struct xrt_stereo_camera_mode_list *out_modes);
+
+xrt_result_t
+ipc_client_stereo_camera_get_control_caps(struct ipc_connection *ipc_c,
+                                          uint64_t camera_id,
+                                          struct xrt_stereo_camera_control_caps *out_caps);
+
+xrt_result_t
+ipc_client_stereo_camera_set_controls(struct ipc_connection *ipc_c,
+                                      uint64_t stream_id,
+                                      const struct xrt_stereo_camera_controls *controls);
+
+xrt_result_t
+ipc_client_stereo_camera_release_controls(struct ipc_connection *ipc_c, uint64_t stream_id);
+
+xrt_result_t
+ipc_client_stereo_camera_request_still(struct ipc_connection *ipc_c,
+                                       uint64_t stream_id,
+                                       const struct xrt_stereo_camera_still_request *req,
+                                       uint64_t *out_request_id);
+
+//! @p out_section: a NEW read-only handle the caller closes.
+xrt_result_t
+ipc_client_stereo_camera_acquire_still(struct ipc_connection *ipc_c,
+                                       uint64_t stream_id,
+                                       uint64_t request_id,
+                                       struct xrt_stereo_camera_still_info *out_info,
+                                       xrt_shmem_handle_t *out_section);
+
+xrt_result_t
+ipc_client_stereo_camera_release_still(struct ipc_connection *ipc_c, uint64_t stream_id, uint64_t request_id);
+
 struct xrt_stereo_camera_client *
 ipc_client_stereo_camera_client_create(struct ipc_connection *ipc_c);
 

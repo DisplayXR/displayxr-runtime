@@ -165,6 +165,102 @@ TEST_CASE("stereo camera rate meter measures, never trusts the advert", "[stereo
 	CHECK(g.rate == Catch::Approx(30.0f).margin(0.05f));
 }
 
+TEST_CASE("spec v8: SBS downscale keeps each eye to its own half, in every format", "[stereo_camera][v8]")
+{
+	// 2 x 64 x 48 -> 2 x 32 x 24 (and a non-integer 2 x 40 x 30). Left half a
+	// horizontal ramp, right half a constant: the seam must not bleed.
+	const uint32_t W = 128, H = 48;
+	for (uint32_t format : {1u, 2u, 3u}) {
+		u_stereo_camera_planes sl;
+		REQUIRE(u_stereo_camera_layout(format, W, H, &sl));
+		std::vector<uint8_t> src((size_t)sl.size, 0);
+		for (uint32_t y = 0; y < H; y++) {
+			for (uint32_t x = 0; x < W; x++) {
+				const uint8_t v = x < W / 2 ? (uint8_t)(x * 2) : (uint8_t)240;
+				if (format == 3) {
+					uint8_t *p =
+					    src.data() + sl.offset[0] + (size_t)y * sl.pitch[0] + 4 * (size_t)x;
+					p[0] = p[1] = p[2] = v;
+					p[3] = 255;
+				} else {
+					src[sl.offset[0] + (size_t)y * sl.pitch[0] + x] = v;
+				}
+			}
+		}
+		if (format == 2) { // chroma: left eye U=V=100, right eye U=V=200
+			for (uint32_t y = 0; y < H / 2; y++) {
+				for (uint32_t x = 0; x < W; x++) {
+					src[sl.offset[1] + (size_t)y * sl.pitch[1] + x] = x < W / 2 ? 100 : 200;
+				}
+			}
+		}
+		const uint8_t *planes[2] = {src.data() + sl.offset[0],
+		                            sl.plane_count > 1 ? src.data() + sl.offset[1] : nullptr};
+		const uint32_t pitches[2] = {sl.pitch[0], sl.plane_count > 1 ? sl.pitch[1] : 0};
+		for (uint32_t dw : {64u, 80u}) {
+			const uint32_t dh = dw * H / W;
+			u_stereo_camera_planes dl;
+			REQUIRE(u_stereo_camera_layout(format, dw, dh, &dl));
+			std::vector<uint8_t> dst((size_t)dl.size, 0);
+			REQUIRE(u_stereo_camera_scale(format, planes, pitches, W, H, dst.data(), &dl, dw, dh));
+			const size_t bpp = format == 3 ? 4 : 1;
+			for (uint32_t y = 0; y < dh; y++) {
+				const uint8_t *row = dst.data() + dl.offset[0] + (size_t)y * dl.pitch[0];
+				CHECK(row[(size_t)(dw / 2 - 1) * bpp] <
+				      140); // last left column: the ramp's end, never 240
+				CHECK(row[(size_t)(dw / 2) * bpp] == 240); // first right column: untouched by the ramp
+				CHECK(row[(size_t)(dw - 1) * bpp] == 240);
+				CHECK(row[0] < 8);
+			}
+			if (format == 2) {
+				const uint8_t *uv = dst.data() + dl.offset[1];
+				CHECK(uv[dw / 2 - 2] == 100);
+				CHECK(uv[dw / 2 - 1] == 100);
+				CHECK(uv[dw / 2] == 200);
+			}
+		}
+	}
+	// Bad arguments.
+	u_stereo_camera_planes dl;
+	REQUIRE(u_stereo_camera_layout(1, 64, 24, &dl));
+	std::vector<uint8_t> dst((size_t)dl.size);
+	const uint8_t *none[2] = {nullptr, nullptr};
+	const uint32_t p0[2] = {0, 0};
+	CHECK_FALSE(u_stereo_camera_scale(1, none, p0, 128, 48, dst.data(), &dl, 64, 24));
+	CHECK_FALSE(u_stereo_camera_scale(9, none, p0, 128, 48, dst.data(), &dl, 64, 24));
+
+	// Intrinsics rescale, pixel-centre aware: a (w-1)/2 centre stays the centre.
+	double k[4];
+	u_stereo_camera_scale_intrinsics(200.0, 200.0, 159.5, 119.5, 320, 240, 1280, 960, k);
+	CHECK(k[0] == Catch::Approx(800.0));
+	CHECK(k[2] == Catch::Approx(639.5));
+	CHECK(k[3] == Catch::Approx(479.5));
+
+	// Spec v8 §5.5: a mode of another vertical extent (the tablet: 16:9 default
+	// 1280x720 cut from a 4:3 1280x960 sensor) keeps the principal point's offset
+	// from the centre, scaled by the width.
+	u_stereo_camera_mode_intrinsics(1000.0, 1000.0, 639.5, 359.5 + 7.0, 1280, 720, 1280, 960, k);
+	CHECK(k[0] == Catch::Approx(1000.0));
+	CHECK(k[3] == Catch::Approx(479.5 + 7.0));
+	u_stereo_camera_mode_intrinsics(1000.0, 1000.0, 639.5, 359.5 + 7.0, 1280, 720, 2560, 1920, k);
+	CHECK(k[0] == Catch::Approx(2000.0));
+	CHECK(k[2] == Catch::Approx(1279.5));
+	CHECK(k[3] == Catch::Approx(959.5 + 14.0));
+	// Centred rows: never letterbox, never stretch.
+	uint32_t y0 = 0, rows = 0;
+	REQUIRE(u_stereo_camera_fit_rows(1280, 960, 1280, 720, &y0, &rows));
+	CHECK(y0 == 120);
+	CHECK(rows == 720);
+	REQUIRE(u_stereo_camera_fit_rows(1920, 1440, 1280, 720, &y0, &rows));
+	CHECK(y0 == 180);
+	CHECK(rows == 1080);
+	REQUIRE(u_stereo_camera_fit_rows(640, 480, 640, 480, &y0, &rows));
+	CHECK(y0 == 0);
+	CHECK(rows == 480);
+	CHECK_FALSE(u_stereo_camera_fit_rows(1280, 720, 640, 480, &y0, &rows)); // 16:9 cannot serve 4:3
+	CHECK_FALSE(u_stereo_camera_fit_rows(640, 480, 1280, 960, &y0, &rows)); // never upscale
+}
+
 TEST_CASE("stereo camera layout", "[stereo_camera]")
 {
 	u_stereo_camera_planes l;
@@ -348,7 +444,37 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	CHECK(offsetof(xrt_plugin_iface, activate) == offsetof(xrt_plugin_iface, get_license_state) + sizeof(void *));
 	// ADR-054 Amendment 3 appended get_setting_status after activate (the new last slot).
 	CHECK(offsetof(xrt_plugin_iface, get_setting_status) == offsetof(xrt_plugin_iface, activate) + sizeof(void *));
-	CHECK(offsetof(xrt_plugin_iface, get_setting_status) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	// XR_DXR_stereo_camera v8 (§9b) appended its eight slots after get_setting_status, in this order;
+	// stereo_camera_release_still is the new last slot.
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_enumerate_modes) ==
+	      offsetof(xrt_plugin_iface, get_setting_status) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_set_mode) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_enumerate_modes) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_get_control_caps) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_set_mode) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_set_controls) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_get_control_caps) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_get_capture_result) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_set_controls) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_request_still) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_get_capture_result) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_poll_still) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_request_still) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_release_still) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_poll_still) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_release_still) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	{
+		// A plug-in built before v8 (struct_size ends at get_setting_status) has none of them.
+		xrt_plugin_iface older{};
+		older.stereo_camera_set_mode = [](xrt_plugin_stereo_camera *, uint32_t) -> xrt_result_t {
+			return XRT_SUCCESS;
+		};
+		older.struct_size = (uint32_t)(offsetof(xrt_plugin_iface, get_setting_status) + sizeof(void *));
+		CHECK_FALSE(XRT_PLUGIN_IFACE_SLOT_PRESENT(&older, stereo_camera_set_mode));
+		older.struct_size = (uint32_t)sizeof(xrt_plugin_iface);
+		CHECK(XRT_PLUGIN_IFACE_SLOT_PRESENT(&older, stereo_camera_set_mode));
+		CHECK_FALSE(XRT_PLUGIN_IFACE_SLOT_PRESENT(&older, stereo_camera_poll_still));
+	}
 	{
 		// An older plug-in (struct_size ends before the slot) declares nothing.
 		xrt_plugin_iface older{};

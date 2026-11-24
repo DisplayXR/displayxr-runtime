@@ -72,6 +72,8 @@
  * the XrDisplayDXR::displayId of the screen a camera belongs to (0 = not
  * known). A change of it is reported like a displayName change. Nothing in
  * XrStereoCameraPropertiesDXR changes size.
+ * 6 - 8: see the comment on XR_DXR_stereo_camera_SPEC_VERSION below (8 = capture
+ * modes, controls + capture state, stills).
  */
 #ifndef XR_DXR_STEREO_CAMERA_H
 #define XR_DXR_STEREO_CAMERA_H 1
@@ -99,7 +101,17 @@ extern "C" {
 //     XrStereoCameraPropertiesDXR::next: the clockwise turn that makes the published
 //     frame upright in the device's NATURAL orientation (Camera2 SENSOR_ORIENTATION
 //     semantics), or XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR.
-#define XR_DXR_stereo_camera_SPEC_VERSION 7
+// 8 = a camera app, not only a call (appended, nothing renumbered, no struct changes
+//     size): capture MODES (xrEnumerateStereoCameraModesDXR + XrStereoCameraStreamModeInfoDXR
+//     chained on the stream create info and on the calibration query), CONTROLS
+//     (XrStereoCameraControlCapabilitiesDXR on the properties, xrSetStereoCameraControlsDXR /
+//     xrReleaseStereoCameraControlsDXR, XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR) with the
+//     per-frame XrStereoCameraCaptureResultDXR, and STILLS (xrRequestStereoCameraStillDXR,
+//     the still-ready / still-failed events, xrAcquireStereoCameraStillDXR /
+//     xrReleaseStereoCameraStillDXR over a read-only shared-memory section), and
+//     XrStereoCameraVerticalRefinementDXR (the online row-alignment correction, for a
+//     consumer that rectifies RAW frames itself).
+#define XR_DXR_stereo_camera_SPEC_VERSION 8
 #define XR_DXR_STEREO_CAMERA_EXTENSION_NAME "XR_DXR_stereo_camera"
 
 // Reserved 1004999300..319 (relocated from 290..309 on the post-lift rebase: 290 was taken by XR_DXR_weave v14). Allocation registry: README.md in this directory.
@@ -146,6 +158,28 @@ extern "C" {
 //! not know the frame orientation. Pre-set it before enumerating (a runtime older
 //! than v7 leaves the struct untouched): 0 is a real value.
 #define XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR      0xFFFFFFFFu
+// Spec v8 — appended (319 closes the 310-319 decade; the rest is 1004999460-469).
+//! Output of xrEnumerateStereoCameraModesDXR: one capture mode.
+#define XR_TYPE_STEREO_CAMERA_MODE_DXR                      ((XrStructureType)1004999319)
+//! Chain on XrStereoCameraStreamCreateInfoDXR (the stream's mode) or on
+//! XrStereoCameraCalibrationDXR (calibration of frames of that mode).
+#define XR_TYPE_STEREO_CAMERA_STREAM_MODE_INFO_DXR          ((XrStructureType)1004999460)
+//! Chain on XrStereoCameraPropertiesDXR::next: focus / exposure capabilities.
+#define XR_TYPE_STEREO_CAMERA_CONTROL_CAPABILITIES_DXR      ((XrStructureType)1004999461)
+#define XR_TYPE_STEREO_CAMERA_CONTROLS_DXR                  ((XrStructureType)1004999462)
+//! Chain on XrStereoCameraFrameDXR::next or XrStereoCameraStillDXR::next.
+#define XR_TYPE_STEREO_CAMERA_CAPTURE_RESULT_DXR            ((XrStructureType)1004999463)
+#define XR_TYPE_STEREO_CAMERA_STILL_REQUEST_DXR             ((XrStructureType)1004999464)
+#define XR_TYPE_STEREO_CAMERA_STILL_DXR                     ((XrStructureType)1004999465)
+#define XR_TYPE_EVENT_DATA_STEREO_CAMERA_STILL_READY_DXR    ((XrStructureType)1004999466)
+#define XR_TYPE_EVENT_DATA_STEREO_CAMERA_STILL_FAILED_DXR   ((XrStructureType)1004999467)
+//! ERROR: another stream holds this camera's controls (spec §5.6). Retry after
+//! that stream releases them, stops or ends.
+#define XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR             ((XrResult)-1004999468)
+// 1004999469 is held back for the still's AHardwareBuffer transport (spec §5.7, next step).
+//! Chain on XrStereoCameraCalibrationDXR::next: the online vertical-alignment
+//! refinement in force, for a consumer that rectifies RAW frames itself (§5.9).
+#define XR_TYPE_STEREO_CAMERA_VERTICAL_REFINEMENT_DXR       ((XrStructureType)1004999470)
 
 //! Size of XrStereoCameraPropertiesDXR::persistentId, NUL included.
 #define XR_STEREO_CAMERA_PERSISTENT_ID_MAX_SIZE_DXR 64
@@ -327,10 +361,72 @@ typedef struct XrStereoCameraCalibrationDXR {
     XrStereoCameraOutputDXR output;
     //! RAW: native + distortion. RECTIFIED: post-rectification, model NONE, equal fy/cy.
     XrStereoCameraIntrinsicsDXR eye[2];
-    //! RAW: the pair's extrinsics. RECTIFIED: pure +x translation of baselineMm/1000.
+    /*!
+     * The pose of the RIGHT camera expressed in the LEFT camera's frame, metres,
+     * both frames OpenCV camera frames (+x right in the image, +y down, +z
+     * forward). As a transform it maps right-camera coordinates INTO left-camera
+     * coordinates (x_L = R_q x_R + C) — read the name as "right, relative to
+     * left", NOT as the "aFromB maps B into A" convention, which it is the
+     * inverse of. The numbers are fixed (shipped consumers depend on them). With
+     * R_q = the rotation matrix of `orientation` and C = `position`:
+     *   - the right camera's centre, in the left frame:    C
+     *   - a point x_L in the left frame, in the right frame: x_R = R_q^T (x_L - C)
+     *     (= OpenCV stereoCalibrate's x_R = R x_L + T with R = R_q^T, T = -R_q^T C,
+     *     in metres; T in mm is 1000x that).
+     * RAW: the pair's calibrated extrinsics. RECTIFIED: identity orientation and
+     * C = (+baselineMm/1000, 0, 0). Example: a pair whose right lens sits to the
+     * right of the left one, as on the tablet, reads C.x = +baseline > 0.
+     */
     XrPosef rightFromLeft;
     float baselineMm;
 } XrStereoCameraCalibrationDXR;
+
+typedef XrFlags64 XrStereoCameraVerticalRefinementFlagsDXR;
+//! The estimate was fitted on this camera's own frames (at least one window);
+//! clear = no measurement yet, refinement off, or a camera the runtime does not
+//! rectify (natively rectified / uncalibrated): every other field then reads 0
+//! except rectifyingRotation, which is identity.
+#define XR_STEREO_CAMERA_VERTICAL_REFINEMENT_VALID_BIT_DXR 0x00000001
+
+/*!
+ * Spec v8 §5.9 — chain on XrStereoCameraCalibrationDXR::next (either output; also
+ * on the calibration chained to a still): the runtime's online vertical-alignment
+ * correction, for a consumer that rectifies RAW frames itself. RECTIFIED frames
+ * already carry it. Its changes move calibrationGeneration.
+ *
+ * Defined in the runtime's rectified frame: eye e's raw rays rotated by
+ * rectifyingRotation[e] (OpenCV stereoRectify's R1 / R2 from the RAW calibration,
+ * zero disparity, any alpha — the crop does not change them). In that frame's
+ * normalised coordinates (x, y) = (X/Z, Y/Z) the uncorrected pair leaves the RIGHT
+ * eye's rows displaced from the LEFT eye's by
+ *   D(y) = verticalOffset + verticalSlope * y        (right minus left, +y down).
+ * Apply it split symmetrically: the corrected output row y of eye e samples the
+ * uncorrected rectified row
+ *   y_src = y * (1 + s_e * verticalSlope / 2) + s_e * verticalOffset / 2,
+ * s_left = -1, s_right = +1 (x unchanged). Normalised units need no rescaling
+ * between modes; pixels at another size are D * f of that size. In pixels about
+ * a rectified principal row cy: dy(v) = f * verticalOffset + verticalSlope * (v - cy),
+ * pixel centres at integers (OpenCV).
+ */
+typedef struct XrStereoCameraVerticalRefinementDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_VERTICAL_REFINEMENT_DXR
+    void* XR_MAY_ALIAS next;
+    XrStereoCameraVerticalRefinementFlagsDXR flags;
+    float verticalOffset; //!< normalised rectified units (radians, small-angle)
+    float verticalSlope;  //!< dimensionless (pixels per pixel)
+    //! Rectified-from-raw rotation per eye: ray_rect = R(q[e]) * ray_raw[e].
+    XrQuaternionf rectifyingRotation[2];
+    //! The per-eye rectified size and focal length (px) the estimate was measured at.
+    XrExtent2Di measuredEyeExtent;
+    float measuredFocalLength;
+    //! Signed median dy (right - left, measured px) of the latest fitted window, on frames
+    //! carrying the correction in force THEN: after the first update it is the uncorrected
+    //! misalignment, afterwards the residual (|residualPx| <= 0.2 = converged).
+    float residualPx;
+    uint32_t matchCount;  //!< row matches in the latest fitted window (>= 50 to fit)
+    uint32_t windowCount; //!< fitted windows since the camera was set up (or recalibrated)
+    uint32_t updateCount; //!< corrections applied since then
+} XrStereoCameraVerticalRefinementDXR;
 
 typedef struct XrStereoCameraStreamCreateInfoDXR {
     XrStructureType type;
@@ -478,6 +574,237 @@ typedef struct XrEventDataStereoCameraStreamEndedDXR {
     XrStereoCameraStreamEndReasonDXR reason;
 } XrEventDataStereoCameraStreamEndedDXR;
 
+/*
+ * Spec v8: capture modes, controls, stills (spec §5.5 - §5.7).
+ */
+
+typedef XrFlags64 XrStereoCameraModeFlagsDXR;
+//! The mode a stream gets without XrStereoCameraStreamModeInfoDXR; its eyeExtent equals
+//! XrStereoCameraPropertiesDXR::eyeExtent. Exactly one mode carries it.
+static const XrStereoCameraModeFlagsDXR XR_STEREO_CAMERA_MODE_DEFAULT_BIT_DXR = 0x00000001;
+//! A stream may ask for this mode.
+static const XrStereoCameraModeFlagsDXR XR_STEREO_CAMERA_MODE_STREAM_BIT_DXR = 0x00000002;
+//! A still may be taken at this size.
+static const XrStereoCameraModeFlagsDXR XR_STEREO_CAMERA_MODE_STILL_BIT_DXR = 0x00000004;
+
+/*!
+ * One capture mode (xrEnumerateStereoCameraModesDXR). Every mode of a camera
+ * has the default mode's HORIZONTAL field of view about the same optical axis;
+ * its vertical extent may differ (a centred vertical crop or extension, e.g. a
+ * 4:3 mode beside a 16:9 default). One calibration therefore describes all of
+ * them: scale by the width ratio, keep the principal point about the frame
+ * centre (spec §5.5); xrGetStereoCameraCalibrationDXR returns it per mode.
+ */
+typedef struct XrStereoCameraModeDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_MODE_DXR
+    void* XR_MAY_ALIAS next;
+    //! Per-eye size; a frame of this mode is 2*width x height, side by side.
+    XrExtent2Di eyeExtent;
+    //! Highest rate the source runs this mode at, Hz; 0 = NOT KNOWN YET (a mode the source
+    //! has not run: a device's own tables can be wrong). Once the mode has run, the runtime
+    //! reports the measured rate here and in the stream's stats. A still-only mode: 0.
+    float maxFrameRate;
+    XrStereoCameraModeFlagsDXR flags;
+} XrStereoCameraModeDXR;
+
+/*!
+ * Chain on XrStereoCameraStreamCreateInfoDXR::next to ask for a mode (eyeExtent
+ * of a STREAM mode), or on XrStereoCameraCalibrationDXR::next to get the
+ * calibration of frames of that per-eye size. Absent = the default mode, so a
+ * v7 client is unchanged.
+ */
+typedef struct XrStereoCameraStreamModeInfoDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_STREAM_MODE_INFO_DXR
+    const void* XR_MAY_ALIAS next;
+    XrExtent2Di eyeExtent;
+} XrStereoCameraStreamModeInfoDXR;
+
+//! Which controls (validity mask of XrStereoCameraControlsDXR, capability set).
+typedef XrFlags64 XrStereoCameraControlFlagsDXR;
+static const XrStereoCameraControlFlagsDXR XR_STEREO_CAMERA_CONTROL_FOCUS_MODE_BIT_DXR = 0x00000001;
+static const XrStereoCameraControlFlagsDXR XR_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE_BIT_DXR = 0x00000002;
+static const XrStereoCameraControlFlagsDXR XR_STEREO_CAMERA_CONTROL_METERING_POINT_BIT_DXR = 0x00000004;
+static const XrStereoCameraControlFlagsDXR XR_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION_BIT_DXR = 0x00000008;
+
+typedef enum XrStereoCameraFocusModeDXR {
+    //! The source focuses by itself, continuously (the default of a source that focuses).
+    XR_STEREO_CAMERA_FOCUS_MODE_CONTINUOUS_AUTO_DXR = 1,
+    //! One focus search at the metering point, then hold (tap to focus).
+    XR_STEREO_CAMERA_FOCUS_MODE_AUTO_ONCE_DXR = 2,
+    //! Focus at focusDistanceDiopters.
+    XR_STEREO_CAMERA_FOCUS_MODE_MANUAL_DXR = 3,
+    //! Hold the current focus distance.
+    XR_STEREO_CAMERA_FOCUS_MODE_LOCKED_DXR = 4,
+    XR_STEREO_CAMERA_FOCUS_MODE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrStereoCameraFocusModeDXR;
+
+//! One bit per XrStereoCameraFocusModeDXR value: bit (1 << value).
+typedef XrFlags64 XrStereoCameraFocusModeFlagsDXR;
+static const XrStereoCameraFocusModeFlagsDXR XR_STEREO_CAMERA_FOCUS_MODE_CONTINUOUS_AUTO_BIT_DXR = 0x00000002;
+static const XrStereoCameraFocusModeFlagsDXR XR_STEREO_CAMERA_FOCUS_MODE_AUTO_ONCE_BIT_DXR = 0x00000004;
+static const XrStereoCameraFocusModeFlagsDXR XR_STEREO_CAMERA_FOCUS_MODE_MANUAL_BIT_DXR = 0x00000008;
+static const XrStereoCameraFocusModeFlagsDXR XR_STEREO_CAMERA_FOCUS_MODE_LOCKED_BIT_DXR = 0x00000010;
+
+typedef enum XrStereoCameraFocusCalibrationDXR {
+    //! Focus distances are relative steps, not dioptres of the scene.
+    XR_STEREO_CAMERA_FOCUS_CALIBRATION_UNCALIBRATED_DXR = 0,
+    //! Dioptres, approximately (Camera2 APPROXIMATE).
+    XR_STEREO_CAMERA_FOCUS_CALIBRATION_APPROXIMATE_DXR = 1,
+    //! Dioptres, calibrated.
+    XR_STEREO_CAMERA_FOCUS_CALIBRATION_CALIBRATED_DXR = 2,
+    XR_STEREO_CAMERA_FOCUS_CALIBRATION_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrStereoCameraFocusCalibrationDXR;
+
+/*!
+ * Chain on XrStereoCameraPropertiesDXR::next. A camera without controls (and a
+ * runtime older than v8, which leaves it untouched) reports
+ * supportedControls == 0: zero-initialise it.
+ */
+typedef struct XrStereoCameraControlCapabilitiesDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_CONTROL_CAPABILITIES_DXR
+    void* XR_MAY_ALIAS next;
+    XrStereoCameraControlFlagsDXR supportedControls;
+    XrStereoCameraFocusModeFlagsDXR supportedFocusModes;
+    //! Nearest focus, dioptres (1 / metres); 0 = fixed focus.
+    float minFocusDistanceDiopters;
+    XrStereoCameraFocusCalibrationDXR focusDistanceCalibration;
+    //! Exposure compensation range and step, EV; step 0 = no compensation.
+    float exposureCompensationMinEv;
+    float exposureCompensationMaxEv;
+    float exposureCompensationStepEv;
+    //! The focus distance the source holds when no focus control is set (a multi-lens
+    //! source whose own autofocus cannot drive a pair picks a fixed one), dioptres; or
+    //! XR_STEREO_CAMERA_FOCUS_DISTANCE_UNKNOWN_DXR when the source focuses by itself or
+    //! does not say. Pre-set it to XR_STEREO_CAMERA_FOCUS_DISTANCE_UNKNOWN_DXR (0 is a
+    //! real value: infinity). Occupies what was tail padding: the struct's size is
+    //! unchanged.
+    float defaultFocusDistanceDiopters;
+} XrStereoCameraControlCapabilitiesDXR;
+
+//! XrStereoCameraControlCapabilitiesDXR::defaultFocusDistanceDiopters when not a fixed distance / not known.
+#define XR_STEREO_CAMERA_FOCUS_DISTANCE_UNKNOWN_DXR (-1.0f)
+
+/*!
+ * xrSetStereoCameraControlsDXR: only the fields whose bit is in validControls
+ * change; the others keep their current value.
+ */
+typedef struct XrStereoCameraControlsDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_CONTROLS_DXR
+    const void* XR_MAY_ALIAS next;
+    XrStereoCameraControlFlagsDXR validControls;
+    XrStereoCameraFocusModeDXR focusMode;
+    //! MANUAL focus distance, dioptres; 0 = infinity.
+    float focusDistanceDiopters;
+    //! Metering / focus point, normalised in the LEFT eye of this stream's output
+    //! (0,0 = top-left, 1,1 = bottom-right of the left half).
+    XrVector2f meteringPoint;
+    //! Exposure compensation, EV (rounded to the camera's step).
+    float exposureCompensationEv;
+} XrStereoCameraControlsDXR;
+
+typedef enum XrStereoCameraFocusStateDXR {
+    XR_STEREO_CAMERA_FOCUS_STATE_UNKNOWN_DXR = 0,
+    XR_STEREO_CAMERA_FOCUS_STATE_SEARCHING_DXR = 1,
+    XR_STEREO_CAMERA_FOCUS_STATE_LOCKED_DXR = 2,
+    //! A fixed-focus lens.
+    XR_STEREO_CAMERA_FOCUS_STATE_FIXED_DXR = 3,
+    //! The last search did not converge (held where it ended).
+    XR_STEREO_CAMERA_FOCUS_STATE_FAILED_DXR = 4,
+    XR_STEREO_CAMERA_FOCUS_STATE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrStereoCameraFocusStateDXR;
+
+//! Which fields of XrStereoCameraCaptureResultDXR hold values.
+typedef XrFlags64 XrStereoCameraCaptureResultFlagsDXR;
+static const XrStereoCameraCaptureResultFlagsDXR XR_STEREO_CAMERA_CAPTURE_RESULT_FOCUS_DISTANCE_BIT_DXR = 0x00000001;
+static const XrStereoCameraCaptureResultFlagsDXR XR_STEREO_CAMERA_CAPTURE_RESULT_FOCUS_STATE_BIT_DXR = 0x00000002;
+static const XrStereoCameraCaptureResultFlagsDXR XR_STEREO_CAMERA_CAPTURE_RESULT_EXPOSURE_TIME_BIT_DXR = 0x00000004;
+static const XrStereoCameraCaptureResultFlagsDXR XR_STEREO_CAMERA_CAPTURE_RESULT_SENSITIVITY_BIT_DXR = 0x00000008;
+static const XrStereoCameraCaptureResultFlagsDXR XR_STEREO_CAMERA_CAPTURE_RESULT_EYE_CAPTURE_TIMES_BIT_DXR = 0x00000010;
+
+/*!
+ * The capture state of one frame or still. Chain on XrStereoCameraFrameDXR::next
+ * or XrStereoCameraStillDXR::next; zero-initialise it (a runtime older than v8
+ * leaves it untouched: validFields 0 = nothing known).
+ */
+typedef struct XrStereoCameraCaptureResultDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_CAPTURE_RESULT_DXR
+    void* XR_MAY_ALIAS next;
+    XrStereoCameraCaptureResultFlagsDXR validFields;
+    float focusDistanceDiopters;
+    XrStereoCameraFocusStateDXR focusState;
+    //! Exposure time, nanoseconds.
+    XrDuration exposureTime;
+    //! ISO arithmetic sensitivity.
+    uint32_t sensitivityIso;
+    //! Start of exposure of each eye (runtime clock, like captureTime). Only with
+    //! EYE_CAPTURE_TIMES set, which a source sets only when it stamps each lens itself
+    //! (a HAL that stamps both lenses identically leaves it clear). Equal or missing
+    //! per-eye times are NOT evidence that the two lenses are synchronised.
+    XrTime eyeCaptureTime[2];
+} XrStereoCameraCaptureResultDXR;
+
+/*!
+ * xrRequestStereoCameraStillDXR. eyeExtent must be a STILL mode's, or {0, 0}
+ * for the largest one. The still is delivered once, in its own section.
+ */
+typedef struct XrStereoCameraStillRequestDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_STILL_REQUEST_DXR
+    const void* XR_MAY_ALIAS next;
+    XrExtent2Di eyeExtent;
+    XrStereoCameraOutputDXR output;
+    XrStereoCameraFormatDXR format;
+} XrStereoCameraStillRequestDXR;
+
+/*!
+ * One delivered still (xrAcquireStereoCameraStillDXR). The section holds ONE
+ * side-by-side image, left eye left. sectionHandle is a NEW read-only handle
+ * (Windows HANDLE / POSIX fd) the caller closes; the mapping stays valid after
+ * xrReleaseStereoCameraStillDXR (only the runtime's copy is freed). Chain
+ * XrStereoCameraCaptureResultDXR for the capture state and
+ * XrStereoCameraCalibrationDXR for the calibration of exactly these pixels
+ * (its output field is overwritten with the still's).
+ */
+typedef struct XrStereoCameraStillDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_STILL_DXR
+    void* XR_MAY_ALIAS next;
+    uint64_t requestId;
+    //! Full SBS extent; may be smaller than asked (a tracking-shared camera, §6).
+    XrExtent2Di extent;
+    XrStereoCameraFormatDXR format;
+    XrStereoCameraOutputDXR output;
+    uint32_t rowPitch[2];
+    uint64_t planeOffset[2];
+    uint64_t sectionHandle;
+    uint64_t sectionSize;
+    XrTime captureTime;
+    XrBool32 captureTimeIsExposure;
+    //! XR_STEREO_CAMERA_STILL_SOURCE_*_BIT_DXR. Occupies what was tail padding: the
+    //! struct's size is unchanged; zero-initialise it.
+    uint32_t sourceFlags;
+} XrStereoCameraStillDXR;
+
+//! XrStereoCameraStillDXR::sourceFlags: the pixels went through LOSSY compression (e.g. a
+//! per-lens JPEG the plug-in decoded) before the runtime got them — a RAW still is then
+//! raw in geometry (unrectified, lens distortion intact), not in pixel fidelity.
+#define XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR 0x00000001u
+
+//! The still @c requestId of @c stream is ready: acquire it.
+typedef struct XrEventDataStereoCameraStillReadyDXR {
+    XrStructureType type; //!< XR_TYPE_EVENT_DATA_STEREO_CAMERA_STILL_READY_DXR
+    const void* XR_MAY_ALIAS next;
+    XrStereoCameraStreamDXR stream;
+    uint64_t requestId;
+} XrEventDataStereoCameraStillReadyDXR;
+
+//! The still @c requestId of @c stream will not come; @c result says why.
+typedef struct XrEventDataStereoCameraStillFailedDXR {
+    XrStructureType type; //!< XR_TYPE_EVENT_DATA_STEREO_CAMERA_STILL_FAILED_DXR
+    const void* XR_MAY_ALIAS next;
+    XrStereoCameraStreamDXR stream;
+    uint64_t requestId;
+    XrResult result;
+} XrEventDataStereoCameraStillFailedDXR;
+
 typedef XrResult (XRAPI_PTR *PFN_xrEnumerateStereoCamerasDXR)(
     XrInstance instance, XrSystemId systemId, uint32_t capacityInput, uint32_t* countOutput,
     XrStereoCameraPropertiesDXR* cameras);
@@ -494,6 +821,18 @@ typedef XrResult (XRAPI_PTR *PFN_xrAcquireStereoCameraFrameDXR)(
     XrStereoCameraStreamDXR stream, XrStereoCameraFrameDXR* frame);
 typedef XrResult (XRAPI_PTR *PFN_xrGetStereoCameraStreamStatsDXR)(
     XrStereoCameraStreamDXR stream, XrStereoCameraStreamStatsDXR* stats);
+// Spec v8.
+typedef XrResult (XRAPI_PTR *PFN_xrEnumerateStereoCameraModesDXR)(
+    XrInstance instance, uint64_t cameraId, uint32_t capacityInput, uint32_t* countOutput,
+    XrStereoCameraModeDXR* modes);
+typedef XrResult (XRAPI_PTR *PFN_xrSetStereoCameraControlsDXR)(
+    XrStereoCameraStreamDXR stream, const XrStereoCameraControlsDXR* controls);
+typedef XrResult (XRAPI_PTR *PFN_xrReleaseStereoCameraControlsDXR)(XrStereoCameraStreamDXR stream);
+typedef XrResult (XRAPI_PTR *PFN_xrRequestStereoCameraStillDXR)(
+    XrStereoCameraStreamDXR stream, const XrStereoCameraStillRequestDXR* request, uint64_t* requestId);
+typedef XrResult (XRAPI_PTR *PFN_xrAcquireStereoCameraStillDXR)(
+    XrStereoCameraStreamDXR stream, uint64_t requestId, XrStereoCameraStillDXR* still);
+typedef XrResult (XRAPI_PTR *PFN_xrReleaseStereoCameraStillDXR)(XrStereoCameraStreamDXR stream, uint64_t requestId);
 
 #ifndef XR_NO_PROTOTYPES
 #ifdef XR_EXTENSION_PROTOTYPES
@@ -531,6 +870,35 @@ XRAPI_ATTR XrResult XRAPI_CALL xrAcquireStereoCameraFrameDXR(
 
 XRAPI_ATTR XrResult XRAPI_CALL xrGetStereoCameraStreamStatsDXR(
     XrStereoCameraStreamDXR stream, XrStereoCameraStreamStatsDXR* stats);
+
+//! Spec v8: the camera's capture modes (two-call idiom). A camera whose source
+//! lists none reports exactly one: its default mode.
+XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateStereoCameraModesDXR(
+    XrInstance instance, uint64_t cameraId, uint32_t capacityInput, uint32_t* countOutput,
+    XrStereoCameraModeDXR* modes);
+
+//! Spec v8: set focus / metering / exposure on a STARTED stream's camera. The first
+//! stream to set controls holds them (XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR for
+//! the others) until it releases, stops or ends, or its frames are withheld
+//! (background, lock, sharing off: it is told SUSPENDED and must set its controls
+//! again once the camera is AVAILABLE to it). XR_ERROR_FEATURE_UNSUPPORTED on a
+//! camera without (those) controls.
+XRAPI_ATTR XrResult XRAPI_CALL xrSetStereoCameraControlsDXR(
+    XrStereoCameraStreamDXR stream, const XrStereoCameraControlsDXR* controls);
+
+//! Spec v8: give the controls back; the camera returns to its defaults.
+XRAPI_ATTR XrResult XRAPI_CALL xrReleaseStereoCameraControlsDXR(XrStereoCameraStreamDXR stream);
+
+//! Spec v8: ask for one still pair on a STARTED stream; completion is an event.
+XRAPI_ATTR XrResult XRAPI_CALL xrRequestStereoCameraStillDXR(
+    XrStereoCameraStreamDXR stream, const XrStereoCameraStillRequestDXR* request, uint64_t* requestId);
+
+//! Spec v8: the ready still @p requestId (after its ready event).
+XRAPI_ATTR XrResult XRAPI_CALL xrAcquireStereoCameraStillDXR(
+    XrStereoCameraStreamDXR stream, uint64_t requestId, XrStereoCameraStillDXR* still);
+
+//! Spec v8: forget still @p requestId (acquired or not); the runtime frees its copy.
+XRAPI_ATTR XrResult XRAPI_CALL xrReleaseStereoCameraStillDXR(XrStereoCameraStreamDXR stream, uint64_t requestId);
 
 #endif /* XR_EXTENSION_PROTOTYPES */
 #endif /* !XR_NO_PROTOTYPES */

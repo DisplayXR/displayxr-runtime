@@ -92,6 +92,83 @@ or_q(const char *s)
  * through the iface (this is the in-process no-comp instance — the service's
  * camera manager is not involved) and validate each description.
  */
+/*!
+ * XR_DXR_stereo_camera v8 (§9b) part of `stereo_camera_caps`: the camera's
+ * modes, control capabilities and still slots, as the plug-in answers them.
+ * Absence never fails (an older plug-in has none of the slots); only a
+ * contradictory answer does. Writes camera 0's summary to the out-params.
+ * @return NULL when sane, else why not.
+ */
+static const char *
+probe_stereo_camera_v8(const struct xrt_plugin_iface *iface,
+                       struct xrt_plugin_instance *inst,
+                       uint32_t index,
+                       const struct xrt_plugin_stereo_camera_info *c,
+                       uint32_t *out_modes,
+                       uint32_t *out_controls,
+                       bool *out_stills)
+{
+	uint32_t modes = 1, controls = 0;
+	const bool stills = XRT_PLUGIN_IFACE_SLOT_PRESENT(iface, stereo_camera_request_still) &&
+	                    XRT_PLUGIN_IFACE_SLOT_PRESENT(iface, stereo_camera_poll_still) &&
+	                    XRT_PLUGIN_IFACE_SLOT_PRESENT(iface, stereo_camera_release_still);
+	if (XRT_PLUGIN_IFACE_SLOT_PRESENT(iface, stereo_camera_enumerate_modes)) {
+		struct xrt_plugin_stereo_camera_mode pm[16];
+		memset(pm, 0, sizeof(pm));
+		for (int k = 0; k < 16; k++) {
+			pm[k].struct_size = (uint32_t)sizeof(pm[k]);
+		}
+		uint32_t m = iface->stereo_camera_enumerate_modes(inst, index, 16, pm);
+		m = m > 16 ? 16 : m;
+		if (m > 0 && (pm[0].eye_width != c->eye_width || pm[0].eye_height != c->eye_height)) {
+			return "spec v8: mode 0 is not the camera's default eye size";
+		}
+		for (uint32_t k = 0; k < m; k++) {
+			if (pm[k].eye_width == 0 || pm[k].eye_height == 0 || (pm[k].eye_width & 1u) ||
+			    (pm[k].eye_height & 1u)) {
+				return "spec v8: a mode with a zero or odd eye extent";
+			}
+			if (!(pm[k].max_frame_rate >= 0.0f && pm[k].max_frame_rate <= 1000.0f)) {
+				return "spec v8: a mode's max_frame_rate is negative, NaN or > 1000";
+			}
+			if ((pm[k].flags & XRT_PLUGIN_STEREO_CAMERA_MODE_STILL) && !stills) {
+				return "spec v8: STILL sizes listed without the still slots";
+			}
+		}
+		modes = m > 0 ? m : 1;
+	}
+	if (XRT_PLUGIN_IFACE_SLOT_PRESENT(iface, stereo_camera_get_control_caps)) {
+		struct xrt_plugin_stereo_camera_control_caps k;
+		memset(&k, 0, sizeof(k));
+		k.struct_size = (uint32_t)sizeof(k);
+		if (iface->stereo_camera_get_control_caps(inst, index, &k) == XRT_SUCCESS &&
+		    k.supported_controls != 0) {
+			if ((k.supported_controls & ~0xFu) != 0) {
+				return "spec v8: unknown control bits";
+			}
+			if ((k.supported_controls & XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE) &&
+			    !(k.min_focus_distance_diopters > 0.0f)) {
+				return "spec v8: a focus distance control on a fixed-focus lens (min focus 0)";
+			}
+			if ((k.supported_controls & XRT_PLUGIN_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION) &&
+			    !(k.exposure_compensation_step_ev > 0.0f &&
+			      k.exposure_compensation_min_ev <= k.exposure_compensation_max_ev)) {
+				return "spec v8: exposure compensation with no step or an empty range";
+			}
+			if (!XRT_PLUGIN_IFACE_SLOT_PRESENT(iface, stereo_camera_set_controls)) {
+				return "spec v8: control capabilities without stereo_camera_set_controls";
+			}
+			controls = k.supported_controls;
+		}
+	}
+	if (index == 0) {
+		*out_modes = modes;
+		*out_controls = controls;
+		*out_stills = stills;
+	}
+	return NULL;
+}
+
 static void
 probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *iface)
 {
@@ -114,6 +191,8 @@ probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *i
 		snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note), "0 cameras (OK)");
 		return;
 	}
+	uint32_t v8_modes = 0, v8_controls = 0; // camera 0's, for the note
+	bool v8_stills = false;
 	for (uint32_t i = 0; i < n && i < 4; i++) {
 		const struct xrt_plugin_stereo_camera_info *c = &infos[i];
 		const char *why = NULL;
@@ -136,6 +215,9 @@ probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *i
 				why = "CALIBRATED with a non-positive focal length or zero baseline";
 			}
 		}
+		if (why == NULL) {
+			why = probe_stereo_camera_v8(iface, inst, i, c, &v8_modes, &v8_controls, &v8_stills);
+		}
 		if (why != NULL) {
 			r->stereo_camera_malformed = true;
 			snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note), "camera %u \"%.60s\": %s", i,
@@ -144,9 +226,10 @@ probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *i
 		}
 	}
 	snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note),
-	         "%u camera(s); [0] \"%.60s\" %ux%u/eye, advertised %.1f Hz (0 = unknown), flags 0x%x", n,
-	         infos[0].display_name, infos[0].eye_width, infos[0].eye_height, (double)infos[0].max_frame_rate,
-	         infos[0].flags);
+	         "%u camera(s); [0] \"%.60s\" %ux%u/eye, advertised %.1f Hz (0 = unknown), flags 0x%x; v8: %u mode(s), "
+	         "controls 0x%x, stills %s",
+	         n, infos[0].display_name, infos[0].eye_width, infos[0].eye_height, (double)infos[0].max_frame_rate,
+	         infos[0].flags, v8_modes, v8_controls, v8_stills ? "yes" : "no");
 }
 
 //! Drop a trailing INCOMPLETE UTF-8 sequence, so a string cut to a fixed

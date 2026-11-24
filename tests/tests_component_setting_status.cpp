@@ -48,9 +48,12 @@ static_assert(XRT_COMPONENT_SETTING_STATE_UNKNOWN == 0 && XRT_COMPONENT_SETTING_
 static_assert(offsetof(xrt_plugin_iface, get_setting_status) ==
                   offsetof(xrt_plugin_iface, activate) + sizeof(xrt_component_activate_fn_t),
               "get_setting_status must directly follow activate");
-static_assert(sizeof(xrt_plugin_iface) ==
+// XR_DXR_stereo_camera v8 appended its eight slots right after it (pinned in tests_stereo_camera).
+static_assert(offsetof(xrt_plugin_iface, stereo_camera_enumerate_modes) ==
                   offsetof(xrt_plugin_iface, get_setting_status) + sizeof(xrt_component_get_setting_status_fn_t),
-              "a slot was appended after get_setting_status: pin it here and in xrt_plugin_iface.md");
+              "the stereo camera v8 slots must directly follow get_setting_status");
+static_assert(sizeof(xrt_plugin_iface) == offsetof(xrt_plugin_iface, stereo_camera_release_still) + sizeof(void *),
+              "a slot was appended after stereo_camera_release_still: pin it here and in xrt_plugin_iface.md");
 
 enum class Mode
 {

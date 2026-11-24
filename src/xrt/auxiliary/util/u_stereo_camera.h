@@ -186,6 +186,108 @@ u_stereo_camera_convert(uint32_t src_format,
 
 /*
  *
+ * Resampling (spec v8 modes: a smaller stream is served from a larger source
+ * mode; also the UVC source's split).
+ *
+ */
+
+//! One 8-bit channel of a plane region: samples at base + y * pitch + x * step.
+struct u_stereo_camera_chan
+{
+	const uint8_t *base;
+	uint32_t pitch;
+	uint32_t step;
+	uint32_t w, h;
+};
+
+//! The writable counterpart of @ref u_stereo_camera_chan.
+struct u_stereo_camera_dchan
+{
+	uint8_t *base;
+	uint32_t pitch;
+	uint32_t step;
+	uint32_t w, h;
+};
+
+/*!
+ * Resample one channel: an integer box pre-reduction (anti-aliasing) then
+ * bilinear with pixel-centre mapping; same size = a copy.
+ * @return false on a zero extent or allocation failure.
+ */
+bool
+u_stereo_camera_resample(const struct u_stereo_camera_chan *s, const struct u_stereo_camera_dchan *d);
+
+/*!
+ * Rescale one SBS image of @p src_width x @p src_height to @p dst_width x
+ * @p dst_height in the SAME @p format (GRAY8 / NV12 / BGRA8), each eye half
+ * from its own half only (no bleed across the seam). @p dst_layout is the
+ * layout of @p format at the destination size. The service only ever
+ * downscales (spec v8 §5.5: a stream never gets a smaller mode scaled up).
+ * @return false on bad arguments (odd NV12 sizes, unknown format).
+ */
+bool
+u_stereo_camera_scale(uint32_t format,
+                      const uint8_t *const src_planes[2],
+                      const uint32_t src_pitches[2],
+                      uint32_t src_width,
+                      uint32_t src_height,
+                      uint8_t *dst,
+                      const struct u_stereo_camera_planes *dst_layout,
+                      uint32_t dst_width,
+                      uint32_t dst_height);
+
+/*!
+ * Rescale pinhole intrinsics given for a @p from_w x @p from_h image to a
+ * @p to_w x @p to_h image of the same field of view, pixel-centre aware
+ * (f' = f s, c' = (c + 1/2) s - 1/2). Distortion is unitless and unchanged.
+ */
+/*!
+ * Spec v8 §5.5: the intrinsics of a MODE of @p to_w x @p to_h per eye from
+ * those of the default mode (@p from_w x @p from_h). Every mode has the
+ * default's horizontal field of view about the same optical axis; its vertical
+ * extent may differ (a centred vertical crop or extension). So: scale by the
+ * width ratio s = to_w / from_w on both axes (square pixels), keep the
+ * principal point's offset from the frame centre (scaled), pixel-centre aware:
+ *   f' = f s,  cx' = (cx + 1/2) s - 1/2,  cy' = (cy + 1/2 - from_h / 2) s + to_h / 2 - 1/2.
+ * Distortion is unitless and unchanged.
+ */
+void
+u_stereo_camera_mode_intrinsics(double fx,
+                                double fy,
+                                double cx,
+                                double cy,
+                                uint32_t from_w,
+                                uint32_t from_h,
+                                uint32_t to_w,
+                                uint32_t to_h,
+                                double out[4]);
+
+/*!
+ * Spec v8 §5.5: the centred rows of a @p src_w x @p src_h image (per eye) that,
+ * scaled to @p dst_w x @p dst_h, keep square pixels: rows = dst_h * src_w /
+ * dst_w, rounded to even, starting at an even row. Never letterbox, never
+ * stretch.
+ * @return false when the source has fewer rows than needed (it cannot serve
+ * that aspect) or @p dst_w > @p src_w.
+ */
+bool
+u_stereo_camera_fit_rows(
+    uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h, uint32_t *out_y0, uint32_t *out_rows);
+
+void
+u_stereo_camera_scale_intrinsics(double fx,
+                                 double fy,
+                                 double cx,
+                                 double cy,
+                                 uint32_t from_w,
+                                 uint32_t from_h,
+                                 uint32_t to_w,
+                                 uint32_t to_h,
+                                 double out[4]);
+
+
+/*
+ *
  * Identity + probe helpers.
  *
  */

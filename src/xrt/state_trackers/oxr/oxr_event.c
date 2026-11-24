@@ -1172,6 +1172,58 @@ oxr_event_push_XrEventDataStereoCamerasChanged(struct oxr_logger *log, struct ox
 
 	return XR_SUCCESS;
 }
+
+XrResult
+oxr_event_push_XrEventDataStereoCameraStillReady(struct oxr_logger *log,
+                                                 struct oxr_instance *inst,
+                                                 XrStereoCameraStreamDXR stream,
+                                                 uint64_t requestId)
+{
+	XrEventDataStereoCameraStillReadyDXR *ready;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &ready);
+
+	ready->type = XR_TYPE_EVENT_DATA_STEREO_CAMERA_STILL_READY_DXR;
+	ready->next = NULL;
+	ready->stream = stream;
+	ready->requestId = requestId;
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataStereoCameraStillFailed(struct oxr_logger *log,
+                                                  struct oxr_instance *inst,
+                                                  XrStereoCameraStreamDXR stream,
+                                                  uint64_t requestId,
+                                                  XrResult result)
+{
+	XrEventDataStereoCameraStillFailedDXR *failed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &failed);
+
+	failed->type = XR_TYPE_EVENT_DATA_STEREO_CAMERA_STILL_FAILED_DXR;
+	failed->next = NULL;
+	failed->stream = stream;
+	failed->requestId = requestId;
+	failed->result = result;
+	event->result = XR_SUCCESS;
+
+	U_LOG_I("OXR EVENT: Stereo camera still %llu failed (%d)", (unsigned long long)requestId, (int)result);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
 #endif // OXR_HAVE_DXR_stereo_camera
 
 #ifdef OXR_HAVE_DXR_lift

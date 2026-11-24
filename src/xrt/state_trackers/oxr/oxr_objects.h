@@ -5245,6 +5245,21 @@ oxr_event_push_XrEventDataStereoCameraStreamEnded(struct oxr_logger *log,
 
 XrResult
 oxr_event_push_XrEventDataStereoCamerasChanged(struct oxr_logger *log, struct oxr_instance *inst);
+
+//! Spec v8 §5.7.
+XrResult
+oxr_event_push_XrEventDataStereoCameraStillReady(struct oxr_logger *log,
+                                                 struct oxr_instance *inst,
+                                                 XrStereoCameraStreamDXR stream,
+                                                 uint64_t requestId);
+
+//! Spec v8 §5.7.
+XrResult
+oxr_event_push_XrEventDataStereoCameraStillFailed(struct oxr_logger *log,
+                                                  struct oxr_instance *inst,
+                                                  XrStereoCameraStreamDXR stream,
+                                                  uint64_t requestId,
+                                                  XrResult result);
 #endif // OXR_HAVE_DXR_stereo_camera
 
 

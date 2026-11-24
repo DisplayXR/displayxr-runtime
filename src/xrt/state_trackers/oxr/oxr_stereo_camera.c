@@ -43,6 +43,7 @@
 
 #include "xrt/xrt_config_os.h"
 
+#include <stddef.h>
 #include <string.h>
 #if defined(XRT_OS_WINDOWS)
 #include <windows.h>
@@ -65,6 +66,7 @@ _Static_assert(XRT_PLUGIN_STEREO_CAMERA_MONOCHROME == 0x10, "flag mirror");
 _Static_assert(XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE == 0x20, "flag mirror");
 // ADR-061: XR_STEREO_CAMERA_APP_CONTENT_BIT_DXR (XR_DXR_app_share.h), reserved by the stereo camera header.
 _Static_assert(XRT_STEREO_CAMERA_APP_CONTENT == 0x40, "flag mirror");
+_Static_assert(XRT_STEREO_CAMERA_REFINEMENT_VALID == XR_STEREO_CAMERA_VERTICAL_REFINEMENT_VALID_BIT_DXR, "flag mirror");
 _Static_assert(XRT_APP_SHARE_EXECUTABLE_NAME_SIZE == XR_APP_SHARE_EXECUTABLE_NAME_MAX_SIZE_DXR, "exe name size");
 _Static_assert(XRT_APP_SHARE_APPLICATION_NAME_SIZE == XR_MAX_APPLICATION_NAME_SIZE, "app name size");
 _Static_assert((XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE & XRT_STEREO_CAMERA_CLIENT_PUBLIC_MASK) == 0,
@@ -90,6 +92,50 @@ _Static_assert(XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR == XRT_STEREO_CAME
                "frame orientation unknown");
 _Static_assert(XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR == 0xFFFFFFFFu, "frame orientation unknown literal");
 _Static_assert(XR_TYPE_STEREO_CAMERA_ORIENTATION_DXR == 1004999318, "orientation struct type");
+// Spec v8 — the wire carries the xrt encodings; they equal the XR ones.
+_Static_assert(XR_TYPE_STEREO_CAMERA_MODE_DXR == 1004999319, "v8 type");
+_Static_assert(XR_TYPE_STEREO_CAMERA_STREAM_MODE_INFO_DXR == 1004999460, "v8 type");
+_Static_assert(XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR == -1004999468, "v8 result");
+_Static_assert(XRT_STEREO_CAMERA_MODE_DEFAULT == 0x1 && XRT_STEREO_CAMERA_MODE_STREAM == 0x2 &&
+                   XRT_STEREO_CAMERA_MODE_STILL == 0x4,
+               "mode flag mirror");
+_Static_assert(XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_MODE == 0x1 &&
+                   XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE == 0x2 &&
+                   XRT_PLUGIN_STEREO_CAMERA_CONTROL_METERING_POINT == 0x4 &&
+                   XRT_PLUGIN_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION == 0x8,
+               "control flag mirror");
+_Static_assert(XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_DISTANCE == 0x1 &&
+                   XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_STATE == 0x2 &&
+                   XRT_PLUGIN_STEREO_CAMERA_RESULT_EXPOSURE_TIME == 0x4 &&
+                   XRT_PLUGIN_STEREO_CAMERA_RESULT_SENSITIVITY == 0x8 &&
+                   XRT_PLUGIN_STEREO_CAMERA_RESULT_EYE_TIMES == 0x10,
+               "capture result flag mirror");
+// The two late v8 fields sit in what was tail padding: neither struct changed size
+// (a client built against the earlier v8 header passes a struct of the same size).
+_Static_assert(offsetof(XrStereoCameraStillDXR, sourceFlags) ==
+                   offsetof(XrStereoCameraStillDXR, captureTimeIsExposure) + sizeof(XrBool32),
+               "sourceFlags right after captureTimeIsExposure");
+_Static_assert(sizeof(XrStereoCameraStillDXR) ==
+                   ((offsetof(XrStereoCameraStillDXR, captureTimeIsExposure) + sizeof(XrBool32) + 7) & ~(size_t)7),
+               "sourceFlags must use the old tail padding, not grow the struct");
+_Static_assert(sizeof(XrStereoCameraControlCapabilitiesDXR) ==
+                   ((offsetof(XrStereoCameraControlCapabilitiesDXR, exposureCompensationStepEv) + sizeof(float) + 7) &
+                    ~(size_t)7),
+               "defaultFocusDistanceDiopters must use the old tail padding, not grow the struct");
+_Static_assert(XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE == XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR,
+               "still flag mirror");
+#define SCAM_PIN8(xr, xrt, v) _Static_assert((xr) == (v) && (xrt) == (v), #xr " != " #xrt)
+SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_MODE_CONTINUOUS_AUTO_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_CONTINUOUS_AUTO, 1);
+SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_MODE_AUTO_ONCE_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_AUTO_ONCE, 2);
+SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_MODE_MANUAL_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_MANUAL, 3);
+SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_MODE_LOCKED_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_LOCKED, 4);
+SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_STATE_SEARCHING_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_SEARCHING, 1);
+SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_STATE_LOCKED_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_LOCKED, 2);
+SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_STATE_FIXED_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_FIXED, 3);
+SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_STATE_FAILED_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_FAILED, 4);
+SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_CALIBRATION_APPROXIMATE_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_APPROXIMATE, 1);
+SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_CALIBRATION_CALIBRATED_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_CALIBRATED, 2);
+#undef SCAM_PIN8
 _Static_assert(XR_STEREO_CAMERA_PERSISTENT_ID_MAX_SIZE_DXR ==
                    sizeof(((struct xrt_stereo_camera_properties *)0)->persistent_id),
                "id size");
@@ -115,7 +161,20 @@ verify_encodings(void)
 	       XR_STEREO_CAMERA_FORMAT_NV12_BIT_DXR == XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_NV12) &&
 	       XR_STEREO_CAMERA_FORMAT_BGRA8_BIT_DXR == XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_BGRA8) &&
 	       XR_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY_BIT_DXR ==
-	           XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY);
+	           XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY) &&
+	       // Spec v8.
+	       XR_STEREO_CAMERA_MODE_DEFAULT_BIT_DXR == XRT_STEREO_CAMERA_MODE_DEFAULT &&
+	       XR_STEREO_CAMERA_MODE_STREAM_BIT_DXR == XRT_STEREO_CAMERA_MODE_STREAM &&
+	       XR_STEREO_CAMERA_MODE_STILL_BIT_DXR == XRT_STEREO_CAMERA_MODE_STILL &&
+	       XR_STEREO_CAMERA_CONTROL_FOCUS_MODE_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_MODE &&
+	       XR_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE &&
+	       XR_STEREO_CAMERA_CONTROL_METERING_POINT_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_CONTROL_METERING_POINT &&
+	       XR_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION_BIT_DXR ==
+	           XRT_PLUGIN_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION &&
+	       XR_STEREO_CAMERA_FOCUS_MODE_AUTO_ONCE_BIT_DXR == (1u << XRT_PLUGIN_STEREO_CAMERA_FOCUS_AUTO_ONCE) &&
+	       XR_STEREO_CAMERA_CAPTURE_RESULT_FOCUS_DISTANCE_BIT_DXR ==
+	           XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_DISTANCE &&
+	       XR_STEREO_CAMERA_CAPTURE_RESULT_EYE_CAPTURE_TIMES_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_RESULT_EYE_TIMES;
 }
 
 static struct xrt_stereo_camera_client *
@@ -158,9 +217,94 @@ scam_xret(struct oxr_logger *log, xrt_result_t xret, const char *what)
 	case XRT_ERROR_FEATURE_NOT_SUPPORTED:
 		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED, "%s: not supported by this runtime / camera", what);
 	case XRT_ERROR_CLIENT_LIMIT_REACHED:
-		return oxr_error(log, XR_ERROR_LIMIT_REACHED, "%s: too many streams on this camera", what);
+		return oxr_error(log, XR_ERROR_LIMIT_REACHED,
+		                 "%s: limit reached (8 streams per camera; one still per stream at a time)", what);
+	case XRT_ERROR_STEREO_CAMERA_CONTROL_HELD:
+		return oxr_error(log, XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR,
+		                 "%s: another stream holds this camera's controls; retry after it releases them", what);
+	case XRT_ERROR_CALL_ORDER_INVALID:
+		return oxr_error(log, XR_ERROR_CALL_ORDER_INVALID,
+		                 "%s: the stream is not started, or the still is not ready yet", what);
 	default:
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "%s: service refused (xrt_result=%d)", what, (int)xret);
+	}
+}
+
+//! The wire calibration into the app's struct (its `next` chain untouched).
+static void
+fill_xr_calibration(const struct xrt_stereo_camera_calibration *k, XrStereoCameraCalibrationDXR *calibration)
+{
+	for (int e = 0; e < 2; e++) {
+		XrStereoCameraIntrinsicsDXR *o = &calibration->eye[e];
+		o->imageExtent.width = (int32_t)k->eye[e].width;
+		o->imageExtent.height = (int32_t)k->eye[e].height;
+		o->fx = k->eye[e].fx;
+		o->fy = k->eye[e].fy;
+		o->cx = k->eye[e].cx;
+		o->cy = k->eye[e].cy;
+		o->model = (XrStereoCameraDistortionModelDXR)k->eye[e].model;
+		memcpy(o->coefficients, k->eye[e].coefficients, sizeof(o->coefficients));
+	}
+	calibration->rightFromLeft.orientation.x = k->orientation[0];
+	calibration->rightFromLeft.orientation.y = k->orientation[1];
+	calibration->rightFromLeft.orientation.z = k->orientation[2];
+	calibration->rightFromLeft.orientation.w = k->orientation[3];
+	calibration->rightFromLeft.position.x = k->position[0];
+	calibration->rightFromLeft.position.y = k->position[1];
+	calibration->rightFromLeft.position.z = k->position[2];
+	calibration->baselineMm = k->baseline_mm;
+}
+
+/*!
+ * Spec v8 §5.9: when the app chained XrStereoCameraVerticalRefinementDXR on
+ * @p calibration, fill it from the service. Its `next` chain is untouched.
+ */
+static xrt_result_t
+fill_xr_refinement(struct xrt_stereo_camera_client *c, uint64_t camera_id, XrStereoCameraCalibrationDXR *calibration)
+{
+	XrStereoCameraVerticalRefinementDXR *o = OXR_GET_OUTPUT_FROM_CHAIN(
+	    calibration, XR_TYPE_STEREO_CAMERA_VERTICAL_REFINEMENT_DXR, XrStereoCameraVerticalRefinementDXR);
+	if (o == NULL) {
+		return XRT_SUCCESS;
+	}
+	struct xrt_stereo_camera_refinement k;
+	xrt_result_t xret = c->get_refinement(c, camera_id, &k);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	o->flags = (XrStereoCameraVerticalRefinementFlagsDXR)k.flags;
+	o->verticalOffset = k.offset;
+	o->verticalSlope = k.slope;
+	for (int e = 0; e < 2; e++) {
+		o->rectifyingRotation[e].x = k.rect_rotation[e][0];
+		o->rectifyingRotation[e].y = k.rect_rotation[e][1];
+		o->rectifyingRotation[e].z = k.rect_rotation[e][2];
+		o->rectifyingRotation[e].w = k.rect_rotation[e][3];
+	}
+	o->measuredEyeExtent.width = (int32_t)k.eye_width;
+	o->measuredEyeExtent.height = (int32_t)k.eye_height;
+	o->measuredFocalLength = k.focal_px;
+	o->residualPx = k.residual_px;
+	o->matchCount = k.matches;
+	o->windowCount = k.windows;
+	o->updateCount = k.updates;
+	return XRT_SUCCESS;
+}
+
+//! Spec v8: the wire capture state into the app's struct (times converted to XrTime).
+static void
+fill_xr_capture_result(struct oxr_instance *inst,
+                       const struct xrt_stereo_camera_capture_result *r,
+                       XrStereoCameraCaptureResultDXR *out)
+{
+	out->validFields = r->valid_fields;
+	out->focusDistanceDiopters = r->focus_distance_diopters;
+	out->focusState = (XrStereoCameraFocusStateDXR)r->focus_state;
+	out->exposureTime = (XrDuration)r->exposure_time_ns;
+	out->sensitivityIso = r->sensitivity_iso;
+	for (int e = 0; e < 2; e++) {
+		out->eyeCaptureTime[e] =
+		    r->eye_time_ns[e] > 0 ? time_state_monotonic_to_ts_ns(inst->timekeeping, r->eye_time_ns[e]) : 0;
 	}
 }
 
@@ -257,6 +401,30 @@ oxr_xrEnumerateStereoCamerasDXR(XrInstance instance,
 		if (orient != NULL) {
 			orient->frameOrientationDegrees = p.frame_orientation_deg;
 		}
+		// Spec v8: the camera's controls, when the app chained the struct.
+		XrStereoCameraControlCapabilitiesDXR *caps = OXR_GET_OUTPUT_FROM_CHAIN(
+		    o, XR_TYPE_STEREO_CAMERA_CONTROL_CAPABILITIES_DXR, XrStereoCameraControlCapabilitiesDXR);
+		if (caps != NULL && c->get_control_caps != NULL) {
+			struct xrt_stereo_camera_control_caps k;
+			xret = c->get_control_caps(c, p.camera_id, &k);
+			if (xret == XRT_ERROR_IPC_FAILURE) {
+				return scam_xret(&log, xret, "xrEnumerateStereoCamerasDXR");
+			}
+			if (xret != XRT_SUCCESS) {
+				memset(&k, 0, sizeof(k)); // gone meanwhile: no controls
+			}
+			caps->supportedControls = k.supported_controls;
+			caps->supportedFocusModes = k.supported_focus_modes;
+			caps->minFocusDistanceDiopters = k.min_focus_distance_diopters;
+			caps->focusDistanceCalibration =
+			    (XrStereoCameraFocusCalibrationDXR)k.focus_distance_calibration;
+			caps->exposureCompensationMinEv = k.exposure_compensation_min_ev;
+			caps->exposureCompensationMaxEv = k.exposure_compensation_max_ev;
+			caps->exposureCompensationStepEv = k.exposure_compensation_step_ev;
+			caps->defaultFocusDistanceDiopters = (xret == XRT_SUCCESS && k.supported_controls != 0)
+			                                         ? k.default_focus_distance_diopters
+			                                         : XR_STEREO_CAMERA_FOCUS_DISTANCE_UNKNOWN_DXR;
+		}
 #ifdef OXR_HAVE_DXR_app_share
 		// ADR-061: an app entry's description, when the app chained it (spec §2:
 		// filled only for an APP_CONTENT entry; test the flag, not the struct).
@@ -311,30 +479,28 @@ oxr_xrGetStereoCameraCalibrationDXR(XrInstance instance, uint64_t cameraId, XrSt
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "no stereo camera %llu (in-process instance)",
 		                 (unsigned long long)cameraId);
 	}
+	// Spec v8 §5.5: the numbers of frames of a mode, when the app chained one.
+	const XrStereoCameraStreamModeInfoDXR *mode = OXR_GET_INPUT_FROM_CHAIN(
+	    calibration, XR_TYPE_STEREO_CAMERA_STREAM_MODE_INFO_DXR, XrStereoCameraStreamModeInfoDXR);
+	uint32_t ew = 0, eh = 0;
+	if (mode != NULL) {
+		if (mode->eyeExtent.width <= 0 || mode->eyeExtent.height <= 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "XrStereoCameraStreamModeInfoDXR::eyeExtent");
+		}
+		ew = (uint32_t)mode->eyeExtent.width;
+		eh = (uint32_t)mode->eyeExtent.height;
+	}
 	struct xrt_stereo_camera_calibration k;
-	xrt_result_t xret = c->get_calibration(c, cameraId, (uint32_t)calibration->output, &k);
+	xrt_result_t xret = c->get_calibration(c, cameraId, (uint32_t)calibration->output, ew, eh, &k);
 	if (xret != XRT_SUCCESS) {
 		return scam_xret(&log, xret, "xrGetStereoCameraCalibrationDXR");
 	}
-	for (int e = 0; e < 2; e++) {
-		XrStereoCameraIntrinsicsDXR *o = &calibration->eye[e];
-		o->imageExtent.width = (int32_t)k.eye[e].width;
-		o->imageExtent.height = (int32_t)k.eye[e].height;
-		o->fx = k.eye[e].fx;
-		o->fy = k.eye[e].fy;
-		o->cx = k.eye[e].cx;
-		o->cy = k.eye[e].cy;
-		o->model = (XrStereoCameraDistortionModelDXR)k.eye[e].model;
-		memcpy(o->coefficients, k.eye[e].coefficients, sizeof(o->coefficients));
+	fill_xr_calibration(&k, calibration);
+	xret = fill_xr_refinement(c, cameraId, calibration);
+	if (xret != XRT_SUCCESS) {
+		return scam_xret(&log, xret, "xrGetStereoCameraCalibrationDXR");
 	}
-	calibration->rightFromLeft.orientation.x = k.orientation[0];
-	calibration->rightFromLeft.orientation.y = k.orientation[1];
-	calibration->rightFromLeft.orientation.z = k.orientation[2];
-	calibration->rightFromLeft.orientation.w = k.orientation[3];
-	calibration->rightFromLeft.position.x = k.position[0];
-	calibration->rightFromLeft.position.y = k.position[1];
-	calibration->rightFromLeft.position.z = k.position[2];
-	calibration->baselineMm = k.baseline_mm;
 	return XR_SUCCESS;
 }
 
@@ -376,6 +542,17 @@ oxr_xrCreateStereoCameraStreamDXR(XrInstance instance,
 	    .transport = (uint32_t)createInfo->transport,
 	    .max_frame_rate = createInfo->maxFrameRate,
 	};
+	// Spec v8 §5.5: the stream's mode; absent = the default (v7 unchanged).
+	const XrStereoCameraStreamModeInfoDXR *mode = OXR_GET_INPUT_FROM_CHAIN(
+	    createInfo, XR_TYPE_STEREO_CAMERA_STREAM_MODE_INFO_DXR, XrStereoCameraStreamModeInfoDXR);
+	if (mode != NULL) {
+		if (mode->eyeExtent.width <= 0 || mode->eyeExtent.height <= 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "XrStereoCameraStreamModeInfoDXR::eyeExtent");
+		}
+		req.eye_width = (uint32_t)mode->eyeExtent.width;
+		req.eye_height = (uint32_t)mode->eyeExtent.height;
+	}
 	uint64_t id = 0;
 	xrt_result_t xret = c->stream_create(c, &req, &id);
 	if (xret != XRT_SUCCESS) {
@@ -505,7 +682,8 @@ oxr_xrAcquireStereoCameraFrameDXR(XrStereoCameraStreamDXR stream, XrStereoCamera
 	bool ready = false;
 	struct xrt_stereo_camera_frame_info fi;
 	struct xrt_app_share_frame_info app;
-	xrt_result_t xret = c->acquire(c, s->id, &ready, &fi, &app);
+	struct xrt_stereo_camera_capture_result res;
+	xrt_result_t xret = c->acquire(c, s->id, &ready, &fi, &app, &res);
 	if (xret != XRT_SUCCESS) {
 		return scam_xret(&log, xret, "xrAcquireStereoCameraFrameDXR");
 	}
@@ -525,6 +703,12 @@ oxr_xrAcquireStereoCameraFrameDXR(XrStereoCameraStreamDXR stream, XrStereoCamera
 	frame->captureTimeIsExposure = fi.time_is_exposure ? XR_TRUE : XR_FALSE;
 	frame->output = (XrStereoCameraOutputDXR)fi.output;
 	frame->calibrationGeneration = fi.calibration_generation;
+	// Spec v8 §5.6: the frame's capture state, when the app chained it.
+	XrStereoCameraCaptureResultDXR *cr =
+	    OXR_GET_OUTPUT_FROM_CHAIN(frame, XR_TYPE_STEREO_CAMERA_CAPTURE_RESULT_DXR, XrStereoCameraCaptureResultDXR);
+	if (cr != NULL) {
+		fill_xr_capture_result(s->inst, &res, cr);
+	}
 #ifdef OXR_HAVE_DXR_app_share
 	// ADR-061 spec §4: per-frame app metadata on an APP_CONTENT stream.
 	XrAppShareFrameInfoDXR *afi =
@@ -571,6 +755,215 @@ oxr_xrGetStereoCameraStreamStatsDXR(XrStereoCameraStreamDXR stream, XrStereoCame
 
 /*
  *
+ * Spec v8: modes, controls, stills (§5.5 - §5.7).
+ *
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateStereoCameraModesDXR(
+    XrInstance instance, uint64_t cameraId, uint32_t capacityInput, uint32_t *countOutput, XrStereoCameraModeDXR *modes)
+{
+	OXR_TRACE_MARKER();
+	struct oxr_instance *inst = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrEnumerateStereoCameraModesDXR");
+	OXR_VERIFY_EXTENSION(&log, inst, DXR_stereo_camera);
+	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
+	if (capacityInput > 0 && modes == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "(modes == NULL) with capacityInput > 0");
+	}
+	*countOutput = 0;
+	struct xrt_stereo_camera_client *c = client_of(inst);
+	if (c == NULL || c->get_modes == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "no stereo camera %llu (in-process instance)",
+		                 (unsigned long long)cameraId);
+	}
+	struct xrt_stereo_camera_mode_list list;
+	xrt_result_t xret = c->get_modes(c, cameraId, &list);
+	if (xret != XRT_SUCCESS) {
+		return scam_xret(&log, xret, "xrEnumerateStereoCameraModesDXR");
+	}
+	*countOutput = list.count;
+	if (capacityInput == 0) {
+		return XR_SUCCESS;
+	}
+	if (capacityInput < list.count) {
+		return oxr_error(&log, XR_ERROR_SIZE_INSUFFICIENT, "(capacityInput == %u) < %u modes", capacityInput,
+		                 list.count);
+	}
+	for (uint32_t i = 0; i < list.count; i++) {
+		if (modes[i].type != XR_TYPE_STEREO_CAMERA_MODE_DXR) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "modes[%u].type", i);
+		}
+	}
+	for (uint32_t i = 0; i < list.count; i++) {
+		modes[i].eyeExtent.width = (int32_t)list.modes[i].eye_width;
+		modes[i].eyeExtent.height = (int32_t)list.modes[i].eye_height;
+		modes[i].maxFrameRate = list.modes[i].max_frame_rate;
+		modes[i].flags = list.modes[i].flags;
+	}
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetStereoCameraControlsDXR(XrStereoCameraStreamDXR stream, const XrStereoCameraControlsDXR *controls)
+{
+	OXR_TRACE_MARKER();
+	struct oxr_stereo_camera_stream_dxr *s = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_STEREO_CAMERA_STREAM_AND_INIT_LOG(&log, stream, s, "xrSetStereoCameraControlsDXR");
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, controls, XR_TYPE_STEREO_CAMERA_CONTROLS_DXR);
+	if ((controls->validControls & ~(XrStereoCameraControlFlagsDXR)0xF) != 0) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "controls->validControls has unknown bits");
+	}
+	struct xrt_stereo_camera_client *c = client_of(s->inst);
+	if (c->set_controls == NULL) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED, "controls are not supported by this runtime");
+	}
+	struct xrt_stereo_camera_controls ctl = {
+	    .valid_controls = (uint32_t)controls->validControls,
+	    .focus_mode = (uint32_t)controls->focusMode,
+	    .focus_distance_diopters = controls->focusDistanceDiopters,
+	    .metering_x = controls->meteringPoint.x,
+	    .metering_y = controls->meteringPoint.y,
+	    .exposure_compensation_ev = controls->exposureCompensationEv,
+	};
+	xrt_result_t xret = c->set_controls(c, s->id, &ctl);
+	if (xret != XRT_SUCCESS) {
+		return scam_xret(&log, xret, "xrSetStereoCameraControlsDXR");
+	}
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrReleaseStereoCameraControlsDXR(XrStereoCameraStreamDXR stream)
+{
+	OXR_TRACE_MARKER();
+	struct oxr_stereo_camera_stream_dxr *s = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_STEREO_CAMERA_STREAM_AND_INIT_LOG(&log, stream, s, "xrReleaseStereoCameraControlsDXR");
+	struct xrt_stereo_camera_client *c = client_of(s->inst);
+	if (c->release_controls == NULL) {
+		return XR_SUCCESS;
+	}
+	xrt_result_t xret = c->release_controls(c, s->id);
+	if (xret != XRT_SUCCESS) {
+		return scam_xret(&log, xret, "xrReleaseStereoCameraControlsDXR");
+	}
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestStereoCameraStillDXR(XrStereoCameraStreamDXR stream,
+                                  const XrStereoCameraStillRequestDXR *request,
+                                  uint64_t *requestId)
+{
+	OXR_TRACE_MARKER();
+	struct oxr_stereo_camera_stream_dxr *s = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_STEREO_CAMERA_STREAM_AND_INIT_LOG(&log, stream, s, "xrRequestStereoCameraStillDXR");
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, request, XR_TYPE_STEREO_CAMERA_STILL_REQUEST_DXR);
+	OXR_VERIFY_ARG_NOT_NULL(&log, requestId);
+	*requestId = 0;
+	if (request->format < XR_STEREO_CAMERA_FORMAT_GRAY8_DXR ||
+	    request->format > XR_STEREO_CAMERA_FORMAT_BGRA8_DXR) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "request->format");
+	}
+	if (request->output != XR_STEREO_CAMERA_OUTPUT_RECTIFIED_DXR &&
+	    request->output != XR_STEREO_CAMERA_OUTPUT_RAW_DXR) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "request->output");
+	}
+	if (request->eyeExtent.width < 0 || request->eyeExtent.height < 0 ||
+	    ((request->eyeExtent.width == 0) != (request->eyeExtent.height == 0))) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "request->eyeExtent (a STILL size, or {0, 0})");
+	}
+	struct xrt_stereo_camera_client *c = client_of(s->inst);
+	if (c->request_still == NULL) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED, "stills are not supported by this runtime");
+	}
+	struct xrt_stereo_camera_still_request req = {
+	    .eye_width = (uint32_t)request->eyeExtent.width,
+	    .eye_height = (uint32_t)request->eyeExtent.height,
+	    .output = (uint32_t)request->output,
+	    .format = (uint32_t)request->format,
+	};
+	xrt_result_t xret = c->request_still(c, s->id, &req, requestId);
+	if (xret != XRT_SUCCESS) {
+		return scam_xret(&log, xret, "xrRequestStereoCameraStillDXR");
+	}
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireStereoCameraStillDXR(XrStereoCameraStreamDXR stream, uint64_t requestId, XrStereoCameraStillDXR *still)
+{
+	OXR_TRACE_MARKER();
+	struct oxr_stereo_camera_stream_dxr *s = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_STEREO_CAMERA_STREAM_AND_INIT_LOG(&log, stream, s, "xrAcquireStereoCameraStillDXR");
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, still, XR_TYPE_STEREO_CAMERA_STILL_DXR);
+	struct xrt_stereo_camera_client *c = client_of(s->inst);
+	if (c->acquire_still == NULL) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED, "stills are not supported by this runtime");
+	}
+	struct xrt_stereo_camera_still_info info;
+	xrt_shmem_handle_t section = XRT_SHMEM_HANDLE_INVALID;
+	xrt_result_t xret = c->acquire_still(c, s->id, requestId, &info, &section);
+	if (xret != XRT_SUCCESS) {
+		return scam_xret(&log, xret, "xrAcquireStereoCameraStillDXR");
+	}
+	still->requestId = info.request_id;
+	still->extent.width = (int32_t)info.width;
+	still->extent.height = (int32_t)info.height;
+	still->format = (XrStereoCameraFormatDXR)info.format;
+	still->output = (XrStereoCameraOutputDXR)info.output;
+	still->rowPitch[0] = info.row_pitch[0];
+	still->rowPitch[1] = info.row_pitch[1];
+	still->planeOffset[0] = info.plane_offset[0];
+	still->planeOffset[1] = info.plane_offset[1];
+	still->sectionHandle = (uint64_t)(uintptr_t)section; // NEW handle, now the caller's to close
+	still->sectionSize = info.section_size;
+	still->captureTime = time_state_monotonic_to_ts_ns(s->inst->timekeeping, info.capture_time_ns);
+	still->captureTimeIsExposure = info.time_is_exposure ? XR_TRUE : XR_FALSE;
+	still->sourceFlags = info.flags & XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR;
+	XrStereoCameraCaptureResultDXR *cr =
+	    OXR_GET_OUTPUT_FROM_CHAIN(still, XR_TYPE_STEREO_CAMERA_CAPTURE_RESULT_DXR, XrStereoCameraCaptureResultDXR);
+	if (cr != NULL) {
+		fill_xr_capture_result(s->inst, &info.result, cr);
+	}
+	XrStereoCameraCalibrationDXR *cal =
+	    OXR_GET_OUTPUT_FROM_CHAIN(still, XR_TYPE_STEREO_CAMERA_CALIBRATION_DXR, XrStereoCameraCalibrationDXR);
+	if (cal != NULL) {
+		cal->output = (XrStereoCameraOutputDXR)info.output; // what these pixels are
+		fill_xr_calibration(&info.calibration, cal);
+		// §5.9: the correction in force now (a failure leaves the struct as passed:
+		// the still itself was delivered and its handle is the caller's).
+		(void)fill_xr_refinement(c, s->camera_id, cal);
+	}
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrReleaseStereoCameraStillDXR(XrStereoCameraStreamDXR stream, uint64_t requestId)
+{
+	OXR_TRACE_MARKER();
+	struct oxr_stereo_camera_stream_dxr *s = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_STEREO_CAMERA_STREAM_AND_INIT_LOG(&log, stream, s, "xrReleaseStereoCameraStillDXR");
+	struct xrt_stereo_camera_client *c = client_of(s->inst);
+	if (c->release_still == NULL) {
+		return XR_SUCCESS;
+	}
+	xrt_result_t xret = c->release_still(c, s->id, requestId);
+	if (xret != XRT_SUCCESS) {
+		return scam_xret(&log, xret, "xrReleaseStereoCameraStillDXR");
+	}
+	return XR_SUCCESS;
+}
+
+
+/*
+ *
  * R3: events. The service queues them per connection; xrPollEvent drains
  * them here into the instance's event queue, mapping a service stream id
  * back to the handle the app holds.
@@ -594,6 +987,17 @@ stream_by_service_id(struct oxr_instance *inst, uint64_t id)
 	}
 	os_mutex_unlock(&inst->handle.children_mutex);
 	return found;
+}
+
+//! Spec v8 §5.7: why a still failed, as the event's XrResult (no log: it is data).
+static XrResult
+still_failure_result(int32_t xret)
+{
+	switch ((xrt_result_t)xret) {
+	case XRT_ERROR_NOT_AUTHORIZED: return XR_ERROR_PERMISSION_INSUFFICIENT;
+	case XRT_ERROR_STEREO_CAMERA_STREAM_ENDED: return XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR;
+	default: return XR_ERROR_STEREO_CAMERA_BUSY_DXR;
+	}
 }
 
 XrResult
@@ -625,6 +1029,22 @@ oxr_stereo_camera_poll_events(struct oxr_logger *log, struct oxr_instance *inst)
 			break;
 		}
 		case XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED: oxr_event_push_XrEventDataStereoCamerasChanged(log, inst); break;
+		case XRT_STEREO_CAMERA_EVENT_STILL_READY:
+		case XRT_STEREO_CAMERA_EVENT_STILL_FAILED: {
+			// Spec v8 §5.7.
+			struct oxr_stereo_camera_stream_dxr *s = stream_by_service_id(inst, ev.stream_id);
+			if (s == NULL) {
+				break; // destroyed meanwhile
+			}
+			XrStereoCameraStreamDXR h = XRT_CAST_PTR_TO_OXR_HANDLE(XrStereoCameraStreamDXR, s);
+			if (ev.kind == XRT_STEREO_CAMERA_EVENT_STILL_READY) {
+				oxr_event_push_XrEventDataStereoCameraStillReady(log, inst, h, ev.request_id);
+			} else {
+				oxr_event_push_XrEventDataStereoCameraStillFailed(log, inst, h, ev.request_id,
+				                                                  still_failure_result(ev.result));
+			}
+			break;
+		}
 		default: break;
 		}
 	}
