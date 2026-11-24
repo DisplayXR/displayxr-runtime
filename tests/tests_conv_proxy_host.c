@@ -589,6 +589,18 @@ main(int argc, char **argv)
 			g_require_cpu_outputs = (unsigned)strtoul(v, NULL, 10);
 		} else if (strcmp(k, "--fake-exit-at-start") == 0) {
 			return (int)strtol(v, NULL, 10);
+		} else if (strcmp(k, "--fake-decline-once") == 0) {
+			// #2798: the probe declines (exit 16) at the first start only; the
+			// marker file makes every later start come up.
+			FILE *f = fopen(v, "rb");
+			if (f == NULL) {
+				f = fopen(v, "wb");
+				if (f != NULL) {
+					fclose(f);
+				}
+				return CONV_HOST_EXIT_PROBE_DECLINED;
+			}
+			fclose(f);
 		}
 	}
 	if (binary_log != NULL) {

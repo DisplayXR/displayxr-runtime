@@ -1021,6 +1021,18 @@ target_conv_status_from_registry(const struct conv_registry *reg,
 			copy_str(x->name, sizeof(x->name), reg->providers[pi].id);
 			copy_str(x->load, sizeof(x->load), "BUILT_IN");
 		}
+		// #2798: a satellite-hosted provider is never loaded in the service,
+		// so its loader row stays NOT_LOADED whatever its host process did.
+		// A host whose probe declined (exit 16) is reported the way the
+		// headless pass reports the same answer, so a reader (the Dashboard's
+		// "not available on this PC" rule) sees one word from both. Other
+		// host exits keep the row as it was.
+		if (reg->providers[pi].host != NULL &&
+		    conv_host_exit_is_probe_declined(conv_host_get_load_failure(reg->providers[pi].host))) {
+			copy_str(x->load, sizeof(x->load), "PROBE_DECLINED");
+			(void)snprintf(x->hint, sizeof(x->hint), "probe returned %d (in its host process)",
+			               (int)XRT_ERROR_PROBER_NOT_SUPPORTED);
+		}
 		// ADR-054 N5: asked live (from memory), so the service's feed follows
 		// a licence that changed since the last describe.
 		if (reg->providers[pi].host != NULL) {

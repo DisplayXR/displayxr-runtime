@@ -641,6 +641,96 @@ TEST_CASE("proxy: a registration rebind makes the next host load the new binary;
 	std::remove(log.c_str());
 }
 
+TEST_CASE("proxy: a declined probe (host exit 16) is a reported load failure: latched, one retry per change (#2798)",
+          "[conv_proxy]")
+{
+	// The host of an opt-in provider that is not enabled (sim-conversion as
+	// shipped), or of one with nothing to serve on this machine, exits 16
+	// before it is up. The supervisor latches it (no respawn loop); the proxy
+	// now also says so, so the status rows can read PROBE_DECLINED instead of
+	// looking like a provider that was never started.
+	Fixture fx({"--fake-exit-at-start", "16"});
+	REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 20000));
+	CHECK(fx.sup().last_exit == CONV_HOST_EXIT_PROBE_DECLINED);
+	CHECK(conv_host_get_load_failure(fx.host) == CONV_HOST_EXIT_PROBE_DECLINED);
+	CHECK(conv_host_exit_is_probe_declined(conv_host_get_load_failure(fx.host)));
+	CHECK(fx.sup().restarts == 0u);                  // not a crash
+	CHECK(fx.row_state() == XRT_CONV_STATE_UNKNOWN); // never described: no capability row
+
+	// Latched: the describe is still wanted (demand), and nothing respawns --
+	// well past the 1 Hz maintenance probe and any backoff.
+	const uint32_t spawns = fx.sup().spawns;
+	CHECK(spawns == 1u);
+	sleep_ms(1500);
+	CHECK(fx.sup().spawns == spawns);
+	CHECK(fx.sup().state == CONV_SUP_FAILED);
+
+	// A configuration change (`conv set`, `conv enable`, a new Version) is one
+	// retry: exactly one more short spawn, and the reader never sees the
+	// provider as "not started" in between.
+	bool saw_none = false;
+	conv_host_proxy_config_changed(fx.host);
+	REQUIRE(wait_until(
+	    [&] {
+		    saw_none = saw_none || conv_host_get_load_failure(fx.host) == 0;
+		    const conv_supervisor_status st = fx.sup();
+		    return st.spawns == spawns + 1u && st.state == CONV_SUP_FAILED;
+	    },
+	    20000));
+	CHECK_FALSE(saw_none);
+	sleep_ms(1500);
+	CHECK(fx.sup().spawns == spawns + 1u);
+	CHECK(conv_host_get_load_failure(fx.host) == CONV_HOST_EXIT_PROBE_DECLINED);
+
+	// The registration is rebound to another binary: what the previous binary
+	// reported is dropped at once (its supervisor gate is cleared separately,
+	// by conv_host_proxy_config_changed).
+	CHECK(conv_host_proxy_rebind(fx.host, "another-binary", false));
+	CHECK(conv_host_get_load_failure(fx.host) == 0);
+}
+
+TEST_CASE("proxy: a declined probe clears when the retry comes up; other exit codes keep their meaning (#2798)",
+          "[conv_proxy]")
+{
+	SECTION("declined once, then up")
+	{
+		const std::string marker = temp_marker() + ".declined";
+		std::remove(marker.c_str());
+		Fixture fx({"--fake-decline-once", marker});
+		REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 20000));
+		CHECK(conv_host_get_load_failure(fx.host) == CONV_HOST_EXIT_PROBE_DECLINED);
+		// The user enabled it (`conv set <id> ENABLE 1`): the service's rescan
+		// clears the load-failure gate and the describe spawn goes again.
+		conv_host_proxy_config_changed(fx.host);
+		REQUIRE(wait_until([&] { return fx.row_state() != XRT_CONV_STATE_UNKNOWN; }, 40000));
+		CHECK(conv_host_get_load_failure(fx.host) == 0);
+		CHECK(fx.sup().state == CONV_SUP_RUNNING);
+		CHECK(fx.sup().spawns == 2u);
+		CHECK(fx.sup().restarts == 0u);
+		std::remove(marker.c_str());
+	}
+	SECTION("an ABI reject (10) is a load failure, not a declined probe")
+	{
+		Fixture fx({"--fake-exit-at-start", "10"});
+		REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 20000));
+		CHECK(conv_host_get_load_failure(fx.host) == CONV_HOST_EXIT_ABI_REJECT);
+		CHECK_FALSE(conv_host_exit_is_probe_declined(conv_host_get_load_failure(fx.host)));
+	}
+	SECTION("a crash loop is not a load failure")
+	{
+		Fixture fx({"--fake-exit-at-start", "139"}, 0, 2);
+		REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 30000));
+		CHECK(fx.sup().restarts >= 2u);
+		CHECK(conv_host_get_load_failure(fx.host) == 0);
+	}
+	SECTION("a host that is up reports none")
+	{
+		Fixture fx({});
+		REQUIRE(wait_until([&] { return fx.row_state() != XRT_CONV_STATE_UNKNOWN; }, 40000));
+		CHECK(conv_host_get_load_failure(fx.host) == 0);
+	}
+}
+
 TEST_CASE("proxy: with a warm describe cache nothing spawns until a warm / create", "[conv_proxy]")
 {
 	std::vector<uint8_t> cache;
@@ -922,6 +1012,39 @@ job_bytes(CoreOps &fx)
 }
 
 } // namespace
+
+TEST_CASE("proxy: the real host with the sim provider as shipped (ENABLE unset) declines and says so (#2798)",
+          "[conv_proxy]")
+{
+	// The state of the bug report: sim-conversion registered, never enabled.
+	// The real displayxr-conversion-host loads it, its probe answers
+	// XRT_ERROR_PROBER_NOT_SUPPORTED, the host exits 16 before it is up.
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");   // the sim provider lives in the build tree (#952)
+	set_env("DXR_CONV_HOST_ALLOW_ELEVATED", "1"); // CI runners and this harness are elevated
+	set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "0");
+	set_env("DXR_CONV_SIM_CONVERSION_LATENCY_MS", "0");
+	Fixture fx({}, 0, 5, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH);
+	// A real host start costs seconds (its logger setup), more under a parallel ctest.
+	REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 60000));
+	const conv_supervisor_status st = fx.sup();
+	CHECK(st.last_exit == CONV_HOST_EXIT_PROBE_DECLINED);
+	CHECK(st.restarts == 0u);
+	CHECK(st.spawns == 1u);
+	CHECK(std::string(st.detail != nullptr ? st.detail : "") == "probe_declined");
+	CHECK(conv_host_exit_is_probe_declined(conv_host_get_load_failure(fx.host)));
+	sleep_ms(1500);
+	CHECK(fx.sup().spawns == 1u); // latched: no respawn loop
+
+	// `conv set sim-conversion ENABLE 1`: the host inherits the setting, the
+	// service's rescan clears the load-failure gate, the retry comes up.
+	set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "1");
+	conv_host_proxy_config_changed(fx.host);
+	REQUIRE(wait_until([&] { return fx.row_state(XRT_CONV_TASK_DEPTH_MONO) != XRT_CONV_STATE_UNKNOWN; }, 60000));
+	CHECK(conv_host_get_load_failure(fx.host) == 0);
+	CHECK(fx.sup().state == CONV_SUP_RUNNING);
+	CHECK(fx.sup().spawns == 2u);
+	CHECK(fx.sup().restarts == 0u);
+}
 
 TEST_CASE("proxy: the real displayxr-conversion-host with the sim provider matches in-service", "[conv_proxy]")
 {

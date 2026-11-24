@@ -294,6 +294,11 @@ struct proxy
 	uint64_t raised_terminal_at;
 	uint64_t next_maintenance_ns;
 	bool maintenance_held; //!< the last probe's answer (logged on change)
+	/*! #2798: the exit code of the last host start the supervisor latched as a
+	 *  terminal refusal (16 = probe declined, 10, 11, ...); 0 = none. Kept
+	 *  across a retry, cleared when a host comes up or the registration is
+	 *  rebound (conv_host_ops::get_load_failure). */
+	int32_t load_failure;
 
 	/* The current incarnation. */
 	uint32_t epoch;
@@ -633,6 +638,7 @@ handle_hello(struct proxy *p, const uint8_t *payload, uint32_t bytes)
 	os_mutex_lock(&p->m);
 	conv_supervisor_hello(&p->sup, now_ns(), reject == CONV_HOST_REJECT_NONE);
 	if (reject == CONV_HOST_REJECT_NONE) {
+		p->load_failure = 0; // a host is up: whatever an earlier start reported is over
 		p->hello_ok = true;
 		p->hello_caps = h.capability_count;
 		p->hello_luid = h.adapter_luid;
@@ -1295,6 +1301,14 @@ host_exited(struct proxy *p, int32_t code)
 		conv_supervisor_idle_exited(&p->sup, now_ns());
 	} else {
 		conv_supervisor_exited(&p->sup, now_ns(), code);
+	}
+	if (p->sup.state == CONV_SUP_FAILED && p->sup.failure_reason != XRT_CONV_FAIL_CRASH_LOOP) {
+		// #2798: a terminal refusal (its probe declined, an ABI reject, ...).
+		// Remembered so the status rows can say why the provider is not
+		// loaded instead of reading like one that was never started.
+		p->load_failure = code;
+	} else if (!orderly) {
+		p->load_failure = 0; // a crash is not a load refusal: the supervisor's state says it
 	}
 	os_mutex_unlock(&p->m);
 	report_terminal(p);
@@ -2855,6 +2869,16 @@ px_get_license_state(struct conv_host *h, struct xrt_component_license_state *ou
 	return out->state; // what the host process last reported; not_applicable before its first message
 }
 
+static int32_t
+px_get_load_failure(struct conv_host *h)
+{
+	struct proxy *p = px(h);
+	os_mutex_lock(&p->m);
+	const int32_t code = p->load_failure;
+	os_mutex_unlock(&p->m);
+	return code;
+}
+
 static bool
 px_activate(
     struct conv_host *h, const char *token, struct xrt_component_license_state *out_state, char *err, uint32_t err_cap)
@@ -2931,6 +2955,7 @@ static const struct conv_host_ops k_proxy_ops = {
     .destroy = px_destroy,
     .get_license_state = px_get_license_state,
     .activate = px_activate,
+    .get_load_failure = px_get_load_failure,
 };
 
 
@@ -3088,6 +3113,9 @@ conv_host_proxy_rebind(struct conv_host *h, const char *provider_binary, bool re
 	// one at its first spawn, and ask for that spawn (demand_locked).
 	p->described = false;
 	p->want_describe = true;
+	// #2798: what the previous binary's last start reported (its probe
+	// declined, ...) says nothing about this one.
+	p->load_failure = 0;
 	// A host still up is running the previous binary (Restart Manager did not
 	// reach it): the supervisor thread ends it as closed for update -- the
 	// adapter-change path (no backoff, no crash accounting, respawn owed).

@@ -395,6 +395,104 @@ TEST_CASE("conv snapshot: the live rows follow a rebound and a removed registrat
 	CHECK(bound(*st, XRT_CONV_TASK_DEPTH_MONO) == "acme-conversion");
 }
 
+namespace {
+//! A satellite host that only answers conv_host_ops::get_load_failure.
+struct load_failure_host
+{
+	conv_host base{};
+	conv_host_ops ops{};
+	int32_t code = 0;
+};
+
+int32_t
+load_failure_of(conv_host *h)
+{
+	return reinterpret_cast<load_failure_host *>(h)->code;
+}
+} // namespace
+
+TEST_CASE("conv snapshot: the live row of a satellite whose probe declined reads PROBE_DECLINED (#2798)",
+          "[conv_snapshot]")
+{
+	// The service never loads a satellite-hosted provider, so its loader row
+	// stays NOT_LOADED ("hosted in displayxr-conversion-host") whatever the
+	// host process did. A host that exited 16 (its probe declined) used to
+	// read exactly like one that was never started.
+	auto reg = std::make_unique<conv_registry>();
+	conv_registry_init(reg.get());
+	load_failure_host sim;
+	sim.base.ops = &sim.ops;
+	sim.ops.get_load_failure = load_failure_of;
+	conv_provider_desc dsim{};
+	dsim.id = "sim-conversion";
+	dsim.probe_order = 900;
+	dsim.hosting = CONV_HOSTING_SATELLITE;
+	dsim.enabled = true;
+	dsim.binary_path = "/opt/sim/sim-conversion.so";
+	dsim.host = &sim.base;
+	REQUIRE(conv_registry_add(reg.get(), &dsim) == 0);
+
+	std::vector<xrt_conversion_plugin_entry> entries(1);
+	std::memset(entries.data(), 0, sizeof(entries[0]));
+	cpy(entries[0].id, sizeof(entries[0].id), "sim-conversion");
+	cpy(entries[0].version, sizeof(entries[0].version), "1.0.0");
+	cpy(entries[0].binary_path, sizeof(entries[0].binary_path), "/opt/sim/sim-conversion.so");
+	cpy(entries[0].reason, sizeof(entries[0].reason), "hosted in displayxr-conversion-host");
+	entries[0].enabled = true;
+	entries[0].status = XRT_CONV_LOAD_NOT_LOADED;
+
+	auto st = std::make_unique<target_conv_status>();
+
+	// Not started yet (or starting): as before.
+	target_conv_status_from_registry(reg.get(), entries.data(), 1, nullptr, st.get());
+	REQUIRE(st->provider_count == 1);
+	CHECK(std::string(st->providers[0].load) == "NOT_LOADED");
+	CHECK(std::string(st->providers[0].hint) == "hosted in displayxr-conversion-host");
+
+	// Its host exited 16 before it was up: the headless pass's word, and the
+	// same kind of hint ("probe returned -17").
+	sim.code = 16;
+	target_conv_status_from_registry(reg.get(), entries.data(), 1, nullptr, st.get());
+	REQUIRE(st->provider_count == 1);
+	const xrt_status_conv_provider &row = st->providers[0];
+	CHECK(std::string(row.load) == "PROBE_DECLINED");
+	CHECK(std::string(row.hint).rfind("probe returned -17", 0) == 0);
+	CHECK(row.hosting == XRT_STATUS_CONV_HOSTING_SATELLITE);
+	CHECK(row.enabled);
+	CHECK_FALSE(row.described);
+	CHECK(row.cap_count == 0u);
+	CHECK(st->task_count == 0u); // nothing to select
+
+	// The snapshot the service serves (and `conv list --json` prints) carries the same word.
+	auto snap = std::make_unique<xrt_status_snapshot>();
+	std::memset(snap.get(), 0, sizeof(*snap));
+	target_conv_status_to_snapshot(st.get(), snap.get());
+	REQUIRE(snap->conv_provider_count == 1u);
+	CHECK(std::string(snap->conv_providers[0].load) == "PROBE_DECLINED");
+
+	// Other terminal host exits keep their current reading (the row is not
+	// re-labelled): 10 = ABI reject, 11 = negotiate / describe failed, ...
+	for (int32_t code : {10, 11, 13, 14}) {
+		CAPTURE(code);
+		sim.code = code;
+		target_conv_status_from_registry(reg.get(), entries.data(), 1, nullptr, st.get());
+		REQUIRE(st->provider_count == 1);
+		CHECK(std::string(st->providers[0].load) == "NOT_LOADED");
+		CHECK(std::string(st->providers[0].hint) == "hosted in displayxr-conversion-host");
+	}
+
+	// Retried and up (or rebound to another binary): the host reports 0 again.
+	sim.code = 0;
+	target_conv_status_from_registry(reg.get(), entries.data(), 1, nullptr, st.get());
+	CHECK(std::string(st->providers[0].load) == "NOT_LOADED");
+
+	// A host without the op (in-service): the helper answers 0.
+	sim.ops.get_load_failure = nullptr;
+	sim.code = 16;
+	CHECK(conv_host_get_load_failure(&sim.base) == 0);
+	CHECK(conv_host_get_load_failure(nullptr) == 0);
+}
+
 
 /*
  *
