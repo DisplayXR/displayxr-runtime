@@ -72,6 +72,8 @@
  * the XrDisplayDXR::displayId of the screen a camera belongs to (0 = not
  * known). A change of it is reported like a displayName change. Nothing in
  * XrStereoCameraPropertiesDXR changes size.
+ * 6 - 8: see the comment on XR_DXR_stereo_camera_SPEC_VERSION below (8 = capture
+ * modes, controls + capture state, stills).
  */
 #ifndef XR_DXR_STEREO_CAMERA_H
 #define XR_DXR_STEREO_CAMERA_H 1

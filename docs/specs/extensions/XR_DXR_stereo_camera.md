@@ -602,7 +602,9 @@ xrReleaseStereoCameraStillDXR(stream, id);
   release. Before the ready event: `XR_ERROR_CALL_ORDER_INVALID`; an unknown or failed id:
   `XR_ERROR_VALIDATION_FAILURE`.
 - **Release** frees the runtime's copy; a mapping the consumer already made stays valid (the memory
-  lives until the last handle and mapping close). Destroying the stream releases its still.
+  lives until the last handle and mapping close). Releasing an id the runtime no longer holds
+  (failed, already released) is a no-op `XR_SUCCESS`; releasing a still still in flight cancels it
+  (what the source delivers is discarded, no event). Destroying the stream releases its still.
 - **The running stream.** Taking a still may make the source reconfigure (a larger sensor mode, a
   separate still pipeline). The stream's frames may then **pause for a documented gap** — the
   plug-in contract allows up to 1 s — and resume by themselves; the camera's state stays
@@ -1258,6 +1260,29 @@ misalignment + roll between the eyes, plus a frame counter burned into each half
 
 The whole path (enumerate → consent → start → acquire → rectify) then runs in CI without hardware.
 
+**Spec v8 (as built).** The fake also implements every §9b slot, with no extra knob:
+
+- **Modes:** the configured size (default, STREAM + STILL), half of it (STREAM) and double (STREAM +
+  STILL, capped at 4096 px). `set_mode` re-renders the same scene at the new size (fx scales with the
+  width, so every mode images one field of view and the rescaled calibration is exact).
+- **Controls:** all four, every focus mode, nearest focus 10 D (`APPROXIMATE`), EV −2…+2 in ⅓ steps.
+  The fake lens moves towards its target with a 150 ms time constant and reports `SEARCHING` until it
+  is within 0.01 D: MANUAL goes to the asked distance, AUTO_ONCE / CONTINUOUS_AUTO to the depth under
+  the metering point (the bar at 0.6 m = 1.667 D, else the background at 2 m = 0.5 D), LOCKED holds.
+  EV scales the reported exposure time (16.7 ms · 2^EV), ISO 100, right eye exposed 0.2 ms after the
+  left.
+- **Stills:** rendered at the still size after a 200 ms capture latency during which `wait_frame`
+  returns no frame (the documented pause), through the same raw lenses on the `_DISTORT=1` fake.
+
+On this Mac (Debug service, `DXR_DP_SIM_DISPLAY_STEREO_CAMERA=1`): `camera set focus-mode manual
+focus 4 ev 1` shows the focus settle 0.5 → 3.41 → 3.90 → 3.98 → 4.00 D (LOCKED) with the exposure
+doubled; `camera set focus-mode once point 0.5,0.5` settles on the bar at 1.66 D; a `--mode
+1280x960` probe sees 24 / 79 px disparities (2.00 m / 0.60 m from the mode's own calibration), a
+`--mode 320x240` probe 6 / 20 px. On `_DISTORT=1`, a 1280×960 `--rectified` probe and a concurrent
+default `--rectified` probe (served downscaled from the 1280×960 rectified source) both PASS row
+alignment; `camera still` returns a 2560×960 RECTIFIED still with |dy| median 0.014 px and depths
+1.998 m / 0.600 m from its own calibration, and a RAW still keeps the 2 px raw misalignment.
+
 ## 11. Probe and diagnostics
 
 ```
@@ -1267,9 +1292,18 @@ displayxr-cli camera uvc-devices [--modes] [--decoder]  # §9a: UVC webcam confi
 displayxr-cli camera uvc-decode-bench <file>          # §9a: a media file through the webcam decode path
 displayxr-cli camera calib <id> [--raw|--rectified] [--json]
 displayxr-cli camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]
-                              [--frames N] [--seconds S] [--out DIR]
+                              [--frames N] [--seconds S] [--out DIR] [--mode WxH]
                                                       # rate, index gaps, SBS layout, block
                                                       # disparities, service stats; --out writes cam_<n>.png
+                                                      # v8: --mode WxH streams that mode (depth from its calibration)
+displayxr-cli camera modes [<id>] [--json]            # v8: modes + control capabilities
+displayxr-cli camera set [<id>] <control> <value> ... [--seconds S] [--mode WxH]
+                                                      # v8: focus-mode auto|once|manual|locked, focus <D>,
+                                                      # point <x>,<y>, ev <EV>; takes the controls, prints the
+                                                      # per-frame capture state (exit 9 = another stream holds them)
+displayxr-cli camera still [<id>] [--size WxH] [--raw] [--format gray8|nv12|bgra8] [--mode WxH] [--out DIR]
+                                                      # v8: one still end to end: latency, layout, capture state,
+                                                      # calibration, its own row alignment + depth; --out writes still_<id>.png
 ```
 
 As built in R1, e.g. against the sim fake on macOS:
@@ -1333,6 +1367,10 @@ scale, a one-eye ±0.5 px centre convention); a transposed R is a large, roll-sh
 > 1 px), so a clean constant offset is *not* that; the calibration-size rescale and the plug-in's
 half swap (`R' = Rᵀ`, `T' = −RᵀT`) are exact; an identity calibration maps as a pure scale about
 (cx, cy) — no half-pixel offset.
+
+`selftest`'s `stereo_camera_caps` also checks the v8 answers of each plug-in camera (mode 0 = the
+default, even non-zero sizes, sane rates, STILL sizes only with the still slots, control capabilities
+consistent with themselves and with `set_controls` being there); absence never fails.
 
 Runs as a DIAG IPC client, non-elevated. `probe` goes through the full consent path (so its
 first run on a box raises the prompt — which is how a developer checks the prompt). `selftest`
