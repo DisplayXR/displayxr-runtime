@@ -573,6 +573,23 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 		}
 	}
 
+	// #2805: say once how this instance was started. The command line differs
+	// by start path on purpose and is not a health signal: --autostart only
+	// arms the start-on-login gate below, --rm-restart only the integrity
+	// check, and every instance that gets past them runs the same tray,
+	// hotkey, orchestrator and IPC server.
+	const char *start_kind =
+	    "plain launch (an installer's start or restore via explorer.exe, an OpenXR "
+	    "client's auto-launch, or by hand)";
+	if (adoption_predecessor_pid != 0) {
+		start_kind = "plug-in adoption successor";
+	} else if (rm_restart) {
+		start_kind = "Restart Manager restart (an installer closed and restarted the service)";
+	} else if (autostart) {
+		start_kind = "logon auto-start (Run key, --autostart)";
+	}
+	U_LOG_W("Service start kind: %s.", start_kind);
+
 	// ADR-045: started by our own predecessor to complete a plug-in adoption.
 	if (adoption_predecessor_pid != 0) {
 		U_LOG_W("Started to complete a display plug-in adoption (predecessor pid %lu).",
