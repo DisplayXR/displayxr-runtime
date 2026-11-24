@@ -11,6 +11,7 @@
 
 #include "util/u_rendering_modes.h"
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 
 #include "xrt/xrt_display_status.h"
 
@@ -90,6 +91,8 @@ struct u_rm_record
 	volatile uint32_t generation;
 	//! Last config poll (u_device_rendering_modes_sync), monotonic ns; 0 = never.
 	uint64_t last_poll_ns;
+	//! The per-user store stamp at the last config re-read (u_setting_user_stamp).
+	uint64_t store_stamp;
 	//! The last refused CONFIGURED_3D_MODE answer, so it is WARNed once.
 	int32_t last_refused;
 	//! The last per-screen choice that named no declared 3D entry (WARNed once).
@@ -716,11 +719,51 @@ u_device_rendering_modes_sync(struct xrt_device *xdev, uint64_t now_ns)
 	if (r->sync_fn != NULL) {
 		return r->sync_fn(xdev);
 	}
-	if (r->wrapped && (r->last_poll_ns == 0 || now_ns - r->last_poll_ns >= U_RM_CONFIG_POLL_NS)) {
+	// ADR-047 Amendment 10: a per-user store write (`dp mode set`) is honoured
+	// at the next poll, not after the rest of the second (one stat).
+	const uint64_t stamp = r->wrapped ? u_setting_user_stamp() : 0;
+	if (r->wrapped &&
+	    (r->last_poll_ns == 0 || now_ns - r->last_poll_ns >= U_RM_CONFIG_POLL_NS || stamp != r->store_stamp)) {
 		r->last_poll_ns = now_ns;
+		r->store_stamp = stamp;
 		(void)u_device_rendering_modes_refresh_config(xdev, NULL);
 	}
 	return r->generation;
+}
+
+bool
+u_device_rendering_modes_promote_choice(struct xrt_device *xdev, const char *choice)
+{
+	struct u_rm_record *r = (xdev != NULL) ? record_find(xdev) : NULL;
+	if (r == NULL || !r->wrapped || choice == NULL || choice[0] == '\0') {
+		return false;
+	}
+	bool promoted = false;
+	record_lock(r);
+	const uint32_t n = r->driver_count < XRT_MAX_RENDERING_MODES ? r->driver_count : XRT_MAX_RENDERING_MODES;
+	for (uint32_t j = 1; j < n && !promoted; j++) {
+		struct xrt_rendering_mode *m = &xdev->rendering_modes[pos_of(j, r->kept_driver_index)];
+		if ((m->mode_flags & XRT_RENDERING_MODE_FLAG_START_UP_ONLY) == 0 || !u_rendering_mode_is_3d(m) ||
+		    m->view_count > XRT_MAX_VIEWS || !u_rendering_mode_matches_choice(m, choice)) {
+			continue;
+		}
+		m->mode_flags &= ~XRT_RENDERING_MODE_FLAG_START_UP_ONLY;
+		r->envelope_count = u_rendering_modes_envelope_of(xdev->rendering_modes, n);
+		if (xdev->hmd != NULL) {
+			const uint32_t mv = u_rendering_modes_max_view_count(xdev->rendering_modes, r->envelope_count);
+			if (mv > xdev->hmd->view_count) {
+				xdev->hmd->view_count = mv;
+			}
+		}
+		U_LOG_W(
+		    "Display driver '%s': the screen's stored 3D mode '%s' is declared only at start-up - declared "
+		    "for this instance (%u views; envelope %u entries, located view count %u)",
+		    r->name, m->mode_name, m->view_count, r->envelope_count,
+		    xdev->hmd != NULL ? xdev->hmd->view_count : 0u);
+		promoted = true;
+	}
+	record_unlock(r);
+	return promoted;
 }
 
 void

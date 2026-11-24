@@ -342,10 +342,13 @@ TEST_CASE("options --json values: in-tree enum help strings that list their word
 TEST_CASE("options --json values: help strings that must NOT parse", "[cli][options][enum]")
 {
 	// sim_display OUTPUT: prose, then a comma list.
-	CHECK(
-	    words_of("the 3D kind mode 1 draws: anaglyph, sbs, squeezed|squeezed_sbs, quad (4 views: an inspection "
-	             "kind, stereo apps fall back to 2D), interlaced, blend; 2d|passthrough = anaglyph and start in 2D")
-	        .empty());
+	CHECK(words_of(
+	          "the default 3D mode (slot 1) of a screen with no 'dp mode set' choice, applied live: Same as 2D "
+	          "(default|same_as_2d: one sharp full-resolution view, the default; 2d and passthrough are aliases "
+	          "of it, no longer 'anaglyph, start in 2D'), anaglyph, sbs, squeezed|squeezed_sbs, interlaced, "
+	          "blend, quad (4 views: declared only when it is the 3D mode at start-up, here or as the screen's "
+	          "'dp mode set' choice, so switching TO quad applies at the next start; stereo apps fall back to 2D)")
+	          .empty());
 	// sim_display WEAVE_SCOPE / WISH_QUANTIZE / STEREO_CAMERA_FORMAT / WEBCAM_ESTIMATOR
 	CHECK(words_of("weave scope the DP declares: canvas, region, scanout").empty());
 	CHECK(words_of("quantise the wish mask: off, band, cell").empty());

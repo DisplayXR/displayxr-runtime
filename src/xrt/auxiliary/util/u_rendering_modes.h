@@ -761,6 +761,19 @@ struct xrt_status_mode_3d;
 void
 u_device_rendering_modes_fill_status(struct xrt_device *xdev, struct xrt_status_mode_3d *out);
 
+/*!
+ * At system creation, honour a stored per-screen 3D-mode choice that names a
+ * START-UP-ONLY entry (sim_display's Quad): clear that entry's
+ * XRT_RENDERING_MODE_FLAG_START_UP_ONLY so it joins the envelope for this
+ * instance (sizing, the located view count) and becomes selectable, as if the
+ * driver had declared it - the same as OUTPUT=quad at start. Call before any
+ * session exists, then re-tile. One WARN.
+ *
+ * @return true when an entry was promoted (the caller re-tiles and re-sizes).
+ */
+bool
+u_device_rendering_modes_promote_choice(struct xrt_device *xdev, const char *choice);
+
 //! Drop @p xdev's record (an unwrapped device being destroyed: an IPC proxy).
 void
 u_device_rendering_modes_forget(struct xrt_device *xdev);

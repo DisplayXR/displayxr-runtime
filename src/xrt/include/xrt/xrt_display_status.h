@@ -488,6 +488,9 @@ struct xrt_status_mode_3d
 	uint32_t source;  //!< `enum xrt_status_mode_3d_source`.
 	uint32_t choice_count;
 	struct xrt_status_mode_3d_choice choices[XRT_STATUS_MAX_MODE_3D_CHOICES];
+	//! Why there are no choices ("" = none): a stored choice for a screen whose
+	//! driver declares no 3D modes now (JSON top-level `reason`, else null).
+	char reason[96];
 };
 
 //! One DP bound to a screen (phase 2).

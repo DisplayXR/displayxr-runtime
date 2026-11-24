@@ -816,7 +816,7 @@ publish_screens_locked(const struct xrt_system_compositor_info *info, bool initi
 
 	// ADR-047 Amendment 10: every screen's own mode table, re-read on every
 	// publish (a hotplugged screen brings its list; a re-claim swaps it).
-	target_screen_modes_publish(now, &info->dp_registry, g_display_info_head);
+	target_screen_modes_publish(now, &info->dp_registry, g_display_info_head, initial);
 
 	bool changed = false;
 	if (initial) {
@@ -1669,6 +1669,43 @@ out:
 		// here on (the slot refresh polls it); apply it now, before any session
 		// exists, so the first one starts in the chosen entry.
 		u_rendering_modes_set_choice_resolver(head_screen_mode_choice);
+		// ADR-047 Amendment 10: a stored choice `dp mode set` accepted as
+		// `applies: restart_app` (a start-up-only entry: sim_display's Quad)
+		// is declared now, at this start, before the instance is sized -
+		// then re-tiled, and the worst case widened, like OUTPUT=quad at start.
+		if (head != NULL) {
+			char start_choice[64] = {0};
+			uint32_t start_src = 0;
+			if (head_screen_mode_choice(head, start_choice, sizeof(start_choice), &start_src) &&
+			    u_device_rendering_modes_promote_choice(head, start_choice) &&
+			    xsysc->info.display_pixel_width > 0 && xsysc->info.display_pixel_height > 0) {
+				struct xrt_system_compositor_info *si = &xsysc->info;
+				const uint32_t env = u_device_rendering_modes_envelope_count(head);
+				for (uint32_t mi = 0; mi < env; mi++) {
+					u_tiling_compute_mode(&head->rendering_modes[mi], si->display_pixel_width,
+					                      si->display_pixel_height);
+					if (head->rendering_modes[mi].view_width_pixels > si->worst_view_width_pixels) {
+						si->worst_view_width_pixels =
+						    head->rendering_modes[mi].view_width_pixels;
+					}
+					if (head->rendering_modes[mi].view_height_pixels >
+					    si->worst_view_height_pixels) {
+						si->worst_view_height_pixels =
+						    head->rendering_modes[mi].view_height_pixels;
+					}
+				}
+				uint32_t aw = 0, ah = 0;
+				u_tiling_compute_system_atlas_oriented(head->rendering_modes, env,
+				                                       si->display_pixel_width,
+				                                       si->display_pixel_height, &aw, &ah);
+				if (aw > si->atlas_width_pixels) {
+					si->atlas_width_pixels = aw;
+				}
+				if (ah > si->atlas_height_pixels) {
+					si->atlas_height_pixels = ah;
+				}
+			}
+		}
 		if (head != NULL) {
 			const struct xrt_plugin_iface *rm_plugin = target_plugin_get_active();
 			(void)u_device_rendering_modes_refresh_config(head, rm_plugin != NULL ? rm_plugin->id : NULL);
