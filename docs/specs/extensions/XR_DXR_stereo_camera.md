@@ -597,7 +597,16 @@ frame with a 250 ms cache:
   package, bound with `BIND_IMPORTANT | BIND_ABOVE_CLIENT`, so it is `IMPORTANCE_FOREGROUND`
   (`BOUND_TOP`) exactly while that package is the top app. Anything lower suspends every stream in
   that satellite (`SUSPENDED`, no frames), and they resume on return. The satellite still has
-  **no** `foregroundServiceType="camera"`. A source that had delivered and then lost its device to
+  **no** `foregroundServiceType="camera"`. **No runtime process is a foreground service while a
+  client is attached** (`RuntimeForegroundPolicy`): AppOps keeps one state per uid, and a
+  `connectedDevice|mediaPlayback` foreground service anywhere in the runtime uid parks it at
+  `fgsvc` without the camera capability while the client is in the background; on the client's
+  return its binding brings BOUND_TOP + the camera capability, which AppOps ranks `fg` — less
+  important than `fgsvc` — so it is held for the 5 s settle and `openCamera` is refused
+  (`ACAMERA_ERROR_CAMERA_DISABLED`) for 5 s after every return from HOME (measured on the tablet,
+  Android 13). Without it the uid falls to the client's background state and the return is an
+  upgrade, committed at once. The main-process service is foreground only **between** clients
+  (residency, #1245); satellites never are. Kill switch `debug.dxr.fgs_idle_only=0`. A source that had delivered and then lost its device to
   the OS (where the OS does enforce while-in-use, or sensor privacy) is also reported `SUSPENDED`,
   not `UNAVAILABLE`, while the service retries, and its started streams are kept.
   **Front camera (option R):** a `USER_FACING` camera

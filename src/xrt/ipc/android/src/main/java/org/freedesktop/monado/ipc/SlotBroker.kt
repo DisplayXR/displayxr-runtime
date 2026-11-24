@@ -70,22 +70,25 @@ class SlotBroker(private val context: Context, private val slotCount: Int) : ISl
             )
             return -1
         }
+        val slot: Int
+        val occupied: Int
         synchronized(lock) {
             // 1. Reuse — a relaunch of the same package rebinds to its own satellite rather
             //    than stranding a live one and burning a second slot.
-            var slot = slots.indexOfFirst { it != null && it.pkg == pkg }
+            var found = slots.indexOfFirst { it != null && it.pkg == pkg }
             var why = "reuse"
-            if (slot < 0) {
+            if (found < 0) {
                 // 2. Honour a pin (debug.dxr.slot / com.displayxr.satellite_slot) if it is free.
                 if (preferredSlot in 0 until slotCount && slots[preferredSlot] == null) {
-                    slot = preferredSlot
+                    found = preferredSlot
                     why = "pinned"
                 } else {
                     // 3. Lowest free slot.
-                    slot = slots.indexOfFirst { it == null }
+                    found = slots.indexOfFirst { it == null }
                     why = "lowest-free"
                 }
             }
+            slot = found
             if (slot < 0) {
                 Log.w(
                     TAG,
@@ -114,8 +117,11 @@ class SlotBroker(private val context: Context, private val slotCount: Int) : ISl
                 "acquireSlot: $pkg pid=$clientPid pref=$preferredSlot -> slot $slot ($why); " +
                     "occupancy ${occupancyLocked()}",
             )
-            return slot
+            occupied = slots.count { it != null }
         }
+        // Outside the lock: the policy may call back into the main-process service.
+        RuntimeForegroundPolicy.slotsOccupied(occupied, "slot acquired by $pkg")
+        return slot
     }
 
     override fun releaseSlot(slot: Int, clientToken: IBinder?) {
@@ -146,20 +152,24 @@ class SlotBroker(private val context: Context, private val slotCount: Int) : ISl
     }
 
     private fun dropToken(slot: Int, token: IBinder, reason: String) {
+        val occupied: Int
         synchronized(lock) {
             val owner = slots[slot] ?: return
             if (!owner.tokens.remove(token)) {
                 return
             }
-            if (owner.tokens.isEmpty()) {
-                slots[slot] = null
-                Log.w(
-                    TAG,
-                    "releaseSlot: slot $slot freed (${owner.pkg}, $reason); " +
-                        "occupancy ${occupancyLocked()}",
-                )
+            if (!owner.tokens.isEmpty()) {
+                return
             }
+            slots[slot] = null
+            Log.w(
+                TAG,
+                "releaseSlot: slot $slot freed (${owner.pkg}, $reason); " +
+                    "occupancy ${occupancyLocked()}",
+            )
+            occupied = slots.count { it != null }
         }
+        RuntimeForegroundPolicy.slotsOccupied(occupied, "slot $slot freed ($reason)")
     }
 
     /**

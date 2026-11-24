@@ -938,7 +938,11 @@ state in one shot — resident, non-isolated, declared foreground-service type,
   PASS -- resident, non-isolated, holding a foreground service, not frozen.
 ```
 
-`isFrozen=true` is a FAIL. The 15-minute soak and the app-op-survives-update
+`isFrozen=true` is a FAIL. `mHasForegroundServices=true` is expected only with **no
+client attached**: while an OpenXR / camera client holds the runtime, the runtime
+deliberately holds no foreground service (its bindings keep it alive; a foreground
+service would hold the camera app-op refused for 5 s after each return from the
+background — `XR_DXR_stereo_camera` §7.2). The 15-minute soak and the app-op-survives-update
 check above are still manual — the probe reports the instant, not the policy over
 time.
 
