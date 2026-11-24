@@ -66,6 +66,7 @@ _Static_assert(XRT_PLUGIN_STEREO_CAMERA_MONOCHROME == 0x10, "flag mirror");
 _Static_assert(XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE == 0x20, "flag mirror");
 // ADR-061: XR_STEREO_CAMERA_APP_CONTENT_BIT_DXR (XR_DXR_app_share.h), reserved by the stereo camera header.
 _Static_assert(XRT_STEREO_CAMERA_APP_CONTENT == 0x40, "flag mirror");
+_Static_assert(XRT_STEREO_CAMERA_REFINEMENT_VALID == XR_STEREO_CAMERA_VERTICAL_REFINEMENT_VALID_BIT_DXR, "flag mirror");
 _Static_assert(XRT_APP_SHARE_EXECUTABLE_NAME_SIZE == XR_APP_SHARE_EXECUTABLE_NAME_MAX_SIZE_DXR, "exe name size");
 _Static_assert(XRT_APP_SHARE_APPLICATION_NAME_SIZE == XR_MAX_APPLICATION_NAME_SIZE, "app name size");
 _Static_assert((XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE & XRT_STEREO_CAMERA_CLIENT_PUBLIC_MASK) == 0,
@@ -252,6 +253,42 @@ fill_xr_calibration(const struct xrt_stereo_camera_calibration *k, XrStereoCamer
 	calibration->rightFromLeft.position.y = k->position[1];
 	calibration->rightFromLeft.position.z = k->position[2];
 	calibration->baselineMm = k->baseline_mm;
+}
+
+/*!
+ * Spec v8 §5.9: when the app chained XrStereoCameraVerticalRefinementDXR on
+ * @p calibration, fill it from the service. Its `next` chain is untouched.
+ */
+static xrt_result_t
+fill_xr_refinement(struct xrt_stereo_camera_client *c, uint64_t camera_id, XrStereoCameraCalibrationDXR *calibration)
+{
+	XrStereoCameraVerticalRefinementDXR *o = OXR_GET_OUTPUT_FROM_CHAIN(
+	    calibration, XR_TYPE_STEREO_CAMERA_VERTICAL_REFINEMENT_DXR, XrStereoCameraVerticalRefinementDXR);
+	if (o == NULL) {
+		return XRT_SUCCESS;
+	}
+	struct xrt_stereo_camera_refinement k;
+	xrt_result_t xret = c->get_refinement(c, camera_id, &k);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	o->flags = (XrStereoCameraVerticalRefinementFlagsDXR)k.flags;
+	o->verticalOffset = k.offset;
+	o->verticalSlope = k.slope;
+	for (int e = 0; e < 2; e++) {
+		o->rectifyingRotation[e].x = k.rect_rotation[e][0];
+		o->rectifyingRotation[e].y = k.rect_rotation[e][1];
+		o->rectifyingRotation[e].z = k.rect_rotation[e][2];
+		o->rectifyingRotation[e].w = k.rect_rotation[e][3];
+	}
+	o->measuredEyeExtent.width = (int32_t)k.eye_width;
+	o->measuredEyeExtent.height = (int32_t)k.eye_height;
+	o->measuredFocalLength = k.focal_px;
+	o->residualPx = k.residual_px;
+	o->matchCount = k.matches;
+	o->windowCount = k.windows;
+	o->updateCount = k.updates;
+	return XRT_SUCCESS;
 }
 
 //! Spec v8: the wire capture state into the app's struct (times converted to XrTime).
@@ -460,6 +497,10 @@ oxr_xrGetStereoCameraCalibrationDXR(XrInstance instance, uint64_t cameraId, XrSt
 		return scam_xret(&log, xret, "xrGetStereoCameraCalibrationDXR");
 	}
 	fill_xr_calibration(&k, calibration);
+	xret = fill_xr_refinement(c, cameraId, calibration);
+	if (xret != XRT_SUCCESS) {
+		return scam_xret(&log, xret, "xrGetStereoCameraCalibrationDXR");
+	}
 	return XR_SUCCESS;
 }
 
@@ -895,6 +936,9 @@ oxr_xrAcquireStereoCameraStillDXR(XrStereoCameraStreamDXR stream, uint64_t reque
 	if (cal != NULL) {
 		cal->output = (XrStereoCameraOutputDXR)info.output; // what these pixels are
 		fill_xr_calibration(&info.calibration, cal);
+		// §5.9: the correction in force now (a failure leaves the struct as passed:
+		// the still itself was delivered and its handle is the caller's).
+		(void)fill_xr_refinement(c, s->camera_id, cal);
 	}
 	return XR_SUCCESS;
 }

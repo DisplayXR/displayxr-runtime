@@ -254,9 +254,34 @@ struct xrt_stereo_camera_calibration
 	uint32_t output; //!< enum xrt_stereo_camera_output these numbers describe
 	uint32_t reserved;
 	struct xrt_stereo_camera_intrinsics eye[2];
-	float orientation[4]; //!< right-from-left rotation, quaternion x y z w
-	float position[3];    //!< right-from-left translation, metres
+	//! The RIGHT camera's pose in the LEFT camera's frame (x_L = R(q) x_R + p):
+	//! quaternion x y z w = R^T of the plug-in's OpenCV x_R = R x_L + T.
+	float orientation[4];
+	float position[3]; //!< the right camera's centre in the left frame, metres (= -R^T T)
 	float baseline_mm;
+};
+
+//! XRT_STEREO_CAMERA_REFINEMENT_* (= XrStereoCameraVerticalRefinementFlagsDXR).
+#define XRT_STEREO_CAMERA_REFINEMENT_VALID (1u << 0)
+
+/*!
+ * Spec v8 §5.9: the online vertical-alignment correction in force
+ * (XrStereoCameraVerticalRefinementDXR): D(y) = offset + slope * y, right minus
+ * left, normalised rectified coordinates of the frame @ref rect_rotation defines.
+ */
+struct xrt_stereo_camera_refinement
+{
+	uint32_t flags; //!< XRT_STEREO_CAMERA_REFINEMENT_*
+	float offset;   //!< normalised
+	float slope;
+	float rect_rotation[2][4]; //!< rectified-from-raw per eye (OpenCV R1, R2), x y z w
+	uint32_t eye_width, eye_height;
+	float focal_px;
+	float residual_px;
+	uint32_t matches;
+	uint32_t windows;
+	uint32_t updates;
+	uint32_t reserved;
 };
 
 /*!
@@ -571,6 +596,10 @@ struct xrt_stereo_camera_client
 	                              struct xrt_stereo_camera_still_info *out_info,
 	                              xrt_shmem_handle_t *out_section);
 	xrt_result_t (*release_still)(struct xrt_stereo_camera_client *c, uint64_t stream_id, uint64_t request_id);
+	//! Spec v8 §5.9: the online vertical-alignment correction (same gate as get_calibration).
+	xrt_result_t (*get_refinement)(struct xrt_stereo_camera_client *c,
+	                               uint64_t camera_id,
+	                               struct xrt_stereo_camera_refinement *out_refinement);
 };
 
 #ifdef __cplusplus

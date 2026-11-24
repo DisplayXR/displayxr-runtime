@@ -1330,6 +1330,15 @@
 		]
 	},
 
+	"stereo_camera_get_refinement": {
+		"in": [
+			{"name": "camera_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "refinement", "type": "struct xrt_stereo_camera_refinement"}
+		]
+	},
+
 	"stereo_camera_stream_create": {
 		"in": [
 			{"name": "req", "type": "struct xrt_stereo_camera_stream_request"}

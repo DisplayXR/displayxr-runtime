@@ -64,7 +64,9 @@
  * from the plug-in's RAW calibration (u_stereo_rectify: Bouguet, zero
  * disparity at infinity, alpha = 0 crop, no convergence shear). It runs ONCE
  * per source frame, on the camera thread, with the manager lock RELEASED, and
- * only while at least one started stream wants RECTIFIED; every RECTIFIED
+ * only while at least one started stream wants RECTIFIED (spec v8 §5.9: with
+ * only RAW streams started, just the frames the refinement measures, never
+ * published, so a RAW consumer can read the correction); every RECTIFIED
  * stream then converts from the rectified image, RAW streams from the
  * original. The seam is `struct scam_rectifier`: the geometry and the float
  * maps are backend-neutral; `apply` is the backend. CPU today (fixed-point
@@ -2713,6 +2715,27 @@ rectifier_copy_luma(struct scam_rectifier *r, const struct xrt_plugin_stereo_cam
 	return true;
 }
 
+/*!
+ * Spec v8 §5.9: should the refinement run on a camera none of whose started
+ * streams wants RECTIFIED? Yes when the service rectifies it, refinement is on
+ * and at least one stream is started (a lingering source with no stream is not
+ * measured).
+ */
+static bool
+camera_refines_raw_locked(struct ipc_server_stereo_camera *m, const struct scam_camera *cam)
+{
+	if (cam->rect == NULL || !cam->rect->refine) {
+		return false;
+	}
+	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+		const struct scam_stream *s = &m->streams[i];
+		if (s->used && s->started && s->camera == cam->index) {
+			return true;
+		}
+	}
+	return false;
+}
+
 //! Does any started stream on @p cam want the service's rectified image?
 static bool
 camera_wants_rectified_locked(struct ipc_server_stereo_camera *m, const struct scam_camera *cam)
@@ -3997,24 +4020,32 @@ camera_thread(void *ptr)
 			cam->streamed = true;
 			// R2: rectify once per source frame, outside the lock (only this
 			// thread touches cam->rect after create), only if someone wants it.
+			// Spec v8 §5.9: with only RAW streams started the refinement still
+			// runs — a frame is rectified ONLY when the estimator is due (every
+			// 250 ms while settling, then 3 frames per 30 s), so a RAW consumer
+			// can read the correction and apply it to its own rectification.
 			struct xrt_plugin_stereo_camera_frame rf;
 			const struct xrt_plugin_stereo_camera_frame *rfp = NULL;
-			if (camera_wants_rectified_locked(m, cam) &&
+			const bool want_rect = camera_wants_rectified_locked(m, cam);
+			const bool raw_refine = !want_rect && camera_refines_raw_locked(m, cam);
+			if ((want_rect || raw_refine) &&
 			    rectifier_resize_locked(m, cam, f.width / 2, f.height)) { // v8: follows the source's mode
 				struct scam_rectifier *rect = cam->rect;
 				rectifier_swap_pending_locked(cam);
 				bool sample = rectifier_want_sample_locked(rect, now);
-				os_mutex_unlock(&m->lock);
-				bool ok = rect->apply(rect, &f, &rf);
-				bool copied = ok && sample && rectifier_copy_luma(rect, &rf);
-				os_mutex_lock(&m->lock);
-				if (copied) {
-					rect->job_ns = f.time_ns > 0 ? f.time_ns : now;
-					rect->job_pending = true;
-					os_cond_signal(&rect->worker_cond);
+				if (want_rect || sample) {
+					os_mutex_unlock(&m->lock);
+					bool ok = rect->apply(rect, &f, &rf);
+					bool copied = ok && sample && rectifier_copy_luma(rect, &rf);
+					os_mutex_lock(&m->lock);
+					if (copied) {
+						rect->job_ns = f.time_ns > 0 ? f.time_ns : now;
+						rect->job_pending = true;
+						os_cond_signal(&rect->worker_cond);
+					}
+					now = os_monotonic_get_ns();
+					rfp = (ok && want_rect) ? &rf : NULL;
 				}
-				now = os_monotonic_get_ns();
-				rfp = ok ? &rf : NULL;
 			}
 			publish_locked(m, cam, &f, rfp, &res, now);
 			if (cam_is_app(cam)) {
@@ -6647,24 +6678,31 @@ fill_properties_locked(struct ipc_server_stereo_camera *m,
 	out_props->supported_transports = XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY);
 }
 
-xrt_result_t
-ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
-                                         uint64_t camera_id,
-                                         uint32_t output,
-                                         uint32_t eye_width,
-                                         uint32_t eye_height,
-                                         struct xrt_stereo_camera_calibration *out_calib)
+/*!
+ * The gate of a calibration query (spec §7.5): the camera client, sharing on,
+ * consent (evaluated with the lock released — it may prompt), the output's
+ * authorisation and a calibration to give. @p output UINT32_MAX = no output
+ * check (the refinement, §5.9). On success returns with the manager lock HELD
+ * and @p out_cam set.
+ */
+static xrt_result_t
+calibration_gate(volatile struct ipc_client_state *ics,
+                 uint64_t camera_id,
+                 uint32_t output,
+                 const char *what,
+                 struct scam_camera **out_cam)
 {
-	U_ZERO(out_calib);
+	*out_cam = NULL;
 	struct ipc_server_stereo_camera *m = mgr_of(ics);
-	xrt_result_t auth = require_camera_client(ics, "stereo_camera_get_calibration");
+	xrt_result_t auth = require_camera_client(ics, what);
 	if (auth != XRT_SUCCESS) {
 		return auth;
 	}
 	if (m == NULL) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
-	if (output != XRT_STEREO_CAMERA_OUTPUT_RAW && output != XRT_STEREO_CAMERA_OUTPUT_RECTIFIED) {
+	if (output != UINT32_MAX && output != XRT_STEREO_CAMERA_OUTPUT_RAW &&
+	    output != XRT_STEREO_CAMERA_OUTPUT_RECTIFIED) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	char exe[512] = {0};
@@ -6680,7 +6718,7 @@ ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
 	// Spec §7.5: calibration identifies the device — only after §7.1 passes.
 	// Evaluated with the manager lock released (it may prompt).
 	struct u_camera_consent_decision dec;
-	xrt_result_t xret = consent_evaluate_client(m, ics, exe, "stereo_camera_get_calibration", &dec);
+	xrt_result_t xret = consent_evaluate_client(m, ics, exe, what, &dec);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -6690,15 +6728,38 @@ ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
 		os_mutex_unlock(&m->lock);
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
-	if (!output_allowed(ics, dec.delegating, output)) {
+	if (output != UINT32_MAX && !output_allowed(ics, dec.delegating, output)) {
 		xret = XRT_ERROR_NOT_AUTHORIZED;
 	}
 	if (xret == XRT_SUCCESS && !cam->have_calib) {
 		xret = XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
+	if (xret != XRT_SUCCESS) {
+		os_mutex_unlock(&m->lock);
+		return xret;
+	}
+	*out_cam = cam;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
+                                         uint64_t camera_id,
+                                         uint32_t output,
+                                         uint32_t eye_width,
+                                         uint32_t eye_height,
+                                         struct xrt_stereo_camera_calibration *out_calib)
+{
+	U_ZERO(out_calib);
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	struct scam_camera *cam = NULL;
+	xrt_result_t xret = calibration_gate(ics, camera_id, output, "stereo_camera_get_calibration", &cam);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
 	// Amendment 4: a nominal model is not a RAW calibration of the device —
 	// only the rectified numbers (which describe the frames delivered) are given.
-	if (xret == XRT_SUCCESS && cam->calib_nominal && output == XRT_STEREO_CAMERA_OUTPUT_RAW) {
+	if (cam->calib_nominal && output == XRT_STEREO_CAMERA_OUTPUT_RAW) {
 		xret = XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	if (xret == XRT_SUCCESS && output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED && !camera_can_rectify(cam)) {
@@ -6714,6 +6775,56 @@ ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
 		return xret;
 	}
 	fill_calibration_locked(cam, output, eye_width, eye_height, out_calib);
+	os_mutex_unlock(&m->lock);
+	return XRT_SUCCESS;
+}
+
+/*!
+ * Spec v8 §5.9: the online vertical-alignment correction the service's
+ * rectified frames carry, for a consumer that rectifies RAW frames itself.
+ * Manager lock held. Not VALID (and identity rotations) when the service does
+ * not rectify this camera, refinement is off, or no window was fitted yet.
+ */
+static void
+fill_refinement_locked(const struct scam_camera *cam, struct xrt_stereo_camera_refinement *out)
+{
+	U_ZERO(out);
+	for (int e = 0; e < 2; e++) {
+		out->rect_rotation[e][3] = 1.0f;
+	}
+	const struct scam_rectifier *r = cam->rect;
+	if (r == NULL || !r->refine || r->ref.windows == 0 || !(r->geo.f > 0.0)) {
+		return;
+	}
+	out->flags = XRT_STEREO_CAMERA_REFINEMENT_VALID;
+	// What the maps in force carry (geo), not a correction still parked by the worker.
+	out->offset = (float)r->geo.v_offset;
+	out->slope = (float)r->geo.v_slope;
+	for (int e = 0; e < 2; e++) {
+		mat3_to_quat(r->geo.rot[e], out->rect_rotation[e]);
+	}
+	out->eye_width = r->geo.width;
+	out->eye_height = r->geo.height;
+	out->focal_px = (float)r->geo.f;
+	out->residual_px = (float)r->ref.last_residual_dy;
+	out->matches = r->ref.last_matches;
+	out->windows = r->ref.windows;
+	out->updates = r->ref.updates;
+}
+
+xrt_result_t
+ipc_handle_stereo_camera_get_refinement(volatile struct ipc_client_state *ics,
+                                        uint64_t camera_id,
+                                        struct xrt_stereo_camera_refinement *out_refinement)
+{
+	U_ZERO(out_refinement);
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	struct scam_camera *cam = NULL;
+	xrt_result_t xret = calibration_gate(ics, camera_id, UINT32_MAX, "stereo_camera_get_refinement", &cam);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	fill_refinement_locked(cam, out_refinement);
 	os_mutex_unlock(&m->lock);
 	return XRT_SUCCESS;
 }

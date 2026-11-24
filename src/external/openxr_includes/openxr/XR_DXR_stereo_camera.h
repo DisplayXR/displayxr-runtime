@@ -108,7 +108,9 @@ extern "C" {
 //     xrReleaseStereoCameraControlsDXR, XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR) with the
 //     per-frame XrStereoCameraCaptureResultDXR, and STILLS (xrRequestStereoCameraStillDXR,
 //     the still-ready / still-failed events, xrAcquireStereoCameraStillDXR /
-//     xrReleaseStereoCameraStillDXR over a read-only shared-memory section).
+//     xrReleaseStereoCameraStillDXR over a read-only shared-memory section), and
+//     XrStereoCameraVerticalRefinementDXR (the online row-alignment correction, for a
+//     consumer that rectifies RAW frames itself).
 #define XR_DXR_stereo_camera_SPEC_VERSION 8
 #define XR_DXR_STEREO_CAMERA_EXTENSION_NAME "XR_DXR_stereo_camera"
 
@@ -175,6 +177,9 @@ extern "C" {
 //! that stream releases them, stops or ends.
 #define XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR             ((XrResult)-1004999468)
 // 1004999469 is held back for the still's AHardwareBuffer transport (spec §5.7, next step).
+//! Chain on XrStereoCameraCalibrationDXR::next: the online vertical-alignment
+//! refinement in force, for a consumer that rectifies RAW frames itself (§5.9).
+#define XR_TYPE_STEREO_CAMERA_VERTICAL_REFINEMENT_DXR       ((XrStructureType)1004999470)
 
 //! Size of XrStereoCameraPropertiesDXR::persistentId, NUL included.
 #define XR_STEREO_CAMERA_PERSISTENT_ID_MAX_SIZE_DXR 64
@@ -356,10 +361,72 @@ typedef struct XrStereoCameraCalibrationDXR {
     XrStereoCameraOutputDXR output;
     //! RAW: native + distortion. RECTIFIED: post-rectification, model NONE, equal fy/cy.
     XrStereoCameraIntrinsicsDXR eye[2];
-    //! RAW: the pair's extrinsics. RECTIFIED: pure +x translation of baselineMm/1000.
+    /*!
+     * The pose of the RIGHT camera expressed in the LEFT camera's frame, metres,
+     * both frames OpenCV camera frames (+x right in the image, +y down, +z
+     * forward). As a transform it maps right-camera coordinates INTO left-camera
+     * coordinates (x_L = R_q x_R + C) — read the name as "right, relative to
+     * left", NOT as the "aFromB maps B into A" convention, which it is the
+     * inverse of. The numbers are fixed (shipped consumers depend on them). With
+     * R_q = the rotation matrix of `orientation` and C = `position`:
+     *   - the right camera's centre, in the left frame:    C
+     *   - a point x_L in the left frame, in the right frame: x_R = R_q^T (x_L - C)
+     *     (= OpenCV stereoCalibrate's x_R = R x_L + T with R = R_q^T, T = -R_q^T C,
+     *     in metres; T in mm is 1000x that).
+     * RAW: the pair's calibrated extrinsics. RECTIFIED: identity orientation and
+     * C = (+baselineMm/1000, 0, 0). Example: a pair whose right lens sits to the
+     * right of the left one, as on the tablet, reads C.x = +baseline > 0.
+     */
     XrPosef rightFromLeft;
     float baselineMm;
 } XrStereoCameraCalibrationDXR;
+
+typedef XrFlags64 XrStereoCameraVerticalRefinementFlagsDXR;
+//! The estimate was fitted on this camera's own frames (at least one window);
+//! clear = no measurement yet, refinement off, or a camera the runtime does not
+//! rectify (natively rectified / uncalibrated): every other field then reads 0
+//! except rectifyingRotation, which is identity.
+#define XR_STEREO_CAMERA_VERTICAL_REFINEMENT_VALID_BIT_DXR 0x00000001
+
+/*!
+ * Spec v8 §5.9 — chain on XrStereoCameraCalibrationDXR::next (either output; also
+ * on the calibration chained to a still): the runtime's online vertical-alignment
+ * correction, for a consumer that rectifies RAW frames itself. RECTIFIED frames
+ * already carry it. Its changes move calibrationGeneration.
+ *
+ * Defined in the runtime's rectified frame: eye e's raw rays rotated by
+ * rectifyingRotation[e] (OpenCV stereoRectify's R1 / R2 from the RAW calibration,
+ * zero disparity, any alpha — the crop does not change them). In that frame's
+ * normalised coordinates (x, y) = (X/Z, Y/Z) the uncorrected pair leaves the RIGHT
+ * eye's rows displaced from the LEFT eye's by
+ *   D(y) = verticalOffset + verticalSlope * y        (right minus left, +y down).
+ * Apply it split symmetrically: the corrected output row y of eye e samples the
+ * uncorrected rectified row
+ *   y_src = y * (1 + s_e * verticalSlope / 2) + s_e * verticalOffset / 2,
+ * s_left = -1, s_right = +1 (x unchanged). Normalised units need no rescaling
+ * between modes; pixels at another size are D * f of that size. In pixels about
+ * a rectified principal row cy: dy(v) = f * verticalOffset + verticalSlope * (v - cy),
+ * pixel centres at integers (OpenCV).
+ */
+typedef struct XrStereoCameraVerticalRefinementDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_VERTICAL_REFINEMENT_DXR
+    void* XR_MAY_ALIAS next;
+    XrStereoCameraVerticalRefinementFlagsDXR flags;
+    float verticalOffset; //!< normalised rectified units (radians, small-angle)
+    float verticalSlope;  //!< dimensionless (pixels per pixel)
+    //! Rectified-from-raw rotation per eye: ray_rect = R(q[e]) * ray_raw[e].
+    XrQuaternionf rectifyingRotation[2];
+    //! The per-eye rectified size and focal length (px) the estimate was measured at.
+    XrExtent2Di measuredEyeExtent;
+    float measuredFocalLength;
+    //! Signed median dy (right - left, measured px) of the latest fitted window, on frames
+    //! carrying the correction in force THEN: after the first update it is the uncorrected
+    //! misalignment, afterwards the residual (|residualPx| <= 0.2 = converged).
+    float residualPx;
+    uint32_t matchCount;  //!< row matches in the latest fitted window (>= 50 to fit)
+    uint32_t windowCount; //!< fitted windows since the camera was set up (or recalibrated)
+    uint32_t updateCount; //!< corrections applied since then
+} XrStereoCameraVerticalRefinementDXR;
 
 typedef struct XrStereoCameraStreamCreateInfoDXR {
     XrStructureType type;

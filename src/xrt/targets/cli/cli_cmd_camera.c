@@ -492,6 +492,10 @@ cmd_calib(struct ipc_connection *ipc_c, uint64_t id, uint32_t output, bool json)
 		       result_hint(xret));
 		return refusal_exit_code(xret);
 	}
+	// Spec v8 §5.9: the online vertical-alignment correction (same gate as the calibration).
+	struct xrt_stereo_camera_refinement r;
+	xrt_result_t rxret = ipc_client_stereo_camera_get_refinement(ipc_c, id, &r);
+	const bool have_ref = rxret == XRT_SUCCESS;
 	if (json) {
 		printf("{\"output\": \"%s\", \"baselineMm\": %.3f, \"eyes\": [",
 		       output == XRT_STEREO_CAMERA_OUTPUT_RAW ? "RAW" : "RECTIFIED", c.baseline_mm);
@@ -504,9 +508,22 @@ cmd_calib(struct ipc_connection *ipc_c, uint64_t id, uint32_t output, bool json)
 		}
 		printf(
 		    "], \"rightFromLeft\": {\"orientation\": [%.6f, %.6f, %.6f, %.6f], \"position\": [%.6f, "
-		    "%.6f, %.6f]}}\n",
+		    "%.6f, %.6f]}",
 		    c.orientation[0], c.orientation[1], c.orientation[2], c.orientation[3], c.position[0],
 		    c.position[1], c.position[2]);
+		if (have_ref) {
+			printf(
+			    ", \"verticalRefinement\": {\"valid\": %s, \"offset\": %.7f, \"slope\": %.7f, "
+			    "\"rectifyingRotation\": [[%.6f, %.6f, %.6f, %.6f], [%.6f, %.6f, %.6f, %.6f]], "
+			    "\"measuredEyeExtent\": [%u, %u], \"focalPx\": %.3f, \"residualPx\": %.3f, \"matches\": "
+			    "%u, "
+			    "\"windows\": %u, \"updates\": %u}",
+			    (r.flags & XRT_STEREO_CAMERA_REFINEMENT_VALID) ? "true" : "false", r.offset, r.slope,
+			    r.rect_rotation[0][0], r.rect_rotation[0][1], r.rect_rotation[0][2], r.rect_rotation[0][3],
+			    r.rect_rotation[1][0], r.rect_rotation[1][1], r.rect_rotation[1][2], r.rect_rotation[1][3],
+			    r.eye_width, r.eye_height, r.focal_px, r.residual_px, r.matches, r.windows, r.updates);
+		}
+		printf("}\n");
 		return 0;
 	}
 	printf("calibration (%s), baseline %.3f mm\n", output == XRT_STEREO_CAMERA_OUTPUT_RAW ? "RAW" : "RECTIFIED",
@@ -527,6 +544,26 @@ cmd_calib(struct ipc_connection *ipc_c, uint64_t id, uint32_t output, bool json)
 		       c.eye[1].fx, c.eye[1].cx, c.eye[1].fx * tx, c.eye[1].fy, c.eye[1].cy, tx);
 		printf("  depth from disparity: Z = f * B / d = %.1f / d(px) m\n",
 		       c.eye[0].fx * c.baseline_mm / 1000.0);
+	}
+	if (!have_ref) {
+		printf("  vertical refinement: query failed (%d)\n", (int)rxret);
+	} else if ((r.flags & XRT_STEREO_CAMERA_REFINEMENT_VALID) == 0) {
+		printf(
+		    "  vertical refinement: not valid (no fitted window yet, refinement off, or not "
+		    "service-rectified)\n");
+	} else {
+		printf(
+		    "  vertical refinement: D(y) = %+.6f %+.6f * y (normalised, right - left) = %+.3f px %+.4f px/px "
+		    "at "
+		    "%ux%u (f %.2f)\n",
+		    r.offset, r.slope, r.offset * r.focal_px, r.slope, r.eye_width, r.eye_height, r.focal_px);
+		printf("    residual %+.3f px over %u matches, %u windows, %u updates\n", r.residual_px, r.matches,
+		       r.windows, r.updates);
+		for (int e = 0; e < 2; e++) {
+			printf("    %s rectified-from-raw q (%.6f %.6f %.6f %.6f)\n", e ? "right" : "left ",
+			       r.rect_rotation[e][0], r.rect_rotation[e][1], r.rect_rotation[e][2],
+			       r.rect_rotation[e][3]);
+		}
 	}
 	return 0;
 }

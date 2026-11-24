@@ -308,6 +308,15 @@ struct scm_v8_state
 struct scm_fixture *
 scm_create_v8_plugin(void);
 
+//! The fake's extrinsic rotation about +y, degrees (OpenCV x_R = R x_L + T); read at camera
+//! enumeration, so set it BEFORE scm_create_v8_plugin(). Not reset by create: set it back to 0.
+void
+scm_v8_set_yaw(double deg);
+
+//! Spec v8 §5.9: ipc_handle_stereo_camera_get_refinement.
+xrt_result_t
+scm_refinement(struct scm_fixture *f, uint64_t camera_id, struct xrt_stereo_camera_refinement *out);
+
 //! The fake refuses every set_mode to a mode other than 0 from now on.
 void
 scm_v8_refuse_modes(bool refuse);

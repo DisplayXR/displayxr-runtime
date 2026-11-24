@@ -114,6 +114,12 @@ ipc_client_stereo_camera_get_calibration_mode(struct ipc_connection *ipc_c,
                                               uint32_t eye_height,
                                               struct xrt_stereo_camera_calibration *out_calib);
 
+//! Spec v8 §5.9: the online vertical-alignment correction of camera @p camera_id.
+xrt_result_t
+ipc_client_stereo_camera_get_refinement(struct ipc_connection *ipc_c,
+                                        uint64_t camera_id,
+                                        struct xrt_stereo_camera_refinement *out_refinement);
+
 //! acquire, plus the frame's capture state (@p out_result may be NULL).
 xrt_result_t
 ipc_client_stereo_camera_acquire_ex(struct ipc_connection *ipc_c,

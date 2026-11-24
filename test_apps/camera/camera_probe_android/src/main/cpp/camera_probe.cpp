@@ -227,6 +227,43 @@ fmt(const char *f, ...)
 }
 
 /*!
+ * Spec v8 §5.9: the online vertical-alignment correction a RAW consumer applies
+ * to its own rectification (D(y) = offset + slope * y, right minus left,
+ * normalised rectified coordinates). A v8 runtime without it leaves the struct
+ * as passed: flags 0 = not valid.
+ */
+std::string refinement_line(PFN_xrGetStereoCameraCalibrationDXR calib,
+                            XrInstance inst, uint64_t camera_id) {
+        XrStereoCameraVerticalRefinementDXR vr = {
+            XR_TYPE_STEREO_CAMERA_VERTICAL_REFINEMENT_DXR};
+        XrStereoCameraCalibrationDXR cal = {
+            XR_TYPE_STEREO_CAMERA_CALIBRATION_DXR};
+        cal.next = &vr;
+        cal.output = XR_STEREO_CAMERA_OUTPUT_RAW_DXR;
+        XrResult r = calib(inst, camera_id, &cal);
+        if (XR_FAILED(r)) {
+                return fmt("vertical refinement: query -> %d", (int)r);
+        }
+        if ((vr.flags & XR_STEREO_CAMERA_VERTICAL_REFINEMENT_VALID_BIT_DXR) ==
+            0) {
+                return "vertical refinement: not valid yet";
+        }
+        return fmt("vertical refinement: D = %+.6f %+.6f*y (= %+.2f px at "
+                   "%dx%d f %.1f), residual %+.2f px, "
+                   "%u matches, %u windows, %u updates; R1 q(%.4f %.4f %.4f "
+                   "%.4f) R2 q(%.4f %.4f %.4f %.4f)",
+                   vr.verticalOffset, vr.verticalSlope,
+                   vr.verticalOffset * vr.measuredFocalLength,
+                   vr.measuredEyeExtent.width, vr.measuredEyeExtent.height,
+                   vr.measuredFocalLength, vr.residualPx, vr.matchCount,
+                   vr.windowCount, vr.updateCount, vr.rectifyingRotation[0].x,
+                   vr.rectifyingRotation[0].y, vr.rectifyingRotation[0].z,
+                   vr.rectifyingRotation[0].w, vr.rectifyingRotation[1].x,
+                   vr.rectifyingRotation[1].y, vr.rectifyingRotation[1].z,
+                   vr.rectifyingRotation[1].w);
+}
+
+/*!
  * Spec v8: acquire the ready still @p id — its read-only section, capture state
  * and calibration — measure its rows, write its pixels to @p path, release it.
  */
@@ -525,8 +562,9 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 	} else {
 		LOGW("calibration (%s) -> %d", want_raw ? "RAW" : "RECTIFIED", (int)r);
 	}
+        LOGW("%s", refinement_line(f.calib, inst, cam.cameraId).c_str());
 
-	XrStereoCameraStreamCreateInfoDXR sci = {XR_TYPE_STEREO_CAMERA_STREAM_CREATE_INFO_DXR};
+        XrStereoCameraStreamCreateInfoDXR sci = {XR_TYPE_STEREO_CAMERA_STREAM_CREATE_INFO_DXR};
         sci.next =
             use_mode ? &mode_info : nullptr; // v8: absent = the default mode
         sci.cameraId = cam.cameraId;
@@ -765,8 +803,11 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 	const double dur = first_ns ? (mono() - first_ns) / 1e9 : 0.0;
 	XrStereoCameraStreamStatsDXR st = {XR_TYPE_STEREO_CAMERA_STREAM_STATS_DXR};
 	f.stats(stream, &st);
+        // §5.9: measured during the run, RAW-only streams included.
+        LOGW("after the run: %s",
+             refinement_line(f.calib, inst, cam.cameraId).c_str());
 
-	std::string align = "no frame";
+        std::string align = "no frame";
 	if (!last_buf.empty()) {
 		const uint32_t eye_w = (uint32_t)last.extent.width / 2, eye_h = (uint32_t)last.extent.height;
 		std::vector<match> m = row_alignment(last_buf.data(), last.rowPitch[0], eye_w, eye_h);

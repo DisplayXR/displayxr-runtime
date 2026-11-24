@@ -11,6 +11,8 @@
 
 #include "tests_stereo_camera_manager_glue.h"
 
+#include <math.h>
+
 #include "server/ipc_server.h"
 #include "server/ipc_server_stereo_camera.h"
 #include "ipc_server_generated.h"
@@ -1211,6 +1213,7 @@ static struct
 	uint32_t still_polls;
 	uint8_t *still;
 	struct xrt_plugin_stereo_camera_controls ctl;
+	double yaw_deg; //!< extrinsic rotation about +y (scm_v8_set_yaw); not reset by create
 } g_v8 = {.lock = PTHREAD_MUTEX_INITIALIZER};
 
 #define V8_MODES 6
@@ -1260,8 +1263,15 @@ v8_get_calibration(struct xrt_plugin_instance *inst, uint32_t index, struct xrt_
 		out->k[e][3] = 119.5;
 	}
 	out->distortion_model = XRT_PLUGIN_STEREO_CAMERA_DISTORTION_NONE;
-	out->rotation_right_from_left[0][0] = out->rotation_right_from_left[1][1] =
-	    out->rotation_right_from_left[2][2] = 1.0;
+	// OpenCV x_R = R x_L + T: R about +y by yaw (0 by default), T = (-50, 0, 0) mm.
+	pthread_mutex_lock(&g_v8.lock);
+	const double a = g_v8.yaw_deg * 3.14159265358979323846 / 180.0;
+	pthread_mutex_unlock(&g_v8.lock);
+	out->rotation_right_from_left[0][0] = cos(a);
+	out->rotation_right_from_left[0][2] = sin(a);
+	out->rotation_right_from_left[1][1] = 1.0;
+	out->rotation_right_from_left[2][0] = -sin(a);
+	out->rotation_right_from_left[2][2] = cos(a);
 	out->translation_right_from_left_mm[0] = -50.0;
 	return XRT_SUCCESS;
 }
@@ -1474,6 +1484,20 @@ scm_create_v8_plugin(void)
 	memset(&g_fake_xinst, 0, sizeof(g_fake_xinst));
 	g_fake_xinst.get_active_plugin = fake_get_active_plugin;
 	return create_with(NULL, &g_fake_xinst, -1, 0);
+}
+
+void
+scm_v8_set_yaw(double deg)
+{
+	pthread_mutex_lock(&g_v8.lock);
+	g_v8.yaw_deg = deg;
+	pthread_mutex_unlock(&g_v8.lock);
+}
+
+xrt_result_t
+scm_refinement(struct scm_fixture *f, uint64_t camera_id, struct xrt_stereo_camera_refinement *out)
+{
+	return ipc_handle_stereo_camera_get_refinement(&f->ics, camera_id, out);
 }
 
 void

@@ -2684,3 +2684,147 @@ TEST_CASE("spec v8: the controls hold is lost when the holder's frames are withh
 	CHECK(scm_set_controls(f, a, &c) == XRT_SUCCESS); // re-applied on resume
 	scm_destroy(f);
 }
+
+
+namespace {
+
+//! Rotation matrix of a unit quaternion x y z w.
+void
+quat_to_mat(const float q[4], double m[3][3])
+{
+	const double x = q[0], y = q[1], z = q[2], w = q[3];
+	m[0][0] = 1 - 2 * (y * y + z * z);
+	m[0][1] = 2 * (x * y - z * w);
+	m[0][2] = 2 * (x * z + y * w);
+	m[1][0] = 2 * (x * y + z * w);
+	m[1][1] = 1 - 2 * (x * x + z * z);
+	m[1][2] = 2 * (y * z - x * w);
+	m[2][0] = 2 * (x * z - y * w);
+	m[2][1] = 2 * (y * z + x * w);
+	m[2][2] = 1 - 2 * (x * x + y * y);
+}
+
+} // namespace
+
+TEST_CASE("spec v8: rightFromLeft is the right camera's pose in the left frame", "[stereo_camera_manager][v8]")
+{
+	// The plug-in gives OpenCV x_R = R x_L + T: R = 5 deg about +y, T = (-50, 0, 0) mm
+	// (the right lens 50 mm to the right of the left one, as on the tablet).
+	const double yaw = 5.0, a = yaw * 3.14159265358979323846 / 180.0;
+	const double R[3][3] = {{std::cos(a), 0, std::sin(a)}, {0, 1, 0}, {-std::sin(a), 0, std::cos(a)}};
+	const double T[3] = {-0.050, 0.0, 0.0}; // metres
+	scm_v8_set_yaw(yaw);
+	scm_fixture *f = scm_create_v8_plugin();
+	scm_v8_set_yaw(0.0);
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	xrt_stereo_camera_calibration c;
+	REQUIRE(scm_calibration(f, p.camera_id, XRT_STEREO_CAMERA_OUTPUT_RAW, &c) == XRT_SUCCESS);
+
+	// The right camera's centre in the left frame: C = -R^T T = 50 mm (cos a, 0, sin a): +x.
+	CHECK(c.position[0] == Catch::Approx(0.050 * std::cos(a)).margin(1e-6));
+	CHECK(c.position[1] == Catch::Approx(0.0).margin(1e-6));
+	CHECK(c.position[2] == Catch::Approx(0.050 * std::sin(a)).margin(1e-6));
+	// orientation = R^T: a -5 deg turn about +y.
+	CHECK(c.orientation[0] == Catch::Approx(0.0).margin(1e-6));
+	CHECK(c.orientation[1] == Catch::Approx(-std::sin(a / 2)).margin(1e-6));
+	CHECK(c.orientation[2] == Catch::Approx(0.0).margin(1e-6));
+	CHECK(c.orientation[3] == Catch::Approx(std::cos(a / 2)).margin(1e-6));
+
+	// The two equations of the header agree with OpenCV for an arbitrary point:
+	// x_R = R_q^T (x_L - C) == R x_L + T, and x_L = R_q x_R + C.
+	double Rq[3][3];
+	quat_to_mat(c.orientation, Rq);
+	const double xl[3] = {0.3, -0.2, 1.7};
+	for (int i = 0; i < 3; i++) {
+		double cv = T[i], pose = 0.0;
+		for (int j = 0; j < 3; j++) {
+			cv += R[i][j] * xl[j];
+			pose += Rq[j][i] * (xl[j] - c.position[j]);
+		}
+		CHECK(pose == Catch::Approx(cv).margin(1e-6));
+	}
+
+	// (A service-rectified pair's RECTIFIED numbers — identity, C = (+baseline, 0, 0) —
+	// are pinned by "manager + UVC fake: enumerate and calibration"; this fake is
+	// natively rectified, so its RECTIFIED query passes the plug-in's pose through.)
+	scm_destroy(f);
+}
+
+TEST_CASE("spec v8: the vertical refinement runs for a RAW-only consumer and is exposed", "[stereo_camera_manager][v8]")
+{
+	// The UVC fake's right eye sits ~2.4 px low; only a RAW stream is started.
+	u_stereo_uvc_config cfg = fake_config();
+	scm_fixture *f = scm_create(&cfg);
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+
+	xrt_stereo_camera_refinement r;
+	REQUIRE(scm_refinement(f, p.camera_id, &r) == XRT_SUCCESS);
+	CHECK((r.flags & XRT_STEREO_CAMERA_REFINEMENT_VALID) == 0); // nothing measured yet
+	CHECK(r.offset == 0.0f);
+	CHECK(r.rect_rotation[0][3] == 1.0f);
+	CHECK(r.rect_rotation[1][3] == 1.0f);
+
+	xrt_stereo_camera_stream_request req = {p.camera_id, XRT_STEREO_CAMERA_OUTPUT_RAW,
+	                                        XRT_STEREO_CAMERA_FORMAT_GRAY8,
+	                                        XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY, 0.0f};
+	uint64_t id = 0;
+	REQUIRE(scm_stream_create(f, &req, &id) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, id) == XRT_SUCCESS);
+	xrt_stereo_camera_stream_layout lay;
+	REQUIRE(scm_stream_map(f, id, &lay) == XRT_SUCCESS);
+
+	const int64_t t_end = os_monotonic_get_ns() + 10ll * 1000 * 1000 * 1000;
+	uint32_t first_gen = UINT32_MAX, last_gen = 0;
+	double last_dy = 0.0;
+	bool valid = false;
+	while (os_monotonic_get_ns() < t_end) {
+		bool ready = false;
+		xrt_stereo_camera_frame_info fi;
+		const uint8_t *slot = nullptr;
+		REQUIRE(scm_acquire(f, id, &ready, &fi, &slot) == XRT_SUCCESS);
+		if (!ready) {
+			os_nanosleep(5 * 1000 * 1000);
+			continue;
+		}
+		CHECK(fi.output == XRT_STEREO_CAMERA_OUTPUT_RAW);
+		if (first_gen == UINT32_MAX) {
+			first_gen = fi.calibration_generation;
+		}
+		last_gen = fi.calibration_generation;
+		size_t blocks = 0;
+		last_dy = row_offset(slot + fi.plane_offset[0], fi.row_pitch[0], 640, 480, &blocks);
+		REQUIRE(scm_refinement(f, p.camera_id, &r) == XRT_SUCCESS);
+		if ((r.flags & XRT_STEREO_CAMERA_REFINEMENT_VALID) != 0 && r.updates >= 1 && last_gen != first_gen) {
+			valid = true;
+			break;
+		}
+	}
+	std::printf(
+	    "[manager v8 refinement] valid %d: D = %+.6f %+.6f y (= %+.3f px at f %.2f, %ux%u), residual %+.3f px, "
+	    "%u matches, %u windows, %u updates; generation %u -> %u; RAW frame dy %+.3f px\n",
+	    (int)valid, r.offset, r.slope, r.offset * r.focal_px, r.focal_px, r.eye_width, r.eye_height, r.residual_px,
+	    r.matches, r.windows, r.updates, first_gen, last_gen, last_dy);
+	REQUIRE(valid);
+	// The correction a RAW consumer applies: right minus left, normalised; ~2.4 px at the measured f.
+	CHECK(r.offset * r.focal_px == Catch::Approx(2.4).margin(0.35));
+	CHECK(std::fabs(r.slope) < 0.01);
+	CHECK(r.eye_width == 640);
+	CHECK(r.eye_height == 480);
+	CHECK(r.focal_px > 0.0f);
+	CHECK(r.matches >= 50);
+	CHECK(r.windows >= 1);
+	// A nominal parallel pair: the rectifying rotations are identity.
+	for (int e = 0; e < 2; e++) {
+		CHECK(r.rect_rotation[e][3] == Catch::Approx(1.0).margin(1e-6));
+	}
+	// The RAW frames themselves are untouched: still the device's own misalignment.
+	CHECK(last_dy == Catch::Approx(2.4).margin(0.35));
+	CHECK(scm_stream_destroy(f, id) == XRT_SUCCESS);
+	scm_destroy(f);
+}

@@ -259,13 +259,33 @@ typedef struct XrStereoCameraCalibrationDXR {
     void* XR_MAY_ALIAS         next;
     XrStereoCameraOutputDXR    output;          // IN: which output the numbers should describe
     XrStereoCameraIntrinsicsDXR eye[2];         // RAW: native + distortion. RECTIFIED: post-rectification, model NONE, equal fy/cy
-    XrPosef                    rightFromLeft;   // RAW: the pair's extrinsics. RECTIFIED: pure +x translation of baselineMm/1000
+    XrPosef                    rightFromLeft;   // the RIGHT camera's pose in the LEFT camera's frame (below)
     float                      baselineMm;
 } XrStereoCameraCalibrationDXR;
 
 XrResult xrGetStereoCameraCalibrationDXR(XrInstance instance, uint64_t cameraId,
     XrStereoCameraCalibrationDXR* calibration);
 ```
+
+**Extrinsics convention (`rightFromLeft`, fixed — shipped consumers depend on these numbers).**
+`rightFromLeft` is the **pose of the right camera expressed in the left camera's frame**, in metres;
+both are OpenCV camera frames (+x right in the image, +y down, +z forward). As a transform it maps
+right-camera coordinates *into* left-camera coordinates — so read the name as "right, relative to
+left"; it is the **inverse** of the "aFromB maps B into A" naming habit. With `R_q` the rotation
+matrix of `orientation` and `C` = `position`:
+
+| | equation |
+|---|---|
+| where the right camera's centre is, in the left frame | `C` |
+| a point `x_L` in the left camera's frame, in the right camera's frame | `x_R = R_qᵀ (x_L − C)` |
+| the same, in OpenCV `stereoCalibrate` terms (`x_R = R x_L + T`) | `R = R_qᵀ`, `T = −R_qᵀ C` (metres; ×1000 for mm) |
+
+A plug-in reports OpenCV `R`, `T` (mm, §9); the service converts with `orientation = quat(Rᵀ)`,
+`position = −Rᵀ T / 1000`. **Example (the tablet, and any pair whose right lens is to the right of
+the left one): `C = (+baseline, ≈0, ≈0)` — `rightFromLeft.position.x > 0`**, i.e. OpenCV
+`T.x = −baseline`. RECTIFIED: identity orientation, `C = (+baselineMm/1000, 0, 0)` exactly. Pinned by
+`tests_stereo_camera_manager` ("rightFromLeft is the right camera's pose in the left frame": a 5°
+extrinsic yaw, both equations checked against OpenCV's on an arbitrary point).
 
 **Pixel convention (everywhere in this extension, plug-in and service alike).** Pixel centres at
 integer coordinates (OpenCV): the first pixel's centre is (0, 0) and an image `W` wide has its
@@ -307,7 +327,8 @@ honest parallel pair.
 > fixtures; and calibration given at a different size than the frames (`image_width/height` ≠ the
 > eye size) is rescaled pixel-centre-aware. Lens models: RADTAN5, RADTAN8 (rational), KB4
 > (fisheye; same Bouguet geometry). The service rectifies **once per source frame** on the camera
-> thread (outside its lock) and only while some started stream wants RECTIFIED; RAW streams read
+> thread (outside its lock) and only while some started stream wants RECTIFIED (with only RAW
+> streams started, just the frames the online refinement measures, §5.9); RAW streams read
 > the original. `xrGetStereoCameraCalibrationDXR(RECTIFIED)` returns that same geometry: both
 > eyes `fx = fy = f` with one principal point, model NONE, and `rightFromLeft` = identity
 > rotation + `(+baseline, 0, 0)` m — so frames and numbers cannot disagree. The browser
@@ -669,6 +690,82 @@ xrReleaseStereoCameraStillDXR(stream, id);
   camera), converts it and copies it into a fresh section. Transport is **shared memory only** in v8;
   an `AHardwareBuffer` still (Android, zero-copy for 12 MP pairs) is the next step and its struct
   type value (1004999469) is held back for it.
+
+### 5.9 Online vertical refinement for a RAW consumer (spec v8)
+
+A device's stored calibration drifts: the service measures the rows it delivers and corrects
+them online (R2 refinement: `dy(y) = a + b (y − cy)`, right minus left, fitted on ≥ 50 row
+matches over ≥ 3 frames, every 250 ms for 5 s after an open or an update, then one window every
+30 s; clamped to |a| ≤ 6 px, |b| ≤ 2 px / 100 px). RECTIFIED frames carry the correction. A
+consumer that rectifies **RAW** frames itself (a camera app on its GPU) reads it by chaining
+`XrStereoCameraVerticalRefinementDXR` (`XR_TYPE_STEREO_CAMERA_VERTICAL_REFINEMENT_DXR` =
+1004999470) on `XrStereoCameraCalibrationDXR::next` (either output; also on the calibration chained
+to a still):
+
+```c
+typedef struct XrStereoCameraVerticalRefinementDXR {
+    XrStructureType type; void* next;
+    XrStereoCameraVerticalRefinementFlagsDXR flags;  // VALID_BIT 0x1
+    float verticalOffset;                // A, normalised rectified units
+    float verticalSlope;                 // B, dimensionless
+    XrQuaternionf rectifyingRotation[2]; // rectified-from-raw per eye (OpenCV R1, R2)
+    XrExtent2Di measuredEyeExtent;       // the rectified per-eye size measured at
+    float measuredFocalLength;           // its rectified f, px
+    float residualPx;                    // signed median dy of the latest fitted window
+    uint32_t matchCount, windowCount, updateCount;
+} XrStereoCameraVerticalRefinementDXR;
+```
+
+**How it composes with the RAW calibration.**
+
+1. *Frame.* The correction lives in the service's rectified frame: eye `e`'s raw rays rotated by
+   `rectifyingRotation[e]` (`ray_rect = R(q_e) · ray_raw`). These are exactly OpenCV
+   `stereoRectify`'s R1 / R2 for the RAW calibration of §4 (zero disparity; **any alpha** — the
+   crop changes f / cx / cy, never the rotations; golden-tested to 1e-12). A consumer whose own
+   rectification uses those rotations applies the numbers directly; one that rectifies some other
+   way uses these rotations instead of its own (or re-expresses D in its frame).
+2. *What, and its sign.* In that frame's normalised coordinates `(x, y) = (X/Z, Y/Z)` (+y down)
+   the uncorrected pair leaves the **right** eye's rows displaced from the **left** eye's by
+   `D(y) = verticalOffset + verticalSlope · y` (a scene point at row `y_L` in the left image sits
+   at `y_L + D` in the right).
+3. *Which eye.* **Both, split symmetrically**: the corrected output row `y` of eye `e` samples the
+   uncorrected rectified row `y_src = y (1 + s_e B/2) + s_e A/2`, `s_left = −1`, `s_right = +1`
+   (`A` = offset, `B` = slope; `x` unchanged). Equivalently a per-eye vertical affine
+   `diag(1, 1 + s_e B/2, 1)` plus a row shift in normalised coordinates, applied after the
+   rotation. Rows then agree to second order (B², AB ≈ 1e-5).
+4. *Units and other modes.* Normalised units are mode-independent: the same `A`, `B` serve every
+   mode (the rotations do not depend on the image size). In pixels of any rectified image with
+   focal `f` and principal row `cy`: `dy(v) = f·A + B·(v − cy)`, pixel centres at integers (§4
+   pixel convention). `measuredEyeExtent` / `measuredFocalLength` say where it was measured
+   (`f·A` there is the offset in those pixels); they are informational, not a rescale input.
+5. *Validity.* `VALID_BIT` clear = nothing fitted on this camera yet, the refinement is off
+   (`DXR_STEREO_CAMERA_REFINE=0`), or the camera is natively rectified / not rectified by the
+   service (no RAW-referred correction exists): every field then reads 0 except
+   `rectifyingRotation`, which is identity. Set = at least one window was fitted
+   (`windowCount ≥ 1`); `A = B = 0` then means "measured and aligned". Confidence:
+   `matchCount` (≥ 50 to fit), `residualPx` (the latest window's signed median dy on frames that
+   carried the correction in force *then*: right after the first update it is the uncorrected
+   misalignment, later the residual; |residualPx| ≤ 0.2 = converged), `updateCount`.
+6. *Change.* A new correction is swapped in between two frames and **moves the frame's
+   `calibrationGeneration`** — RAW streams too: re-read the calibration (with this struct
+   chained) when it moves.
+
+**RAW-only consumers are measured too.** The refinement is driven by the camera thread on the
+service's rectified image; when only RAW streams are started, the service rectifies a source frame
+**only when the estimator is due** (the cadence above; one remap of ~1 ms per measured frame on an
+M1 Pro, i.e. ≤ 4 frames/s while settling and 3 frames per 30 s afterwards) and never publishes it.
+A lingering source with no started stream is not measured. Measured on this Mac (sim fake,
+distorted, `_DY=2.6`, one RAW GRAY8 stream, `camera probe --raw` then `camera calib --raw`):
+`D = +0.005455 − 0.000060·y` = **+2.485 px at 640×480, f 455.54** (the fake's +2.60 px raw
+misalignment at raw fy ≈ 471, i.e. +2.51 px at the rectified f), residual +0.010 px over 456
+matches, 9 windows, 1 update; rotations `R1 q(0.003054 0.002182 0.003927 0.999985)`,
+`R2 q(−0.003054 −0.002182 −0.003927 0.999985)`. Pinned by `tests_stereo_camera_manager`
+("the vertical refinement runs for a RAW-only consumer and is exposed": UVC fake, RAW only →
+VALID with `f·A` = +2.41 px for the fake's +2.4 px, the RAW frames themselves still +2.40 px).
+
+The UVC nominal model (§9a) has no RAW calibration; its rectifying rotations are identity and its
+"rectified" frames are the source frames while passed through, so a consumer of its RAW frames can
+apply the correction with the RECTIFIED calibration's `f` / `cy`.
 
 ### 5.8 Known limits (v8, as built)
 
@@ -1427,7 +1524,8 @@ blocks: SIGNED Δy median, |Δy| median / p90 / count above 1 px, and the domina
 converted to depth with the RECTIFIED calibration), `camera calib <id> --rectified` prints P1/P2
 and `Z = f·B/d`, and `probe --rectified` insists on RECTIFIED output and exits 5 unless the median
 |Δy| ≤ 0.5 px **and** the signed median is within ±0.5 px (a constant vertical offset fails even
-when the scatter is small).
+when the scatter is small). Spec v8: `camera calib` also prints the §5.9 vertical refinement (`D(y)` normalised and in px at the
+measured size, residual / matches / windows / updates, R1 / R2 quaternions; `--json`: `verticalRefinement`).
 
 **Matching (after the first SR-hardware run).** Zero-mean NCC with parabolic sub-pixel refinement
 (coarse pass on every second pixel, full-resolution refinement), blind to the two sensors'
@@ -1496,7 +1594,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
-| 8 | A camera app, not only a call (appended; no public struct changes size; nothing renumbered). **Modes** (§5.5): `xrEnumerateStereoCameraModesDXR` → `XrStereoCameraModeDXR` (`XR_TYPE_STEREO_CAMERA_MODE_DXR` = 1004999319; flags `DEFAULT` / `STREAM` / `STILL`), every camera lists at least its default; `XrStereoCameraStreamModeInfoDXR` (1004999460) chained on the stream create info (absent = the default mode, v7 unchanged) or on the calibration query (numbers for that size); every mode has the default's horizontal field of view about the same axis with a possibly different vertical extent (a 4:3 mode beside a 16:9 default), its calibration derived from the default's (scale by width, principal point kept about the centre); the source runs the smallest mode serving every started stream, the others get their centred rows downscaled by the service (never letterboxed or stretched), a start no single mode can serve with the started streams is `BUSY`, a switch is a reconfigure gap (≤ 500 ms) and never ends a stream unless the source refuses it (then `SOURCE_BUSY` for the streams it cannot serve). **Controls** (§5.6): `XrStereoCameraControlCapabilitiesDXR` (1004999461) chained on the properties; `xrSetStereoCameraControlsDXR` (`XrStereoCameraControlsDXR`, 1004999462: focus mode, focus distance in dioptres, metering point in the stream's left eye, EV) / `xrReleaseStereoCameraControlsDXR`; one holder per camera (`XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR` = −1004999468), started streams only, frames-withheld streams refused, and the hold is lost the moment the holder's frames are withheld (the client is told `SUSPENDED`, re-applies on `AVAILABLE`); `XrStereoCameraCaptureResultDXR` (1004999463) chained on a frame or a still. **Stills** (§5.7): `xrRequestStereoCameraStillDXR` (`XrStereoCameraStillRequestDXR`, 1004999464) → `XrEventDataStereoCameraStillReadyDXR` (1004999466) / `…StillFailedDXR` (1004999467) → `xrAcquireStereoCameraStillDXR` (`XrStereoCameraStillDXR`, 1004999465: a read-only section + layout, chained capture result + calibration) / `xrReleaseStereoCameraStillDXR`; one still per stream at a time; the stream may pause (≤ 1 s) and resumes by itself; a tracking-shared camera may refuse or downsize. Shared memory only; the `AHardwareBuffer` still transport is the next step (1004999469 held back). Hardened against the first real source (Leia Android): `XrStereoCameraStillDXR::sourceFlags` with `XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR` (a per-lens JPEG still), `XrStereoCameraControlCapabilitiesDXR::defaultFocusDistanceDiopters` (a pair's fixed default focus; −1 = not fixed / unknown) — both in what was tail padding, no size change; a mode's `maxFrameRate` 0 = not known yet, measured once it runs; per-eye capture times only when each lens is stamped on its own; a pair may advertise only `MANUAL` + `LOCKED`. Plug-in contract §9b: eight appended slots (`XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES` / `_CONTROLS` / `_STILL`), no ABI bump |
+| 8 | A camera app, not only a call (appended; no public struct changes size; nothing renumbered). **Modes** (§5.5): `xrEnumerateStereoCameraModesDXR` → `XrStereoCameraModeDXR` (`XR_TYPE_STEREO_CAMERA_MODE_DXR` = 1004999319; flags `DEFAULT` / `STREAM` / `STILL`), every camera lists at least its default; `XrStereoCameraStreamModeInfoDXR` (1004999460) chained on the stream create info (absent = the default mode, v7 unchanged) or on the calibration query (numbers for that size); every mode has the default's horizontal field of view about the same axis with a possibly different vertical extent (a 4:3 mode beside a 16:9 default), its calibration derived from the default's (scale by width, principal point kept about the centre); the source runs the smallest mode serving every started stream, the others get their centred rows downscaled by the service (never letterboxed or stretched), a start no single mode can serve with the started streams is `BUSY`, a switch is a reconfigure gap (≤ 500 ms) and never ends a stream unless the source refuses it (then `SOURCE_BUSY` for the streams it cannot serve). **Controls** (§5.6): `XrStereoCameraControlCapabilitiesDXR` (1004999461) chained on the properties; `xrSetStereoCameraControlsDXR` (`XrStereoCameraControlsDXR`, 1004999462: focus mode, focus distance in dioptres, metering point in the stream's left eye, EV) / `xrReleaseStereoCameraControlsDXR`; one holder per camera (`XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR` = −1004999468), started streams only, frames-withheld streams refused, and the hold is lost the moment the holder's frames are withheld (the client is told `SUSPENDED`, re-applies on `AVAILABLE`); `XrStereoCameraCaptureResultDXR` (1004999463) chained on a frame or a still. **Stills** (§5.7): `xrRequestStereoCameraStillDXR` (`XrStereoCameraStillRequestDXR`, 1004999464) → `XrEventDataStereoCameraStillReadyDXR` (1004999466) / `…StillFailedDXR` (1004999467) → `xrAcquireStereoCameraStillDXR` (`XrStereoCameraStillDXR`, 1004999465: a read-only section + layout, chained capture result + calibration) / `xrReleaseStereoCameraStillDXR`; one still per stream at a time; the stream may pause (≤ 1 s) and resumes by itself; a tracking-shared camera may refuse or downsize. Shared memory only; the `AHardwareBuffer` still transport is the next step (1004999469 held back). Hardened against the first real source (Leia Android): `XrStereoCameraStillDXR::sourceFlags` with `XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR` (a per-lens JPEG still), `XrStereoCameraControlCapabilitiesDXR::defaultFocusDistanceDiopters` (a pair's fixed default focus; −1 = not fixed / unknown) — both in what was tail padding, no size change; a mode's `maxFrameRate` 0 = not known yet, measured once it runs; per-eye capture times only when each lens is stamped on its own; a pair may advertise only `MANUAL` + `LOCKED`. Plug-in contract §9b: eight appended slots (`XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES` / `_CONTROLS` / `_STILL`), no ABI bump **Refinement for RAW consumers** (§5.9): `XrStereoCameraVerticalRefinementDXR` (`XR_TYPE_STEREO_CAMERA_VERTICAL_REFINEMENT_DXR` = 1004999470) chained on the calibration query; the refinement now also runs with only RAW streams started. The `rightFromLeft` convention is stated with its equations (§4) — no number changed. |
 | 7, as built | No API change. NV12/BGRA conversions are BT.601 full range (§5.3). |
 | 7 | `XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR` = `0x20` (appended): set by the runtime exactly when a RECTIFIED stream of the camera delivers rectified frames (natively rectified, or the service's rectifier accepted the calibration at registration). It is the pre-start signal a rectified-only consumer needs: `CALIBRATED` stays set on a pair whose geometry the rectifier rejected, and the RECTIFIED calibration query is a consent point, so neither can be used to filter a camera list. A plug-in's own value of the bit is ignored. Also `XrStereoCameraOrientationDXR` (`XR_TYPE_STEREO_CAMERA_ORIENTATION_DXR` = 1004999318), chained on `XrStereoCameraPropertiesDXR::next`: the clockwise rotation (0/90/180/270) that makes the published frame upright in the device's natural orientation, Camera2 `SENSOR_ORIENTATION` semantics, or `XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR` (`0xFFFFFFFF`); the consumer pre-sets UNKNOWN (§3). Plug-in contract (§9): appended `xrt_plugin_stereo_camera_info::frame_orientation` (0 = unknown, `XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION`); the UVC source reports UNKNOWN (§9a). `displayxr-cli camera list` prints it. No public struct changes size, nothing renumbered |
 | 6 (A2, Android) | No API change. The Android rows of §7: the consent identity is the peer uid's package + signing-certificate digest, the trusted list is built into the runtime, and the consent dialog, the in-use notification with Stop, the lock watch, and "the OS took the camera" = `SUSPENDED` are runtime-owned. A front camera needs a live weave from the same app (`BUSY` otherwise), with or without the developer override |
