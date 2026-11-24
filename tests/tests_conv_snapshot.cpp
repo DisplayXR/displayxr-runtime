@@ -17,6 +17,9 @@
 #include "target_plugin_loader.h"
 #include "target_status_snapshot.h"
 
+#include "conversion/conv_readiness.h"
+#include "conversion/conv_registry.h"
+
 #include "util/u_status_snapshot.h"
 #include "xrt/xrt_conversion_plugin.h"
 #include "xrt/xrt_display_status.h"
@@ -271,6 +274,125 @@ TEST_CASE("conv snapshot: streams / jobs columns come from the live core per tas
 	// No callback (the headless pass): untouched, no crash.
 	target_conv_status_fill_activity(st.get(), nullptr, nullptr);
 	CHECK(st->tasks[0].streams == 2);
+}
+
+namespace {
+
+//! One described capability row for @p provider, as a describe would leave it.
+void
+add_live_row(conv_registry &reg, uint32_t provider, uint32_t cap_id, uint32_t task_id)
+{
+	conv_cap_row &row = reg.rows[reg.row_count++];
+	std::memset(&row, 0, sizeof(row));
+	row.provider = provider;
+	row.cap.struct_size = sizeof(row.cap);
+	row.cap.cap_id = cap_id;
+	row.cap.task = task_id;
+	row.cap.lanes = XRT_CONV_LANE_STREAM;
+	row.cap.input_kinds = XRT_CONV_INPUT_MONO;
+	row.cap.outputs = XRT_CONV_OUT_DEPTH;
+	row.cap.licence_class = XRT_CONV_LICENCE_PERMISSIVE;
+	row.cap.depth_kind = XRT_CONV_DEPTH_AFFINE_INVERSE;
+	conv_readiness_init(&row.rd);
+	conv_readiness_event e{};
+	e.type = CONV_EV_DESCRIBED;
+	e.now_ns = 1;
+	conv_readiness_apply(&row.rd, &e);
+	reg.providers[provider].described = true;
+}
+
+std::string
+bound(const target_conv_status &st, uint32_t task_id)
+{
+	const char *id = target_conv_status_bound_provider(&st, task_id, 0, nullptr, nullptr, 0);
+	return id != nullptr ? id : "";
+}
+
+} // namespace
+
+TEST_CASE("conv snapshot: the live rows follow a rebound and a removed registration (spec 3.8.1)", "[conv_snapshot]")
+{
+	// The service's live path (target_conv_status_from_registry): the running
+	// core's registry plus the loader rows the service holds.
+	auto reg = std::make_unique<conv_registry>();
+	conv_registry_init(reg.get());
+	conv_provider_desc da{};
+	da.id = "acme-conversion";
+	da.probe_order = 50;
+	da.hosting = CONV_HOSTING_SATELLITE;
+	da.enabled = true;
+	da.binary_path = "/opt/old/acme-conversion.so";
+	conv_provider_desc dopen{};
+	dopen.id = "open-conversion";
+	dopen.probe_order = 200;
+	dopen.hosting = CONV_HOSTING_SATELLITE;
+	dopen.enabled = true;
+	dopen.binary_path = "/opt/open/open-conversion.so";
+	REQUIRE(conv_registry_add(reg.get(), &da) == 0);
+	REQUIRE(conv_registry_add(reg.get(), &dopen) == 1);
+	add_live_row(*reg, 0, 1, XRT_CONV_TASK_DEPTH_MONO);
+	add_live_row(*reg, 1, 1, XRT_CONV_TASK_DEPTH_MONO);
+
+	std::vector<xrt_conversion_plugin_entry> entries(2);
+	std::memset(entries.data(), 0, sizeof(entries[0]) * entries.size());
+	cpy(entries[0].id, sizeof(entries[0].id), "acme-conversion");
+	cpy(entries[0].version, sizeof(entries[0].version), "0.0.9");
+	cpy(entries[0].binary_path, sizeof(entries[0].binary_path), "/opt/old/acme-conversion.so");
+	cpy(entries[1].id, sizeof(entries[1].id), "open-conversion");
+	cpy(entries[1].version, sizeof(entries[1].version), "1.0.0");
+	cpy(entries[1].binary_path, sizeof(entries[1].binary_path), "/opt/open/open-conversion.so");
+
+	auto st = std::make_unique<target_conv_status>();
+	target_conv_status_from_registry(reg.get(), entries.data(), 2, nullptr, st.get());
+	REQUIRE(st->provider_count == 2);
+	CHECK(std::string(st->providers[0].binary) == "/opt/old/acme-conversion.so");
+	CHECK(bound(*st, XRT_CONV_TASK_DEPTH_MONO) == "acme-conversion");
+
+	// An installer takes the row over at a new path: the service re-reads the
+	// whole row and rebinds the core's registry. Version AND binary move
+	// together (the bug: only the version did, so the reader classified the
+	// provenance of a file that no longer existed).
+	cpy(entries[0].version, sizeof(entries[0].version), "0.1.0");
+	cpy(entries[0].binary_path, sizeof(entries[0].binary_path), "/opt/new/AcmeConversion/acme-conversion.so");
+	conv_provider_desc nd = da;
+	nd.binary_path = entries[0].binary_path;
+	nd.binary_size = 10;
+	nd.binary_mtime = 20;
+	REQUIRE(conv_registry_rebind(reg.get(), 0, &nd));
+	target_conv_status_from_registry(reg.get(), entries.data(), 2, nullptr, st.get());
+	REQUIRE(st->provider_count == 2);
+	CHECK(std::string(st->providers[0].id) == "acme-conversion");
+	CHECK(std::string(st->providers[0].version) == "0.1.0");
+	CHECK(std::string(st->providers[0].binary) == "/opt/new/AcmeConversion/acme-conversion.so");
+	CHECK(st->providers[0].enabled);
+	CHECK(bound(*st, XRT_CONV_TASK_DEPTH_MONO) == "acme-conversion");
+
+	// The provider is uninstalled: its row is gone. The core keeps the slot,
+	// the snapshot reads as if it had never been installed, and the next
+	// provider serves.
+	conv_registry_set_registered(reg.get(), 0, false);
+	target_conv_status_from_registry(reg.get(), entries.data(), 2, nullptr, st.get());
+	REQUIRE(st->provider_count == 1);
+	CHECK(std::string(st->providers[0].id) == "open-conversion");
+	CHECK(st->registered == 1);
+	for (uint32_t i = 0; i < st->task_count; i++) {
+		CAPTURE(i);
+		REQUIRE(st->tasks[i].provider < st->provider_count);
+		CHECK(std::string(st->providers[st->tasks[i].provider].id) == "open-conversion");
+	}
+	CHECK(bound(*st, XRT_CONV_TASK_DEPTH_MONO) == "open-conversion");
+	char why[160] = {0};
+	CHECK(target_conv_status_bound_provider(st.get(), XRT_CONV_TASK_DEPTH_MONO, 0, "acme-conversion", why,
+	                                        sizeof(why)) == nullptr);
+	CHECK(std::string(why).find("not a registered provider") != std::string::npos);
+
+	// Reinstalled: listed and selected again.
+	conv_registry_set_registered(reg.get(), 0, true);
+	reg->providers[0].enabled = true;
+	add_live_row(*reg, 0, 1, XRT_CONV_TASK_DEPTH_MONO);
+	target_conv_status_from_registry(reg.get(), entries.data(), 2, nullptr, st.get());
+	REQUIRE(st->provider_count == 2);
+	CHECK(bound(*st, XRT_CONV_TASK_DEPTH_MONO) == "acme-conversion");
 }
 
 

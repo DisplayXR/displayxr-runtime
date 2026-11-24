@@ -8,7 +8,7 @@
  "providers": [
   {
    "id": "leia-conversion",
-   "name": "Leia conversion provider",
+   "name": "Leia conversion",
    "vendor": "Leia, Inc.",
    "version": "1.0.0",
    "load": "ACTIVE",

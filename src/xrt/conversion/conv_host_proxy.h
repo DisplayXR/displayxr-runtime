@@ -174,6 +174,27 @@ conv_host_proxy_set_adapter(struct conv_host *h, uint64_t adapter_luid, const st
 void
 conv_host_proxy_config_changed(struct conv_host *h);
 
+/*!
+ * The provider's registration now names another binary (discovery spec
+ * §3.8.1): every later spawn passes @p provider_binary as the host's binary
+ * argument, the describe the proxy holds (the previous binary's) is dropped
+ * so the new one is described at its first spawn, and that spawn is requested
+ * (it still waits for a free maintenance mutex). A host still alive on the
+ * previous binary is closed the closed-for-update way (exit 20 shape: no
+ * backoff, no crash accounting; the core's tasks read WARMING(updating) and
+ * re-warm on RESTORED), so it is never reused for the new binary. @p replaced says the
+ * file at an unchanged path is another binary (its size or mtime moved: a
+ * package manager renamed a new file over it, which leaves a running host on
+ * the old one). A no-op (false) when the path is the one already bound and
+ * @p replaced is false. Follow with conv_host_proxy_config_changed.
+ */
+bool
+conv_host_proxy_rebind(struct conv_host *h, const char *provider_binary, bool replaced);
+
+//! The binary path the next spawn passes (diagnostics, tests).
+void
+conv_host_proxy_get_binary(struct conv_host *h, char *buf, size_t size);
+
 //! The maintenance-mutex name for @p provider_id: `Global\DisplayXR-ConvMaintenance-<id>`.
 void
 conv_host_proxy_maintenance_mutex_name(const char *provider_id, char *buf, size_t size);

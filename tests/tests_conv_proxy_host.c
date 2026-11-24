@@ -16,6 +16,8 @@
  *   --fake-exit-at-start <code>    exit with <code> before saying hello (10 = ABI reject, ...)
  *   --fake-update-after <n>        exit(20) ("closed for update") when the n-th convert arrives
  *   --fake-update-once <file>      ... only when <file> does not exist (it is created first)
+ *   --fake-binary-log <file>       append the provider binary path this process was given
+ *                                  (CONV_HOST_ARG_BINARY), one line per start
  *   --fake-rm-unresponsive 1       Windows: own a hidden top-level window that never pumps
  *                                  messages (as a provider dependency may), so Restart
  *                                  Manager can only close this process with RmForceShutdown
@@ -538,11 +540,17 @@ int
 main(int argc, char **argv)
 {
 	const char *token = NULL;
+	const char *binary = "";
+	const char *binary_log = NULL;
 	long parent = 0;
 	for (int i = 1; i + 1 < argc; i += 2) {
 		const char *k = argv[i], *v = argv[i + 1];
 		if (strcmp(k, CONV_HOST_ARG_PROVIDER) == 0) {
 			snprintf(g_provider, sizeof(g_provider), "%s", v);
+		} else if (strcmp(k, CONV_HOST_ARG_BINARY) == 0) {
+			binary = v;
+		} else if (strcmp(k, "--fake-binary-log") == 0) {
+			binary_log = v;
 		} else if (strcmp(k, CONV_HOST_ARG_CHANNEL) == 0) {
 			token = v;
 		} else if (strcmp(k, CONV_HOST_ARG_ADAPTER_LUID) == 0) {
@@ -581,6 +589,13 @@ main(int argc, char **argv)
 			g_require_cpu_outputs = (unsigned)strtoul(v, NULL, 10);
 		} else if (strcmp(k, "--fake-exit-at-start") == 0) {
 			return (int)strtol(v, NULL, 10);
+		}
+	}
+	if (binary_log != NULL) {
+		FILE *f = fopen(binary_log, "a");
+		if (f != NULL) {
+			fprintf(f, "%s\n", binary);
+			fclose(f);
 		}
 	}
 	if (token == NULL || os_channel_open_child(token, &g_ch) != 0) {

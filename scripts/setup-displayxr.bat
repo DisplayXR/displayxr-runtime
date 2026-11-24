@@ -281,7 +281,7 @@ echo                     ^(Opt-in: it is a separate browser, so you ask for it
 echo                     by name; it is never part of the default install.^)
 echo   --with leia-conversion
 echo                     Also install the Leia 2D-to-3D conversion provider.
-echo                     ^(Opt-in. Needs the NeurD runtime, installed separately.^)
+echo                     ^(Opt-in. Needs the Leia conversion runtime, installed separately.^)
 echo   --with ultraleap  Also install the Ultraleap hands input provider.
 echo                     ^(Opt-in. Needs the Ultraleap tracking software.^)
 echo   --with-demos      Also install each demo's prebuilt release installer
