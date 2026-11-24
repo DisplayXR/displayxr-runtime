@@ -1321,7 +1321,9 @@
 	"stereo_camera_get_calibration": {
 		"in": [
 			{"name": "camera_id", "type": "uint64_t"},
-			{"name": "output", "type": "uint32_t"}
+			{"name": "output", "type": "uint32_t"},
+			{"name": "eye_width", "type": "uint32_t"},
+			{"name": "eye_height", "type": "uint32_t"}
 		],
 		"out": [
 			{"name": "calib", "type": "struct xrt_stereo_camera_calibration"}
@@ -1379,7 +1381,8 @@
 		"out": [
 			{"name": "ready", "type": "bool"},
 			{"name": "frame", "type": "struct xrt_stereo_camera_frame_info"},
-			{"name": "app", "type": "struct xrt_app_share_frame_info"}
+			{"name": "app", "type": "struct xrt_app_share_frame_info"},
+			{"name": "capture", "type": "struct xrt_stereo_camera_capture_result"}
 		]
 	},
 
@@ -1415,6 +1418,65 @@
 		],
 		"out": [
 			{"name": "value", "type": "uint32_t"}
+		]
+	},
+
+	"stereo_camera_get_modes": {
+		"in": [
+			{"name": "camera_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "modes", "type": "struct xrt_stereo_camera_mode_list"}
+		]
+	},
+
+	"stereo_camera_get_control_caps": {
+		"in": [
+			{"name": "camera_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "caps", "type": "struct xrt_stereo_camera_control_caps"}
+		]
+	},
+
+	"stereo_camera_set_controls": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"},
+			{"name": "controls", "type": "struct xrt_stereo_camera_controls"}
+		]
+	},
+
+	"stereo_camera_release_controls": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"stereo_camera_request_still": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"},
+			{"name": "req", "type": "struct xrt_stereo_camera_still_request"}
+		],
+		"out": [
+			{"name": "request_id", "type": "uint64_t"}
+		]
+	},
+
+	"stereo_camera_acquire_still": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"},
+			{"name": "request_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "info", "type": "struct xrt_stereo_camera_still_info"}
+		],
+		"out_handles": {"type": "xrt_shmem_handle_t"}
+	},
+
+	"stereo_camera_release_still": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"},
+			{"name": "request_id", "type": "uint64_t"}
 		]
 	},
 

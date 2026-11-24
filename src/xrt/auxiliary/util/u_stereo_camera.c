@@ -674,3 +674,270 @@ u_stereo_camera_match_block(const uint8_t *gray,
 	out->dy = (float)by + sy;
 	return true;
 }
+
+
+/*
+ *
+ * Channel resampling (shared by the UVC source's split and the spec v8 per-stream downscale).
+ *
+ */
+
+/*!
+ * One row of the box-reduced intermediate grid: row @p m averages source rows
+ * [m * iy, m * iy + iy) and columns in groups of @p ix. Rows are walked in
+ * memory order and summed into @p acc (16-bit: ix * iy <= 256), then scaled by
+ * a fixed-point reciprocal — no per-sample division. A 1 x 1 reduction of a
+ * packed (step 1) channel needs no work at all: the source row itself is
+ * returned.
+ */
+static const uint8_t *
+box_row(const struct u_stereo_camera_chan *s,
+        uint32_t ix,
+        uint32_t iy,
+        uint32_t mw,
+        uint32_t m,
+        uint16_t *acc,
+        uint8_t *row)
+{
+	const size_t step = s->step;
+	if (ix == 1 && iy == 1) {
+		const uint8_t *p = s->base + (size_t)m * s->pitch;
+		if (step == 1) {
+			return p;
+		}
+		for (uint32_t x = 0; x < mw; x++) {
+			row[x] = p[x * step];
+		}
+		return row;
+	}
+	memset(acc, 0, sizeof(uint16_t) * mw);
+	for (uint32_t yy = 0; yy < iy; yy++) {
+		const uint8_t *p = s->base + (size_t)(m * iy + yy) * s->pitch;
+		if (ix == 1 && step == 1) {
+			for (uint32_t x = 0; x < mw; x++) {
+				acc[x] = (uint16_t)(acc[x] + p[x]);
+			}
+		} else if (ix == 1) {
+			for (uint32_t x = 0; x < mw; x++) {
+				acc[x] = (uint16_t)(acc[x] + p[x * step]);
+			}
+		} else {
+			for (uint32_t x = 0; x < mw; x++) {
+				const uint8_t *q = p + (size_t)x * ix * step;
+				uint32_t a = 0;
+				for (uint32_t xx = 0; xx < ix; xx++) {
+					a += q[xx * step];
+				}
+				acc[x] = (uint16_t)(acc[x] + a);
+			}
+		}
+	}
+	const uint32_t div = ix * iy;
+	const uint32_t recip = (65536u + div / 2) / div; // sum * recip >> 16 ~= sum / div
+	for (uint32_t x = 0; x < mw; x++) {
+		uint32_t v = ((uint32_t)acc[x] * recip + 32768u) >> 16;
+		row[x] = (uint8_t)(v > 255 ? 255 : v);
+	}
+	return row;
+}
+
+//! Pixel-centre bilinear tap from a @p dst-sized grid into a @p src-sized one.
+static void
+tap(uint32_t i, uint32_t src, uint32_t dst, uint32_t *i0, uint32_t *i1, uint32_t *w)
+{
+	double f = ((double)i + 0.5) * (double)src / (double)dst - 0.5;
+	if (f < 0.0) {
+		f = 0.0;
+	}
+	if (f > (double)(src - 1)) {
+		f = (double)(src - 1);
+	}
+	uint32_t a = (uint32_t)f;
+	uint32_t wt = (uint32_t)((f - (double)a) * 256.0 + 0.5);
+	if (wt >= 256) {
+		a++;
+		wt = 0;
+	}
+	if (a > src - 1) {
+		a = src - 1;
+	}
+	*i0 = a;
+	*i1 = a + 1 < src ? a + 1 : src - 1;
+	*w = wt;
+}
+
+bool
+u_stereo_camera_resample(const struct u_stereo_camera_chan *s, const struct u_stereo_camera_dchan *d)
+{
+	if (s->w == 0 || s->h == 0 || d->w == 0 || d->h == 0) {
+		return false;
+	}
+	if (s->w == d->w && s->h == d->h) {
+		for (uint32_t y = 0; y < d->h; y++) {
+			const uint8_t *sp = s->base + (size_t)y * s->pitch;
+			uint8_t *dp = d->base + (size_t)y * d->pitch;
+			if (s->step == 1 && d->step == 1) {
+				memcpy(dp, sp, d->w);
+			} else {
+				for (uint32_t x = 0; x < d->w; x++) {
+					dp[(size_t)x * d->step] = sp[(size_t)x * s->step];
+				}
+			}
+		}
+		return true;
+	}
+	// Integer box pre-reduction (anti-aliasing), then bilinear for the rest.
+	uint32_t ix = s->w / d->w, iy = s->h / d->h;
+	ix = ix < 1 ? 1 : ix > 16 ? 16 : ix;
+	iy = iy < 1 ? 1 : iy > 16 ? 16 : iy;
+	const uint32_t mw = s->w / ix, mh = s->h / iy;
+	uint32_t *x0 = (uint32_t *)malloc(sizeof(uint32_t) * d->w * 3);
+	uint8_t *rows = (uint8_t *)malloc((size_t)mw * 2);
+	uint16_t *acc = (uint16_t *)malloc(sizeof(uint16_t) * mw);
+	if (x0 == NULL || rows == NULL || acc == NULL) {
+		free(x0);
+		free(rows);
+		free(acc);
+		return false;
+	}
+	uint32_t *x1 = x0 + d->w, *wx = x0 + 2 * d->w;
+	bool h_identity = mw == d->w;
+	for (uint32_t x = 0; x < d->w; x++) {
+		tap(x, mw, d->w, &x0[x], &x1[x], &wx[x]);
+	}
+	// Two cached intermediate rows, slot = row parity: y1 is y0 or y0 + 1, so
+	// the two rows one output row needs never share a slot.
+	uint8_t *rowbuf[2] = {rows, rows + mw};
+	const uint8_t *row[2] = {NULL, NULL};
+	int64_t have[2] = {-1, -1};
+	const size_t dstep = d->step;
+	for (uint32_t y = 0; y < d->h; y++) {
+		uint32_t y0, y1, wy;
+		tap(y, mh, d->h, &y0, &y1, &wy);
+		const uint32_t need[2] = {y0, y1};
+		const uint8_t *r[2];
+		const int rows_needed = wy == 0 ? 1 : 2; // an exact row needs no second one
+		for (int k = 0; k < rows_needed; k++) {
+			const uint32_t slot = need[k] & 1u;
+			if (have[slot] != (int64_t)need[k]) {
+				row[slot] = box_row(s, ix, iy, mw, need[k], acc, rowbuf[slot]);
+				have[slot] = need[k];
+			}
+			r[k] = row[slot];
+		}
+		uint8_t *dp = d->base + (size_t)y * d->pitch;
+		if (rows_needed == 1) {
+			const uint8_t *r0 = r[0];
+			if (h_identity) {
+				for (uint32_t x = 0; x < d->w; x++) {
+					dp[x * dstep] = r0[x];
+				}
+			} else {
+				for (uint32_t x = 0; x < d->w; x++) {
+					uint32_t w = wx[x];
+					dp[x * dstep] = (uint8_t)((r0[x0[x]] * (256 - w) + r0[x1[x]] * w + 128) >> 8);
+				}
+			}
+			continue;
+		}
+		const uint8_t *r0 = r[0], *r1 = r[1];
+		for (uint32_t x = 0; x < d->w; x++) {
+			uint32_t a = h_identity ? x : x0[x], b = h_identity ? x : x1[x], w = h_identity ? 0 : wx[x];
+			uint32_t top = r0[a] * (256 - w) + r0[b] * w;
+			uint32_t bot = r1[a] * (256 - w) + r1[b] * w;
+			dp[x * dstep] = (uint8_t)((top * (256 - wy) + bot * wy + 32768) >> 16);
+		}
+	}
+	free(x0);
+	free(rows);
+	free(acc);
+	return true;
+}
+
+bool
+u_stereo_camera_scale(uint32_t format,
+                      const uint8_t *const src_planes[2],
+                      const uint32_t src_pitches[2],
+                      uint32_t src_width,
+                      uint32_t src_height,
+                      uint8_t *dst,
+                      const struct u_stereo_camera_planes *dst_layout,
+                      uint32_t dst_width,
+                      uint32_t dst_height)
+{
+	if (src_planes == NULL || src_pitches == NULL || src_planes[0] == NULL || dst == NULL || dst_layout == NULL ||
+	    (src_width & 1u) != 0 || (dst_width & 1u) != 0 || src_width == 0 || src_height == 0 || dst_width == 0 ||
+	    dst_height == 0) {
+		return false;
+	}
+	const uint32_t sw = src_width / 2, dw = dst_width / 2; // per eye
+	for (uint32_t e = 0; e < 2; e++) {
+		switch (format) {
+		case 1: { // GRAY8
+			struct u_stereo_camera_chan s = {src_planes[0] + (size_t)e * sw, src_pitches[0], 1, sw,
+			                                 src_height};
+			struct u_stereo_camera_dchan d = {dst + dst_layout->offset[0] + (size_t)e * dw,
+			                                  dst_layout->pitch[0], 1, dw, dst_height};
+			if (!u_stereo_camera_resample(&s, &d)) {
+				return false;
+			}
+			break;
+		}
+		case 2: { // NV12: Y full res, interleaved UV at half res
+			if (src_planes[1] == NULL || (sw & 1u) != 0 || (dw & 1u) != 0 || (src_height & 1u) != 0 ||
+			    (dst_height & 1u) != 0 || dst_layout->plane_count < 2) {
+				return false;
+			}
+			struct u_stereo_camera_chan sy = {src_planes[0] + (size_t)e * sw, src_pitches[0], 1, sw,
+			                                  src_height};
+			struct u_stereo_camera_dchan dy = {dst + dst_layout->offset[0] + (size_t)e * dw,
+			                                   dst_layout->pitch[0], 1, dw, dst_height};
+			if (!u_stereo_camera_resample(&sy, &dy)) {
+				return false;
+			}
+			for (uint32_t c = 0; c < 2; c++) { // U, V: eye e's chroma starts at byte e * (width / 2)
+				struct u_stereo_camera_chan su = {src_planes[1] + (size_t)e * sw + c, src_pitches[1], 2,
+				                                  sw / 2, src_height / 2};
+				struct u_stereo_camera_dchan du = {dst + dst_layout->offset[1] + (size_t)e * dw + c,
+				                                   dst_layout->pitch[1], 2, dw / 2, dst_height / 2};
+				if (!u_stereo_camera_resample(&su, &du)) {
+					return false;
+				}
+			}
+			break;
+		}
+		case 3: // BGRA8: four interleaved channels
+			for (uint32_t c = 0; c < 4; c++) {
+				struct u_stereo_camera_chan s = {src_planes[0] + (size_t)e * sw * 4 + c, src_pitches[0],
+				                                 4, sw, src_height};
+				struct u_stereo_camera_dchan d = {dst + dst_layout->offset[0] + (size_t)e * dw * 4 + c,
+				                                  dst_layout->pitch[0], 4, dw, dst_height};
+				if (!u_stereo_camera_resample(&s, &d)) {
+					return false;
+				}
+			}
+			break;
+		default: return false;
+		}
+	}
+	return true;
+}
+
+void
+u_stereo_camera_scale_intrinsics(double fx,
+                                 double fy,
+                                 double cx,
+                                 double cy,
+                                 uint32_t from_w,
+                                 uint32_t from_h,
+                                 uint32_t to_w,
+                                 uint32_t to_h,
+                                 double out[4])
+{
+	const double sx = from_w > 0 ? (double)to_w / (double)from_w : 1.0;
+	const double sy = from_h > 0 ? (double)to_h / (double)from_h : 1.0;
+	out[0] = fx * sx;
+	out[1] = fy * sy;
+	out[2] = (cx + 0.5) * sx - 0.5;
+	out[3] = (cy + 0.5) * sy - 0.5;
+}

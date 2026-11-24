@@ -550,6 +550,12 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrGetStereoCameraStreamInfoDXR, DXR_stereo_camera);
 	ENTRY_IF_EXT(xrAcquireStereoCameraFrameDXR, DXR_stereo_camera);
 	ENTRY_IF_EXT(xrGetStereoCameraStreamStatsDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrEnumerateStereoCameraModesDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrSetStereoCameraControlsDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrReleaseStereoCameraControlsDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrRequestStereoCameraStillDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrAcquireStereoCameraStillDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrReleaseStereoCameraStillDXR, DXR_stereo_camera);
 #endif
 
 #ifdef OXR_HAVE_DXR_desktop_control

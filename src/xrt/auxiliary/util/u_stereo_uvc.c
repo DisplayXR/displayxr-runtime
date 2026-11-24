@@ -896,188 +896,8 @@ u_stereo_uvc_calibration_parse(const char *text,
  *
  */
 
-//! One 8-bit channel of a plane region: samples at base + y * pitch + x * step.
-struct chan
-{
-	const uint8_t *base;
-	uint32_t pitch;
-	uint32_t step;
-	uint32_t w, h;
-};
-
-struct dchan
-{
-	uint8_t *base;
-	uint32_t pitch;
-	uint32_t step;
-	uint32_t w, h;
-};
-
-/*!
- * One row of the box-reduced intermediate grid: row @p m averages source rows
- * [m * iy, m * iy + iy) and columns in groups of @p ix. Rows are walked in
- * memory order and summed into @p acc (16-bit: ix * iy <= 256), then scaled by
- * a fixed-point reciprocal — no per-sample division. A 1 x 1 reduction of a
- * packed (step 1) channel needs no work at all: the source row itself is
- * returned.
- */
-static const uint8_t *
-box_row(const struct chan *s, uint32_t ix, uint32_t iy, uint32_t mw, uint32_t m, uint16_t *acc, uint8_t *row)
-{
-	const size_t step = s->step;
-	if (ix == 1 && iy == 1) {
-		const uint8_t *p = s->base + (size_t)m * s->pitch;
-		if (step == 1) {
-			return p;
-		}
-		for (uint32_t x = 0; x < mw; x++) {
-			row[x] = p[x * step];
-		}
-		return row;
-	}
-	memset(acc, 0, sizeof(uint16_t) * mw);
-	for (uint32_t yy = 0; yy < iy; yy++) {
-		const uint8_t *p = s->base + (size_t)(m * iy + yy) * s->pitch;
-		if (ix == 1 && step == 1) {
-			for (uint32_t x = 0; x < mw; x++) {
-				acc[x] = (uint16_t)(acc[x] + p[x]);
-			}
-		} else if (ix == 1) {
-			for (uint32_t x = 0; x < mw; x++) {
-				acc[x] = (uint16_t)(acc[x] + p[x * step]);
-			}
-		} else {
-			for (uint32_t x = 0; x < mw; x++) {
-				const uint8_t *q = p + (size_t)x * ix * step;
-				uint32_t a = 0;
-				for (uint32_t xx = 0; xx < ix; xx++) {
-					a += q[xx * step];
-				}
-				acc[x] = (uint16_t)(acc[x] + a);
-			}
-		}
-	}
-	const uint32_t div = ix * iy;
-	const uint32_t recip = (65536u + div / 2) / div; // sum * recip >> 16 ~= sum / div
-	for (uint32_t x = 0; x < mw; x++) {
-		uint32_t v = ((uint32_t)acc[x] * recip + 32768u) >> 16;
-		row[x] = (uint8_t)(v > 255 ? 255 : v);
-	}
-	return row;
-}
-
-//! Pixel-centre bilinear tap from a @p dst-sized grid into a @p src-sized one.
-static void
-tap(uint32_t i, uint32_t src, uint32_t dst, uint32_t *i0, uint32_t *i1, uint32_t *w)
-{
-	double f = ((double)i + 0.5) * (double)src / (double)dst - 0.5;
-	if (f < 0.0) {
-		f = 0.0;
-	}
-	if (f > (double)(src - 1)) {
-		f = (double)(src - 1);
-	}
-	uint32_t a = (uint32_t)f;
-	uint32_t wt = (uint32_t)((f - (double)a) * 256.0 + 0.5);
-	if (wt >= 256) {
-		a++;
-		wt = 0;
-	}
-	if (a > src - 1) {
-		a = src - 1;
-	}
-	*i0 = a;
-	*i1 = a + 1 < src ? a + 1 : src - 1;
-	*w = wt;
-}
-
-static bool
-resample(const struct chan *s, const struct dchan *d)
-{
-	if (s->w == 0 || s->h == 0 || d->w == 0 || d->h == 0) {
-		return false;
-	}
-	if (s->w == d->w && s->h == d->h) {
-		for (uint32_t y = 0; y < d->h; y++) {
-			const uint8_t *sp = s->base + (size_t)y * s->pitch;
-			uint8_t *dp = d->base + (size_t)y * d->pitch;
-			if (s->step == 1 && d->step == 1) {
-				memcpy(dp, sp, d->w);
-			} else {
-				for (uint32_t x = 0; x < d->w; x++) {
-					dp[(size_t)x * d->step] = sp[(size_t)x * s->step];
-				}
-			}
-		}
-		return true;
-	}
-	// Integer box pre-reduction (anti-aliasing), then bilinear for the rest.
-	uint32_t ix = s->w / d->w, iy = s->h / d->h;
-	ix = ix < 1 ? 1 : ix > 16 ? 16 : ix;
-	iy = iy < 1 ? 1 : iy > 16 ? 16 : iy;
-	const uint32_t mw = s->w / ix, mh = s->h / iy;
-	uint32_t *x0 = (uint32_t *)malloc(sizeof(uint32_t) * d->w * 3);
-	uint8_t *rows = (uint8_t *)malloc((size_t)mw * 2);
-	uint16_t *acc = (uint16_t *)malloc(sizeof(uint16_t) * mw);
-	if (x0 == NULL || rows == NULL || acc == NULL) {
-		free(x0);
-		free(rows);
-		free(acc);
-		return false;
-	}
-	uint32_t *x1 = x0 + d->w, *wx = x0 + 2 * d->w;
-	bool h_identity = mw == d->w;
-	for (uint32_t x = 0; x < d->w; x++) {
-		tap(x, mw, d->w, &x0[x], &x1[x], &wx[x]);
-	}
-	// Two cached intermediate rows, slot = row parity: y1 is y0 or y0 + 1, so
-	// the two rows one output row needs never share a slot.
-	uint8_t *rowbuf[2] = {rows, rows + mw};
-	const uint8_t *row[2] = {NULL, NULL};
-	int64_t have[2] = {-1, -1};
-	const size_t dstep = d->step;
-	for (uint32_t y = 0; y < d->h; y++) {
-		uint32_t y0, y1, wy;
-		tap(y, mh, d->h, &y0, &y1, &wy);
-		const uint32_t need[2] = {y0, y1};
-		const uint8_t *r[2];
-		const int rows_needed = wy == 0 ? 1 : 2; // an exact row needs no second one
-		for (int k = 0; k < rows_needed; k++) {
-			const uint32_t slot = need[k] & 1u;
-			if (have[slot] != (int64_t)need[k]) {
-				row[slot] = box_row(s, ix, iy, mw, need[k], acc, rowbuf[slot]);
-				have[slot] = need[k];
-			}
-			r[k] = row[slot];
-		}
-		uint8_t *dp = d->base + (size_t)y * d->pitch;
-		if (rows_needed == 1) {
-			const uint8_t *r0 = r[0];
-			if (h_identity) {
-				for (uint32_t x = 0; x < d->w; x++) {
-					dp[x * dstep] = r0[x];
-				}
-			} else {
-				for (uint32_t x = 0; x < d->w; x++) {
-					uint32_t w = wx[x];
-					dp[x * dstep] = (uint8_t)((r0[x0[x]] * (256 - w) + r0[x1[x]] * w + 128) >> 8);
-				}
-			}
-			continue;
-		}
-		const uint8_t *r0 = r[0], *r1 = r[1];
-		for (uint32_t x = 0; x < d->w; x++) {
-			uint32_t a = h_identity ? x : x0[x], b = h_identity ? x : x1[x], w = h_identity ? 0 : wx[x];
-			uint32_t top = r0[a] * (256 - w) + r0[b] * w;
-			uint32_t bot = r1[a] * (256 - w) + r1[b] * w;
-			dp[x * dstep] = (uint8_t)((top * (256 - wy) + bot * wy + 32768) >> 16);
-		}
-	}
-	free(x0);
-	free(rows);
-	free(acc);
-	return true;
-}
+// The channel resampler lives in u_stereo_camera.c (u_stereo_camera_resample): the
+// service's per-stream downscale (spec v8 modes) uses the same one.
 
 /*!
  * Fast path: the frame already has the output size (a GPU-scaled frame), NV12
@@ -1124,29 +944,31 @@ u_stereo_uvc_split(const struct u_stereo_uvc_raw_frame *in,
 	}
 	for (uint32_t e = 0; e < 2; e++) {
 		const uint32_t h = swap_eyes ? 1u - e : e; // which half of the source holds output eye e
-		struct chan sy, su, sv;
+		struct u_stereo_camera_chan sy, su, sv;
 		if (in->pixel == U_STEREO_UVC_PIXEL_NV12) {
 			if (in->planes[1] == NULL) {
 				return false;
 			}
-			sy = (struct chan){in->planes[0] + (size_t)h * hw, in->pitches[0], 1, hw, H};
-			su = (struct chan){in->planes[1] + (size_t)h * hw, in->pitches[1], 2, hw / 2, H / 2};
+			sy = (struct u_stereo_camera_chan){in->planes[0] + (size_t)h * hw, in->pitches[0], 1, hw, H};
+			su = (struct u_stereo_camera_chan){in->planes[1] + (size_t)h * hw, in->pitches[1], 2, hw / 2,
+			                                   H / 2};
 			sv = su;
 			sv.base += 1;
 		} else if (in->pixel == U_STEREO_UVC_PIXEL_YUY2) {
 			const uint8_t *p = in->planes[0] + (size_t)h * hw * 2;
-			sy = (struct chan){p, in->pitches[0], 2, hw, H};
-			su = (struct chan){p + 1, in->pitches[0], 4, hw / 2, H};
-			sv = (struct chan){p + 3, in->pitches[0], 4, hw / 2, H};
+			sy = (struct u_stereo_camera_chan){p, in->pitches[0], 2, hw, H};
+			su = (struct u_stereo_camera_chan){p + 1, in->pitches[0], 4, hw / 2, H};
+			sv = (struct u_stereo_camera_chan){p + 3, in->pitches[0], 4, hw / 2, H};
 		} else {
 			return false;
 		}
 		uint8_t *yb = dst + dst_layout->offset[0] + (size_t)e * eye_w;
 		uint8_t *uvb = dst + dst_layout->offset[1] + (size_t)e * eye_w; // eye_w bytes = eye_w/2 UV pairs
-		struct dchan dy = {yb, dst_layout->pitch[0], 1, eye_w, eye_h};
-		struct dchan du = {uvb, dst_layout->pitch[1], 2, eye_w / 2, eye_h / 2};
-		struct dchan dv = {uvb + 1, dst_layout->pitch[1], 2, eye_w / 2, eye_h / 2};
-		if (!resample(&sy, &dy) || !resample(&su, &du) || !resample(&sv, &dv)) {
+		struct u_stereo_camera_dchan dy = {yb, dst_layout->pitch[0], 1, eye_w, eye_h};
+		struct u_stereo_camera_dchan du = {uvb, dst_layout->pitch[1], 2, eye_w / 2, eye_h / 2};
+		struct u_stereo_camera_dchan dv = {uvb + 1, dst_layout->pitch[1], 2, eye_w / 2, eye_h / 2};
+		if (!u_stereo_camera_resample(&sy, &dy) || !u_stereo_camera_resample(&su, &du) ||
+		    !u_stereo_camera_resample(&sv, &dv)) {
 			return false;
 		}
 	}

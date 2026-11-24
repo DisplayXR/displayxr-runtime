@@ -1212,6 +1212,36 @@ oxr_xrAcquireStereoCameraFrameDXR(XrStereoCameraStreamDXR stream, XrStereoCamera
 //! OpenXR API function @ep{xrGetStereoCameraStreamStatsDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetStereoCameraStreamStatsDXR(XrStereoCameraStreamDXR stream, XrStereoCameraStreamStatsDXR *stats);
+
+//! OpenXR API function @ep{xrEnumerateStereoCameraModesDXR} (spec v8)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateStereoCameraModesDXR(XrInstance instance,
+                                    uint64_t cameraId,
+                                    uint32_t capacityInput,
+                                    uint32_t *countOutput,
+                                    XrStereoCameraModeDXR *modes);
+
+//! OpenXR API function @ep{xrSetStereoCameraControlsDXR} (spec v8)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetStereoCameraControlsDXR(XrStereoCameraStreamDXR stream, const XrStereoCameraControlsDXR *controls);
+
+//! OpenXR API function @ep{xrReleaseStereoCameraControlsDXR} (spec v8)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrReleaseStereoCameraControlsDXR(XrStereoCameraStreamDXR stream);
+
+//! OpenXR API function @ep{xrRequestStereoCameraStillDXR} (spec v8)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestStereoCameraStillDXR(XrStereoCameraStreamDXR stream,
+                                  const XrStereoCameraStillRequestDXR *request,
+                                  uint64_t *requestId);
+
+//! OpenXR API function @ep{xrAcquireStereoCameraStillDXR} (spec v8)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireStereoCameraStillDXR(XrStereoCameraStreamDXR stream, uint64_t requestId, XrStereoCameraStillDXR *still);
+
+//! OpenXR API function @ep{xrReleaseStereoCameraStillDXR} (spec v8)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrReleaseStereoCameraStillDXR(XrStereoCameraStreamDXR stream, uint64_t requestId);
 #endif
 
 #ifdef OXR_HAVE_DXR_desktop_control

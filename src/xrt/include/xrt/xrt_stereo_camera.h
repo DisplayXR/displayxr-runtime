@@ -269,6 +269,108 @@ struct xrt_stereo_camera_stream_request
 	uint32_t format;    //!< enum xrt_stereo_camera_format
 	uint32_t transport; //!< enum xrt_stereo_camera_transport
 	float max_frame_rate;
+	//! Spec v8: the stream's mode (per-eye size of a STREAM mode); 0 x 0 = the default mode.
+	uint32_t eye_width;
+	uint32_t eye_height;
+};
+
+/*
+ *
+ * Spec v8: modes, controls, capture state, stills (spec §5.5 - §5.7).
+ *
+ */
+
+//! Most modes one camera lists (service-side cap).
+#define XRT_STEREO_CAMERA_MAX_MODES 16
+
+//! xrt_stereo_camera_mode::flags (= XrStereoCameraModeFlagsDXR).
+#define XRT_STEREO_CAMERA_MODE_DEFAULT (1u << 0)
+#define XRT_STEREO_CAMERA_MODE_STREAM (1u << 1)
+#define XRT_STEREO_CAMERA_MODE_STILL (1u << 2)
+
+//! One capture mode (XrStereoCameraModeDXR).
+struct xrt_stereo_camera_mode
+{
+	uint32_t eye_width;
+	uint32_t eye_height;
+	float max_frame_rate;
+	uint32_t flags; //!< XRT_STEREO_CAMERA_MODE_*
+};
+
+//! A camera's modes, as one wire struct (`stereo_camera_get_modes`).
+struct xrt_stereo_camera_mode_list
+{
+	uint32_t count;
+	uint32_t reserved;
+	struct xrt_stereo_camera_mode modes[XRT_STEREO_CAMERA_MAX_MODES];
+};
+
+/*!
+ * XrStereoCameraControlCapabilitiesDXR. Bit values equal the plug-in's
+ * XRT_PLUGIN_STEREO_CAMERA_CONTROL_* and the XR ones.
+ */
+struct xrt_stereo_camera_control_caps
+{
+	uint32_t supported_controls;
+	uint32_t supported_focus_modes; //!< bit (1 << focus mode)
+	float min_focus_distance_diopters;
+	uint32_t focus_distance_calibration;
+	float exposure_compensation_min_ev;
+	float exposure_compensation_max_ev;
+	float exposure_compensation_step_ev;
+	uint32_t reserved;
+};
+
+//! XrStereoCameraControlsDXR (a partial update: only valid_controls fields apply).
+struct xrt_stereo_camera_controls
+{
+	uint32_t valid_controls;
+	uint32_t focus_mode;
+	float focus_distance_diopters;
+	float metering_x, metering_y; //!< normalised in the LEFT eye of the stream's output
+	float exposure_compensation_ev;
+};
+
+/*!
+ * XrStereoCameraCaptureResultDXR; times on the os_monotonic clock (the state
+ * tracker converts). valid_fields 0 = nothing known.
+ */
+struct xrt_stereo_camera_capture_result
+{
+	uint32_t valid_fields; //!< = XrStereoCameraCaptureResultFlagsDXR bits
+	float focus_distance_diopters;
+	uint32_t focus_state;
+	uint32_t sensitivity_iso;
+	int64_t exposure_time_ns;
+	int64_t eye_time_ns[2];
+};
+
+//! XrStereoCameraStillRequestDXR.
+struct xrt_stereo_camera_still_request
+{
+	uint32_t eye_width; //!< 0 x 0 = the largest still size
+	uint32_t eye_height;
+	uint32_t output; //!< enum xrt_stereo_camera_output
+	uint32_t format; //!< enum xrt_stereo_camera_format
+};
+
+//! One delivered still (XrStereoCameraStillDXR + its chained structs).
+struct xrt_stereo_camera_still_info
+{
+	uint64_t request_id;
+	uint32_t width; //!< full SBS
+	uint32_t height;
+	uint32_t format;
+	uint32_t output;
+	uint32_t row_pitch[2];
+	uint64_t plane_offset[2];
+	uint64_t section_size;
+	int64_t capture_time_ns;
+	uint32_t time_is_exposure;
+	uint32_t reserved;
+	struct xrt_stereo_camera_capture_result result;
+	//! The calibration of exactly these pixels (for its output).
+	struct xrt_stereo_camera_calibration calibration;
 };
 
 /*!
@@ -346,6 +448,8 @@ enum xrt_stereo_camera_event_kind
 	XRT_STEREO_CAMERA_EVENT_CAMERA_STATE = 1,    //!< XrEventDataStereoCameraStateChangedDXR
 	XRT_STEREO_CAMERA_EVENT_STREAM_ENDED = 2,    //!< XrEventDataStereoCameraStreamEndedDXR
 	XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED = 3, //!< XrEventDataStereoCamerasChangedDXR
+	XRT_STEREO_CAMERA_EVENT_STILL_READY = 4,     //!< XrEventDataStereoCameraStillReadyDXR (v8)
+	XRT_STEREO_CAMERA_EVENT_STILL_FAILED = 5,    //!< XrEventDataStereoCameraStillFailedDXR (v8)
 };
 
 //! Why the service ended a stream (= XrStereoCameraStreamEndReasonDXR).
@@ -368,7 +472,10 @@ struct xrt_stereo_camera_event
 	uint32_t kind;  //!< enum xrt_stereo_camera_event_kind
 	uint32_t value; //!< CAMERA_STATE: the state; STREAM_ENDED: the reason
 	uint64_t camera_id;
-	uint64_t stream_id; //!< STREAM_ENDED only
+	uint64_t stream_id;  //!< STREAM_ENDED, STILL_*
+	uint64_t request_id; //!< STILL_* (v8)
+	int32_t result;      //!< STILL_FAILED: the xrt_result_t why (v8)
+	uint32_t reserved;
 };
 
 //! `stereo_camera_control` ops (DIAG clients and the service's own UI only).
@@ -397,9 +504,12 @@ struct xrt_stereo_camera_client
 	xrt_result_t (*get_properties)(struct xrt_stereo_camera_client *c,
 	                               uint32_t index,
 	                               struct xrt_stereo_camera_properties *out_props);
+	//! @p eye_width x @p eye_height: the mode the numbers describe (v8); 0 x 0 = the default mode.
 	xrt_result_t (*get_calibration)(struct xrt_stereo_camera_client *c,
 	                                uint64_t camera_id,
 	                                uint32_t output,
+	                                uint32_t eye_width,
+	                                uint32_t eye_height,
 	                                struct xrt_stereo_camera_calibration *out_calib);
 	xrt_result_t (*stream_create)(struct xrt_stereo_camera_client *c,
 	                              const struct xrt_stereo_camera_stream_request *req,
@@ -416,13 +526,14 @@ struct xrt_stereo_camera_client
 	/*!
 	 * @p out_ready false = nothing newer than the last acquire. @p out_app
 	 * (may be NULL): the frame's XR_DXR_app_share metadata (valid = 0 for a
-	 * camera frame).
+	 * camera frame). @p out_result (may be NULL): the frame's capture state (v8).
 	 */
 	xrt_result_t (*acquire)(struct xrt_stereo_camera_client *c,
 	                        uint64_t stream_id,
 	                        bool *out_ready,
 	                        struct xrt_stereo_camera_frame_info *out_frame,
-	                        struct xrt_app_share_frame_info *out_app);
+	                        struct xrt_app_share_frame_info *out_app,
+	                        struct xrt_stereo_camera_capture_result *out_result);
 	//! ADR-061: the XR_DXR_app_share description of APP_CONTENT entry @p camera_id.
 	xrt_result_t (*get_app_source)(struct xrt_stereo_camera_client *c,
 	                               uint64_t camera_id,
@@ -436,6 +547,29 @@ struct xrt_stereo_camera_client
 	                           struct xrt_stereo_camera_event *out_event);
 	//! R3: enum xrt_stereo_camera_control_op (DIAG clients only).
 	xrt_result_t (*control)(struct xrt_stereo_camera_client *c, uint32_t op, uint32_t arg, uint32_t *out_value);
+
+	// Spec v8.
+	xrt_result_t (*get_modes)(struct xrt_stereo_camera_client *c,
+	                          uint64_t camera_id,
+	                          struct xrt_stereo_camera_mode_list *out_modes);
+	xrt_result_t (*get_control_caps)(struct xrt_stereo_camera_client *c,
+	                                 uint64_t camera_id,
+	                                 struct xrt_stereo_camera_control_caps *out_caps);
+	xrt_result_t (*set_controls)(struct xrt_stereo_camera_client *c,
+	                             uint64_t stream_id,
+	                             const struct xrt_stereo_camera_controls *controls);
+	xrt_result_t (*release_controls)(struct xrt_stereo_camera_client *c, uint64_t stream_id);
+	xrt_result_t (*request_still)(struct xrt_stereo_camera_client *c,
+	                              uint64_t stream_id,
+	                              const struct xrt_stereo_camera_still_request *req,
+	                              uint64_t *out_request_id);
+	//! @p out_section is a NEW read-only handle owned by the caller.
+	xrt_result_t (*acquire_still)(struct xrt_stereo_camera_client *c,
+	                              uint64_t stream_id,
+	                              uint64_t request_id,
+	                              struct xrt_stereo_camera_still_info *out_info,
+	                              xrt_shmem_handle_t *out_section);
+	xrt_result_t (*release_still)(struct xrt_stereo_camera_client *c, uint64_t stream_id, uint64_t request_id);
 };
 
 #ifdef __cplusplus
