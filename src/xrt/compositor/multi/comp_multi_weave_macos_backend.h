@@ -210,6 +210,14 @@ comp_multi_weave_macos_segs_window(const struct multi_compositor *mc, struct com
 void
 comp_multi_weave_macos_segs_log(struct multi_compositor *mc, const struct comp_segment_table *t, bool split);
 
+/*!
+ * ADR-047 Amendment 10: publish what this submit decided for the IPC main loop
+ * — whether a placed window is woven, and the effective rendering-mode table
+ * its apps are told (NULL = invalid: the head's table). Holding mc->weave.mutex.
+ */
+void
+comp_multi_weave_macos_publish(struct multi_compositor *mc, bool weaves, const struct xrt_effective_mode_table *eff);
+
 extern const struct comp_multi_weave_macos_backend comp_multi_weave_macos_backend_vk;
 
 #ifdef COMP_MULTI_WEAVE_HAVE_METAL

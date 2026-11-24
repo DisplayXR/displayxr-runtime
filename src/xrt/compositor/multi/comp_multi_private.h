@@ -22,6 +22,7 @@
 #include "xrt/xrt_weave_dmabuf.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_processor.h"
+#include "xrt/xrt_device.h" // ADR-047 Amendment 10: struct xrt_rendering_mode (the head's slots)
 
 #include "os/os_time.h"
 #include "os/os_threading.h"
@@ -790,6 +791,21 @@ struct multi_compositor
 		bool segs_split;                              //!< the last submit was woven per screen
 		uint64_t segs_logged_key;                     //!< what the last WARN described (change-only)
 		//! @}
+
+		/*!
+		 * @name The view size follows the window's screen (ADR-047 Amendment 10)
+		 * The desktop-Linux block's twin: the head's two slots (set by the IPC
+		 * server before each submit) and the effective table the last submit
+		 * published for the IPC main loop. @ref pub_mutex is a leaf.
+		 * @{
+		 */
+		struct xrt_rendering_mode head_modes[2];
+		uint32_t head_mode_count;
+		bool pub_mutex_initialized;
+		struct os_mutex pub_mutex;
+		bool pub_weaves;
+		struct xrt_effective_mode_table pub_eff;
+		//! @}
 	} weave;
 #endif
 
@@ -1241,6 +1257,27 @@ struct multi_compositor
 		int segs_frame;                               //!< last enum comp_weave_frame (-1 = none yet)
 		bool segs_split;                              //!< the last submit was woven per screen
 		uint64_t segs_logged_key;                     //!< what the last WARN described (change-only)
+		//! @}
+
+		/*!
+		 * @name The view size follows the window's screen (ADR-047 Amendment 10)
+		 * The head device's two slots (set by the IPC server before each
+		 * submit: the per-client mc has no xsysd out-of-process), and what
+		 * the last submit published for the session's OTHER readers — the
+		 * IPC main loop (the effective table into every client's shared
+		 * memory) and a locating session's frame (the per-screen table with
+		 * each screen's eyes). @ref pub_mutex is a leaf (taken with
+		 * global_state.lock held, never the other way round).
+		 * @{
+		 */
+		struct xrt_rendering_mode head_modes[2];
+		uint32_t head_mode_count;
+		bool pub_mutex_initialized;
+		struct os_mutex pub_mutex;
+		bool pub_weaves;                         //!< a placed window this engine weaves
+		uint64_t pub_window_id;                  //!< the bound window's id (0 on Wayland)
+		struct xrt_effective_mode_table pub_eff; //!< the table its window's apps are told
+		struct xrt_segment_metrics pub_segs;     //!< the last per-screen table (count 0 = one DP)
 		//! @}
 		uint64_t slot_clock;    //!< LRU tick, bumped per lookup.
 		bool size_probe_warned; //!< One-shot: lseek could not size an opaque fd.
@@ -2048,6 +2085,16 @@ comp_multi_weave_macos_window_on_panel(struct multi_compositor *mc,
 void
 comp_multi_weave_macos_set_capture_tag(struct xrt_compositor *xc, const char *tag);
 
+/*!
+ * ADR-047 Amendment 10: the head device's presented table (its two slots), set
+ * by the IPC handler before every submit (the desktop-Linux twin:
+ * comp_multi_weave_linux_set_head_modes).
+ */
+void
+comp_multi_weave_macos_set_head_modes(struct xrt_compositor *xc,
+                                      const struct xrt_rendering_mode *modes,
+                                      uint32_t count);
+
 #ifdef COMP_MULTI_WEAVE_HAVE_METAL
 /*!
  * The Metal weave backend DP's predicted eyes, read inside an autorelease
@@ -2184,8 +2231,53 @@ comp_multi_weave_linux_set_overlay_hints(struct xrt_compositor *xc, bool overlay
  */
 void
 comp_multi_weave_linux_set_capture_tag(struct xrt_compositor *xc, const char *tag);
+
+/*!
+ * ADR-047 Amendment 10: the head device's presented table (its two slots),
+ * set by the IPC handler before every submit — the engine needs it to tell a
+ * window on the session screen apart (the head's table stands) and to fill a
+ * straddle that covers the session screen.
+ */
+void
+comp_multi_weave_linux_set_head_modes(struct xrt_compositor *xc,
+                                      const struct xrt_rendering_mode *modes,
+                                      uint32_t count);
 /*! @} */
 #endif // XRT_OS_LINUX_DESKTOP
+
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
+struct u_weave_window_key;
+
+/*!
+ * ADR-047 Amendment 10 over IPC: what this session's weave engine published
+ * at its last submit, read by the IPC server's main loop (with
+ * global_state.lock held: leaf locks only). @p out_key is the bound window,
+ * @p out_table the rendering-mode table that window's apps are told (invalid
+ * while it is wholly on the session screen). @return true when this session
+ * weaves a placed window (its table is authoritative for it).
+ */
+bool
+comp_multi_weave_get_published_table(struct xrt_compositor *xc,
+                                     struct u_weave_window_key *out_key,
+                                     struct xrt_effective_mode_table *out_table);
+
+/*!
+ * The per-screen table of this session's last weave, each screen's eyes as of
+ * that weave (count 0 = woven by one DP / no weave), and the bound window.
+ * Leaf locks only. @return true when @p out has segments.
+ */
+bool
+comp_multi_weave_get_published_segments(struct xrt_compositor *xc,
+                                        struct u_weave_window_key *out_key,
+                                        struct xrt_segment_metrics *out);
+
+/*!
+ * The window this session is bound to (its own bind / geometry calls),
+ * whether or not it weaves. Leaf locks only.
+ */
+bool
+comp_multi_weave_get_window_key(struct xrt_compositor *xc, struct u_weave_window_key *out_key);
+#endif
 
 bool
 comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,

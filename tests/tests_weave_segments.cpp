@@ -16,6 +16,7 @@
 #include "util/comp_segments.h"
 #include "util/u_canvas.h"
 #include "util/u_weave_rect_parts.h"
+#include "util/u_weave_peer.h"
 
 #include "oxr_segment_views.h"
 
@@ -27,6 +28,7 @@
 #include "catch_amalgamated.hpp"
 
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 
 namespace {
@@ -570,5 +572,189 @@ TEST_CASE("weave segments: weave_get_segments carries the table and every screen
 	CHECK(left.screen_id == PRIMARY_ID);
 	CHECK(left.eyes.eyes[0].x == Catch::Approx(-0.032f));
 	CHECK(wire.metrics.generation == 9);
+}
+#endif
+
+
+/*
+ * ADR-047 Amendment 4 addendum on desktop Linux / Amendment 10 over IPC
+ * (u_weave_peer.h): the session that LOCATES and ENUMERATES (the browser
+ * process) is not the one that WEAVES (the GPU process); both are bound to the
+ * same window. And the bug class runtime #2757 fixed in-process: a part on a
+ * screen that does not track takes THAT screen's eyes, never the 3D panel's
+ * camera.
+ */
+namespace {
+
+/*
+ * The two-screen Linux box: the 3D panel (primary, its DP tracks the viewer)
+ * and the laptop screen to its right, whose DP (sim-display, "Anaglyph" or
+ * "Same as 2D") does not track - its eyes are its nominal viewer.
+ */
+xrt_segment_metrics
+panel_and_laptop(const comp_seg_rect &win, comp_segments_screen screens[2])
+{
+	two_screens(screens);
+	xrt_segment_metrics m = publish(win, screens, 2);
+	with_geometry(m, screens, 2);
+	for (uint32_t k = 0; k < m.count; k++) {
+		// The panel's camera follows the head (x = +0.21 m: the user leaned
+		// right); the laptop's DP reports its nominal viewer, not tracking.
+		xrt_eye_positions &e = m.seg[k].eyes;
+		if (m.seg[k].is_primary) {
+			e.is_tracking = true;
+			e.eyes[0].x = 0.21f - 0.032f;
+			e.eyes[1].x = 0.21f + 0.032f;
+		} else {
+			e.is_tracking = false;
+			e.eyes[0].x = -0.032f;
+			e.eyes[1].x = 0.032f;
+			e.eyes[0].z = e.eyes[1].z = 0.65f;
+		}
+	}
+	return m;
+}
+
+} // namespace
+
+TEST_CASE("weave peer: a window wholly on the laptop screen is framed from the laptop's own (nominal) eyes")
+{
+	comp_segments_screen screens[2];
+	const comp_seg_rect win = {2100, 100, 1000, 600}; // wholly right of the seam at x 1920
+	const xrt_segment_metrics m = panel_and_laptop(win, screens);
+	REQUIRE(m.count == 1); // a window wholly on a non-primary screen is still per screen
+	REQUIRE_FALSE(m.seg[0].is_primary);
+
+	// A plain (whole-window) locate and an element locate both re-frame.
+	u_weave_reframe rf;
+	REQUIRE(u_weave_locate_reframe(&m, NULL, win.w, win.h, &rf));
+	CHECK(rf.screen_id == SECOND_ID);
+	CHECK_FALSE(rf.eyes.is_tracking); // NOT the panel's tracked camera
+	CHECK(rf.eyes.eyes[0].x == Catch::Approx(-0.032f));
+	CHECK(rf.eyes.eyes[1].x == Catch::Approx(0.032f));
+	CHECK(rf.nominal_viewer_z_m == Catch::Approx(0.65f));
+	CHECK(rf.pitch_x_m == Catch::Approx(PANEL_W_M / 1920.0f));
+	CHECK(rf.wm.display_screen_left == 1920);
+	CHECK(rf.wm.window_width_m == Catch::Approx(1000.0f * PANEL_W_M / 1920.0f));
+
+	const xrt_rect zone = xr(100, 100, 300, 200);
+	REQUIRE(u_weave_locate_reframe(&m, &zone, win.w, win.h, &rf));
+	CHECK(rf.screen_id == SECOND_ID);
+	CHECK_FALSE(rf.eyes.is_tracking);
+}
+
+TEST_CASE("weave peer: an element on the panel part of a straddling window keeps the session framing")
+{
+	comp_segments_screen screens[2];
+	const comp_seg_rect win = {1400, 100, 1000, 600}; // seam at window x 520
+	const xrt_segment_metrics m = panel_and_laptop(win, screens);
+	REQUIRE(m.count == 2);
+	u_weave_reframe rf;
+	// On the panel: the session DP's (tracked) eyes stay - correct there.
+	const xrt_rect on_panel = xr(50, 50, 200, 200);
+	CHECK_FALSE(u_weave_locate_reframe(&m, &on_panel, win.w, win.h, &rf));
+	// The whole window straddles: one view set, the session framing.
+	CHECK_FALSE(u_weave_locate_reframe(&m, NULL, win.w, win.h, &rf));
+	// On the laptop part: the laptop's eyes.
+	const xrt_rect on_laptop = xr(700, 50, 200, 200);
+	REQUIRE(u_weave_locate_reframe(&m, &on_laptop, win.w, win.h, &rf));
+	CHECK(rf.screen_id == SECOND_ID);
+	CHECK_FALSE(rf.eyes.is_tracking);
+}
+
+TEST_CASE("weave peer: no reframe without that screen's eyes, a table, or at a resize in flight")
+{
+	comp_segments_screen screens[2];
+	const comp_seg_rect win = {2100, 100, 1000, 600};
+	xrt_segment_metrics m = panel_and_laptop(win, screens);
+	u_weave_reframe rf;
+	CHECK_FALSE(u_weave_locate_reframe(&m, NULL, win.w + 10, win.h, &rf)); // resize in flight
+	xrt_segment_metrics none;
+	std::memset(&none, 0, sizeof(none));
+	CHECK_FALSE(u_weave_locate_reframe(&none, NULL, win.w, win.h, &rf)); // one DP: no table
+	m.seg[0].have_eyes = false; // its DP is not up yet (the lifecycle hysteresis)
+	CHECK_FALSE(u_weave_locate_reframe(&m, NULL, win.w, win.h, &rf));
+}
+
+TEST_CASE("weave peer: the same window, named or by its rect")
+{
+	u_weave_window_key a = {true, 0x4a00007u, 100, 200, 1280, 720};
+	u_weave_window_key b = a;
+	CHECK(u_weave_window_key_same(&a, &b));
+	b.window_id = 0x4a00009u; // another named window
+	CHECK_FALSE(u_weave_window_key_same(&a, &b));
+	// Native Wayland: unnamed, matched by the identical rect.
+	a.window_id = 0;
+	b.window_id = 0;
+	CHECK(u_weave_window_key_same(&a, &b));
+	b.x = 101;
+	CHECK_FALSE(u_weave_window_key_same(&a, &b));
+	b = a;
+	b.valid = false;
+	CHECK_FALSE(u_weave_window_key_same(&a, &b));
+	a.w = a.h = 0;
+	b = a;
+	CHECK_FALSE(u_weave_window_key_same(&a, &b)); // an empty rect matches nothing
+}
+
+TEST_CASE("weave peer: the enumerating session is told its weaving session's table")
+{
+	u_weave_table_source browser;
+	std::memset(&browser, 0, sizeof(browser));
+	browser.key = {true, 0x4a00007u, 2100, 100, 1000, 600};
+	browser.weaves = false; // locates + enumerates, weaves nothing
+
+	u_weave_table_source peers[2];
+	std::memset(peers, 0, sizeof(peers));
+	peers[0].key = {true, 0x5b00001u, 0, 0, 800, 600}; // another app's window
+	peers[0].weaves = true;
+	peers[0].table.valid = true;
+	peers[0].table.majority_screen_id = PRIMARY_ID;
+	peers[1].key = browser.key; // the browser's GPU process
+	peers[1].weaves = true;
+	peers[1].table.valid = true;
+	peers[1].table.majority_screen_id = SECOND_ID;
+	peers[1].table.slot[1].view_count = 2;
+	std::snprintf(peers[1].table.slot[1].mode_name, XRT_EFFECTIVE_MODE_NAME_MAX, "Anaglyph");
+
+	xrt_effective_mode_table out;
+	CHECK(u_weave_pick_effective_table(&browser, peers, 2, &out) == 1);
+	CHECK(out.valid);
+	CHECK(out.majority_screen_id == SECOND_ID);
+	CHECK(std::strcmp(out.slot[1].mode_name, "Anaglyph") == 0);
+
+	// Back on the panel the weaving session's table is invalid - and so is
+	// the browser's (the head's table stands), not some other window's.
+	peers[1].table.valid = false;
+	CHECK(u_weave_pick_effective_table(&browser, peers, 2, &out) == 1);
+	CHECK_FALSE(out.valid);
+
+	// The weaving session itself: its own table.
+	CHECK(u_weave_pick_effective_table(&peers[1], peers, 2, &out) == -1);
+	CHECK_FALSE(out.valid);
+
+	// No session weaves this window: invalid.
+	peers[1].key.window_id = 0x6c00002u;
+	CHECK(u_weave_pick_effective_table(&browser, peers, 2, &out) == -1);
+	CHECK_FALSE(out.valid);
+}
+
+#ifdef DXR_TESTS_HAVE_IPC_PROTOCOL
+TEST_CASE("weave peer: each client's effective table rides its own shared memory")
+{
+	// Per client, by value: the generation is written last and moves on a change.
+	ipc_shared_memory *ism = new ipc_shared_memory();
+	std::memset(ism, 0, sizeof(*ism));
+	xrt_effective_mode_table t;
+	std::memset(&t, 0, sizeof(t));
+	t.valid = true;
+	t.majority_screen_id = SECOND_ID;
+	t.slot[0].view_count = 1;
+	t.slot[1].view_count = 2;
+	ism->hmd.effective_table = t;
+	ism->hmd.effective_table_generation = ism->hmd.effective_table_generation + 1;
+	CHECK(ism->hmd.effective_table_generation == 1u);
+	CHECK(std::memcmp(&ism->hmd.effective_table, &t, sizeof(t)) == 0);
+	delete ism;
 }
 #endif

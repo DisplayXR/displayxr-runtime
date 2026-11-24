@@ -1315,6 +1315,17 @@ main_loop(struct ipc_server *s)
 						shm_copy_rendering_modes(s->isms[ci], head);
 					}
 					s->isms[ci]->hmd.active_rendering_mode_index = mode_idx;
+					// ADR-047 Amendment 10: this client's own table - its
+					// window's screen(s). Written only when it changed, the
+					// generation last; a memcmp per client per tick otherwise.
+					struct xrt_effective_mode_table eff;
+					ipc_server_client_effective_table(s, &s->threads[ci].ics, &eff);
+					struct ipc_shared_memory *ism = s->isms[ci];
+					if (memcmp(&eff, &ism->hmd.effective_table, sizeof(eff)) != 0) {
+						ism->hmd.effective_table = eff;
+						ism->hmd.effective_table_generation =
+						    ism->hmd.effective_table_generation + 1;
+					}
 				}
 			}
 			os_mutex_unlock(&s->global_state.lock);

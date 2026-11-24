@@ -796,6 +796,19 @@ unsigned long
 ipc_server_get_orchestrator_workspace_pid(void);
 
 /*!
+ * ADR-047 Amendment 10 over IPC: the rendering-mode table client @p ics's app
+ * is told - computed from where its window is (its own weave engine's /
+ * per-client segment manager's table, else that of a session weaving the same
+ * window). Invalid = the head's table. Called by the main loop with
+ * global_state.lock held: leaf compositor locks only.
+ */
+struct xrt_effective_mode_table;
+void
+ipc_server_client_effective_table(struct ipc_server *s,
+                                  volatile struct ipc_client_state *ics,
+                                  struct xrt_effective_mode_table *out);
+
+/*!
  * #960: class-verification provider. The IPC server verifies a client's declared
  * class (enum xrt_client_class) at describe_client. Two claims need facts only
  * the service target owns (registry / install dir), so they are delegated:

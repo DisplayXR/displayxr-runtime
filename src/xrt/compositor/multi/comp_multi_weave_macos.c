@@ -82,6 +82,7 @@
 
 #include "util/comp_segments.h"
 #include "util/comp_weave_screens.h" // #2218 item 6: the window against the screens (CG frame)
+#include "util/u_weave_peer.h"       // ADR-047 Amendment 10: the window key for the IPC main loop
 
 #ifdef XRT_OS_MACOS
 
@@ -111,6 +112,10 @@ weave_ensure_mutex(struct multi_compositor *mc)
 	if (!mc->weave.mutex_initialized) {
 		os_mutex_init(&mc->weave.mutex);
 		mc->weave.mutex_initialized = true;
+	}
+	if (!mc->weave.pub_mutex_initialized) {
+		os_mutex_init(&mc->weave.pub_mutex); // ADR-047 Amendment 10: the published copies
+		mc->weave.pub_mutex_initialized = true;
 	}
 	os_mutex_unlock(&mc->msc->list_and_timing_lock);
 }
@@ -1296,6 +1301,118 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 	os_mutex_unlock(&mc->weave.mutex);
 	os_mutex_destroy(&mc->weave.mutex);
 	mc->weave.mutex_initialized = false;
+	if (mc->weave.pub_mutex_initialized) {
+		os_mutex_destroy(&mc->weave.pub_mutex);
+		mc->weave.pub_mutex_initialized = false;
+	}
+}
+
+/*
+ *
+ * ADR-047 Amendment 10: the view size follows the window's screen.
+ *
+ */
+
+void
+comp_multi_weave_macos_set_head_modes(struct xrt_compositor *xc, const struct xrt_rendering_mode *modes, uint32_t count)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	const uint32_t n = (modes != NULL && count > 0) ? (count < 2 ? count : 2) : 0;
+	for (uint32_t i = 0; i < n; i++) {
+		mc->weave.head_modes[i] = modes[i];
+	}
+	mc->weave.head_mode_count = n;
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+void
+comp_multi_weave_macos_publish(struct multi_compositor *mc, bool weaves, const struct xrt_effective_mode_table *eff)
+{
+	if (mc == NULL || !mc->weave.pub_mutex_initialized) {
+		return;
+	}
+	os_mutex_lock(&mc->weave.pub_mutex);
+	mc->weave.pub_weaves = weaves;
+	if (eff != NULL) {
+		mc->weave.pub_eff = *eff;
+	} else {
+		U_ZERO(&mc->weave.pub_eff);
+	}
+	os_mutex_unlock(&mc->weave.pub_mutex);
+}
+
+//! The bound window (read unlocked: a torn read during a drag costs one tick of a stale match).
+static void
+weave_window_key(const struct multi_compositor *mc, struct u_weave_window_key *out)
+{
+	U_ZERO(out);
+	out->valid = mc->weave.have_geometry && mc->weave.win_w > 0 && mc->weave.win_h > 0;
+	out->window_id = mc->weave.window_id;
+	out->x = mc->weave.win_x;
+	out->y = mc->weave.win_y;
+	out->w = mc->weave.win_w;
+	out->h = mc->weave.win_h;
+}
+
+bool
+comp_multi_weave_get_window_key(struct xrt_compositor *xc, struct u_weave_window_key *out_key)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (out_key == NULL) {
+		return false;
+	}
+	U_ZERO(out_key);
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	weave_window_key(mc, out_key);
+	return out_key->valid;
+}
+
+bool
+comp_multi_weave_get_published_table(struct xrt_compositor *xc,
+                                     struct u_weave_window_key *out_key,
+                                     struct xrt_effective_mode_table *out_table)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (out_key == NULL || out_table == NULL) {
+		return false;
+	}
+	U_ZERO(out_key);
+	U_ZERO(out_table);
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	weave_window_key(mc, out_key);
+	if (!mc->weave.pub_mutex_initialized) {
+		return false;
+	}
+	os_mutex_lock(&mc->weave.pub_mutex);
+	const bool weaves = mc->weave.pub_weaves;
+	*out_table = mc->weave.pub_eff;
+	os_mutex_unlock(&mc->weave.pub_mutex);
+	return weaves && out_key->valid;
+}
+
+bool
+comp_multi_weave_get_published_segments(struct xrt_compositor *xc,
+                                        struct u_weave_window_key *out_key,
+                                        struct xrt_segment_metrics *out)
+{
+	// The macOS service frames a present-owner's locates from the panel
+	// (comp_multi_weave_macos_window_on_panel); no per-screen locate yet.
+	if (out_key != NULL) {
+		(void)comp_multi_weave_get_window_key(xc, out_key);
+	}
+	if (out != NULL) {
+		U_ZERO(out);
+	}
+	return false;
 }
 
 #endif // XRT_OS_MACOS

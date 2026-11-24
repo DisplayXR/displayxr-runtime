@@ -18,6 +18,7 @@
 #include "util/u_canvas.h" // XR_DXR_display_zones P5: zone-scoped locate rebase
 #include "util/u_snap_grid.h" // XR_DXR_weave v11: bulk grid snap (#1723)
 #include "util/u_weave_rect_parts.h" // ADR-047 Amendment 4 addendum: per-screen element views
+#include "util/u_weave_peer.h"       // ... and a present-owner's window from its other sessions
 #include "util/u_cursor_depth.h"      // XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4)
 
 #include "server/ipc_server.h"
@@ -187,6 +188,70 @@ unsigned long
 ipc_server_get_orchestrator_workspace_pid(void)
 {
 	return get_orchestrator_workspace_pid();
+}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) ||                                                                      \
+    ((defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && defined(COMP_MULTI_HAVE_WEAVE))
+#define IPC_HAVE_EFFECTIVE_TABLE
+//! One client's published table + window, from whichever compositor this service runs.
+static void
+ipc_client_table_source(struct ipc_server *s, volatile struct ipc_client_state *ics, struct u_weave_table_source *out)
+{
+	memset(out, 0, sizeof(*out));
+	struct xrt_compositor *xc = (struct xrt_compositor *)ics->xc;
+	if (xc == NULL) {
+		return;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// The D3D11 service: a direct client's app window, a present-owner's bound
+	// window, or a workspace tile's footprint (ADR-052 D2).
+	out->weaves = comp_d3d11_service_get_published_table(s->xsysc, xc, &out->key, &out->table);
+#else
+	// A present-owner's weave engine (desktop Linux / macOS).
+	(void)s;
+	out->weaves = comp_multi_weave_get_published_table(xc, &out->key, &out->table);
+#endif
+}
+#endif
+
+void
+ipc_server_client_effective_table(struct ipc_server *s,
+                                  volatile struct ipc_client_state *ics,
+                                  struct xrt_effective_mode_table *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (s == NULL || ics == NULL || ics->xc == NULL) {
+		return;
+	}
+#ifdef IPC_HAVE_EFFECTIVE_TABLE
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || !comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		return;
+	}
+#endif
+	// Its own compositor's table when it is woven / located; else the table
+	// of the session weaving the same window (the DisplayXR Browser enumerates
+	// from its browser process and weaves from its GPU process).
+	struct u_weave_table_source self;
+	ipc_client_table_source(s, ics, &self);
+	if (self.weaves || !self.key.valid) {
+		(void)u_weave_pick_effective_table(&self, NULL, 0, out);
+		return;
+	}
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *other = &s->threads[i].ics;
+		if (other == ics || other->xc == NULL) {
+			continue;
+		}
+		struct u_weave_table_source src;
+		ipc_client_table_source(s, other, &src);
+		if (u_weave_pick_effective_table(&self, &src, 1, out) == 0) {
+			return;
+		}
+	}
+#else
+	(void)s;
+#endif
 }
 
 /*
@@ -1544,6 +1609,49 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 }
 #endif // XRT_HAVE_D3D11_SERVICE_COMPOSITOR
 
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(COMP_MULTI_HAVE_WEAVE)
+/*!
+ * ADR-047 Amendment 4 addendum on desktop Linux: the per-screen table (with
+ * each screen's eyes) of the last weave of the window session @p ics is bound
+ * to — its own weave first, then any session weaving the SAME window (the
+ * DisplayXR Browser locates from its browser process and weaves from its GPU
+ * process, both bound to its window). False when no weave of that window is
+ * per screen (every window on one screen: one DP).
+ */
+static bool
+ipc_weave_segments_for_window(volatile struct ipc_client_state *ics, struct xrt_segment_metrics *out)
+{
+	struct u_weave_window_key self_key;
+	if (comp_multi_weave_get_published_segments((struct xrt_compositor *)ics->xc, &self_key, out)) {
+		return true;
+	}
+	if (!self_key.valid) {
+		return false;
+	}
+	struct ipc_server *s = ics->server;
+	bool found = false;
+	// Every client's xc is detached under this lock before it is destroyed
+	// (#1988); the engines' published copies are behind a leaf mutex.
+	os_mutex_lock(&s->global_state.lock);
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS && !found; i++) {
+		volatile struct ipc_client_state *other = &s->threads[i].ics;
+		if (other == ics || other->xc == NULL) {
+			continue;
+		}
+		struct u_weave_window_key key;
+		if (comp_multi_weave_get_published_segments((struct xrt_compositor *)other->xc, &key, out) &&
+		    u_weave_window_key_same(&self_key, &key)) {
+			found = true;
+		}
+	}
+	os_mutex_unlock(&s->global_state.lock);
+	if (!found) {
+		memset(out, 0, sizeof(*out));
+	}
+	return found;
+}
+#endif
+
 #if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE) ||                              \
     defined(COMP_MULTI_SHARED_SURFACE)
 /*!
@@ -1744,6 +1852,63 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	}
 #endif
 
+	// ADR-047 Amendment 4 addendum on desktop Linux (the bug class runtime
+	// #2757 fixed in-process): a present-owner's window woven per screen. An
+	// inline element (a zone-scoped locate) or the whole window (a plain
+	// locate) that lies WHOLLY on a non-primary screen is framed against THAT
+	// screen: its own DP's eyes (nominal where it does not track, or its
+	// viewer-tracking provider) and its geometry — never this session's DP,
+	// whose eyes are the session screen's (the 3D panel's) camera. Straddling
+	// elements and everything on the primary keep the framing above.
+	bool reframed = false;
+	float reframe_pitch_m = 0.0f;
+	float reframe_nominal_z_m = 0.0f;
+	struct xrt_eye_positions reframe_eyes = {0};
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(COMP_MULTI_HAVE_WEAVE)
+	if (have_wm && wm.valid && wm.window_pixel_width > 0 && wm.window_pixel_height > 0) {
+		struct xrt_rect zone_rect;
+		const struct xrt_rect *zp = NULL;
+		if (rig != NULL && rig->zone_valid != 0 && rig->zone_w_px > 0 && rig->zone_h_px > 0) {
+			zone_rect.offset.w = rig->zone_x_px; // xrt_offset names its fields w/h
+			zone_rect.offset.h = rig->zone_y_px;
+			zone_rect.extent.w = rig->zone_w_px;
+			zone_rect.extent.h = rig->zone_h_px;
+			zp = &zone_rect;
+		}
+		struct xrt_segment_metrics wseg;
+		struct u_weave_reframe rf;
+		if (ipc_weave_segments_for_window(ics, &wseg) &&
+		    u_weave_locate_reframe(&wseg, zp, wm.window_pixel_width, wm.window_pixel_height, &rf)) {
+			reframed = true;
+			reframe_eyes = rf.eyes;
+			// ADR-054 N6 Part 2: that screen's viewer source - the provider,
+			// mapped into its display space, when the arbitration routed it there.
+			(void)ipc_viewer_override_eyes(ics, rf.screen_id, at_timestamp_ns, &reframe_eyes, true);
+			reframe_pitch_m = rf.pitch_x_m;
+			reframe_nominal_z_m = rf.nominal_viewer_z_m;
+			wm = rf.wm;
+			screen_width_m = wm.window_width_m;
+			screen_height_m = wm.window_height_m;
+			win_eye_offset_x = wm.window_center_offset_x_m;
+			win_eye_offset_y = wm.window_center_offset_y_m;
+			win_eye_offset_z = 0.0f;
+			// Change-only (never per frame): which screen locates were last
+			// re-framed onto. Not logged back (a page with elements on both
+			// screens would flip it every locate).
+			static uint64_t s_reframe_logged = 0;
+			if (rf.screen_id != s_reframe_logged) {
+				s_reframe_logged = rf.screen_id;
+				IPC_WARN(s,
+				         "multi-screen: %s wholly on screen 0x%016llx - views from that screen's eyes "
+				         "(tracking=%d) and geometry, not the session screen's (ADR-047 Amendment 4 "
+				         "addendum)",
+				         zp != NULL ? "element" : "window", (unsigned long long)rf.screen_id,
+				         (int)reframe_eyes.is_tracking);
+			}
+		}
+	}
+#endif
+
 #ifdef COMP_MULTI_SHARED_SURFACE
 	// Shared spatial surface (#59; macOS, and desktop Linux #710) PER-WINDOW Kooima. Each client composites into a
 	// TILED window, not the full display, so the Kooima screen must be the WINDOW's
@@ -1900,6 +2065,9 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		if (s->xsysc->info.display_pixel_width > 0 && s->xsysc->info.display_width_m > 0.0f) {
 			pitch = s->xsysc->info.display_width_m / (float)s->xsysc->info.display_pixel_width;
 		}
+		if (reframed && reframe_pitch_m > 0.0f) {
+			pitch = reframe_pitch_m; // the framing screen's pixels (ADR-047 Amendment 4 addendum)
+		}
 		if (pitch <= 0.0f) {
 			// The only remaining reason to keep the full-canvas frame, and it is
 			// named: no metres-per-pixel means no zone metres either.
@@ -1968,8 +2136,16 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	// N6 Part 1 (#2144): the eyes at the locate's display time, not "latest".
 	// XR_DXR_display_info v25: a fixed-viewer client's views are the nominal
 	// layout below even on a display that tracks (its weave keeps the DP's).
-	bool have_dp_eyes = !ics->fixed_viewer && multi_compositor_get_eye_positions_at(mc, at_timestamp_ns, &eyes) &&
-	                    eyes.valid && eyes.count > 0;
+	bool have_dp_eyes = false;
+	if (reframed && !ics->fixed_viewer) {
+		// A window / element wholly on a non-primary screen: THAT screen's eyes.
+		eyes = reframe_eyes;
+		have_dp_eyes = eyes.valid && eyes.count > 0;
+	} else if (!reframed) {
+		have_dp_eyes = !ics->fixed_viewer &&
+		               multi_compositor_get_eye_positions_at(mc, at_timestamp_ns, &eyes) && eyes.valid &&
+		               eyes.count > 0;
+	}
 	if (have_dp_eyes) {
 		head_eye_count = (eyes.count < XRT_MAX_VIEWS) ? eyes.count : XRT_MAX_VIEWS;
 		for (uint32_t i = 0; i < head_eye_count; i++) {
@@ -1984,6 +2160,11 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		float nx = s->xsysc->info.nominal_viewer_x_m;
 		float ny = s->xsysc->info.nominal_viewer_y_m;
 		float nz = s->xsysc->info.nominal_viewer_z_m;
+		if (reframed && reframe_nominal_z_m > 0.0f) {
+			nx = 0.0f; // the framing screen's nominal viewer (ADR-047 Amendment 4 addendum)
+			ny = 0.0f;
+			nz = reframe_nominal_z_m;
+		}
 		if (nz <= 0.0f) {
 			nz = 0.6f; // sane default if the DP left it unset
 		}
@@ -2022,7 +2203,9 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		for (uint32_t i = 0; i < head_eye_count && i < XRT_MAX_VIEWS; i++) {
 			cur.eyes[i] = (struct xrt_eye_position){head_eyes[i].x, head_eyes[i].y, head_eyes[i].z};
 		}
-		if (ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, at_timestamp_ns, &cur, cur.valid)) {
+		// A re-framed locate already took its screen's provider (above).
+		if (!reframed &&
+		    ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, at_timestamp_ns, &cur, cur.valid)) {
 			head_eye_count = cur.count < XRT_MAX_VIEWS ? cur.count : XRT_MAX_VIEWS;
 			for (uint32_t i = 0; i < head_eye_count; i++) {
 				head_eyes[i] = (struct xrt_vec3){cur.eyes[i].x, cur.eyes[i].y, cur.eyes[i].z};
@@ -2140,6 +2323,9 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	struct xrt_pose display_pose = {display_ori, display_pos};
 
 	struct xrt_vec3 nominal_viewer = {0.0f, s->xsysc->info.nominal_viewer_y_m, s->xsysc->info.nominal_viewer_z_m};
+	if (reframed && reframe_nominal_z_m > 0.0f) {
+		nominal_viewer = (struct xrt_vec3){0.0f, 0.0f, reframe_nominal_z_m}; // the framing screen's
+	}
 	const struct xrt_vec3 *rig_nominal = rig_any ? &nominal_viewer : NULL;
 
 	struct dxr_xrt_view rig_views[XRT_MAX_VIEWS];
@@ -7686,6 +7872,24 @@ weave_submit_release_handles(const xrt_graphics_buffer_handle_t *handles, uint32
 #endif
 }
 
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && defined(COMP_MULTI_HAVE_WEAVE)
+//! ADR-047 Amendment 10: hand the head device's two slots to this session's weave engine.
+static void
+ipc_weave_set_head_modes(volatile struct ipc_client_state *ics)
+{
+	struct ipc_server *s = ics->server;
+	struct xrt_device *head = (s != NULL && s->xsysd != NULL) ? s->xsysd->static_roles.head : NULL;
+	if (head == NULL || ics->xc == NULL) {
+		return;
+	}
+#ifdef XRT_OS_MACOS
+	comp_multi_weave_macos_set_head_modes(ics->xc, head->rendering_modes, head->rendering_mode_count);
+#else
+	comp_multi_weave_linux_set_head_modes(ics->xc, head->rendering_modes, head->rendering_mode_count);
+#endif
+}
+#endif
+
 xrt_result_t
 ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         const struct ipc_arg_weave_submit *args,
@@ -7947,6 +8151,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	comp_multi_weave_linux_set_overlay_hints(ics->xc, args->overlay_unchanged != 0, args->overlay_filter_strength);
 	// #2207: the client's exe basename tags its per-client capture trigger.
 	comp_multi_weave_linux_set_capture_tag(ics->xc, (const char *)ics->input_exe_basename);
+	// ADR-047 Amendment 10: the head's two slots (the per-client mc has no xsysd).
+	ipc_weave_set_head_modes(ics);
 #elif defined(XRT_OS_ANDROID)
 	// v14/v15: same per-submit hints for the Android weave (2D under the lens).
 	comp_multi_weave_android_set_overlay_hints(ics->xc, args->overlay_unchanged != 0,
@@ -7956,6 +8162,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 #elif defined(XRT_OS_MACOS)
 	// #2470: the client's exe basename tags its per-client capture trigger (the #2207 twin).
 	comp_multi_weave_macos_set_capture_tag(ics->xc, (const char *)ics->input_exe_basename);
+	// ADR-047 Amendment 10: the head's two slots (the per-client mc has no xsysd).
+	ipc_weave_set_head_modes(ics);
 #endif
 	bool ok = comp_multi_weave_submit(                        //
 	    ics->xc, handles[0],                                    //
@@ -8487,6 +8695,8 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	comp_multi_weave_linux_set_overlay_hints(ics->xc, args->overlay_unchanged != 0, args->overlay_filter_strength);
 	// #2207: the client's exe basename tags its per-client capture trigger.
 	comp_multi_weave_linux_set_capture_tag(ics->xc, (const char *)ics->input_exe_basename);
+	// ADR-047 Amendment 10: the head's two slots (the per-client mc has no xsysd).
+	ipc_weave_set_head_modes(ics);
 	bool ok = comp_multi_weave_submit_dmabuf(                   //
 	    ics->xc, &in_desc,                                      //
 	    args->have_overlay ? &overlay_desc : NULL,              //

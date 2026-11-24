@@ -161,6 +161,11 @@ void
 comp_ipc_client_compositor_segments_enable(struct xrt_compositor *xc, uint64_t pinned_display_id);
 bool
 comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics);
+// ADR-047 Amendment 10 over IPC: this client's effective rendering-mode table,
+// from its shared memory (no round trip).
+struct xrt_effective_mode_table;
+bool
+comp_ipc_client_compositor_get_effective_table(struct xrt_compositor *xc, struct xrt_effective_mode_table *out);
 
 // IPC-client DP tracking state (#441 Phase 2) — same linkage pattern as
 // above. Consumed ONLY for the derived isTracking value + tracking-state
@@ -2182,6 +2187,12 @@ xrt_to_passthrough_state_flags(enum xrt_passthrough_state state)
 #endif
 
 
+// ADR-047 Amendment 10 (defined with the locate path below).
+static bool
+oxr_session_is_ipc_client(const struct oxr_session *sess);
+static void
+locate_note_effective_table(struct oxr_session *sess, const struct xrt_segment_metrics *m);
+
 #ifdef OXR_HAVE_DXR_display_info
 //! ADR-066 C1.6: at most one table-changed event per session per second.
 #define OXR_MODE_TABLE_EVENT_MIN_NS (1000ull * 1000ull * 1000ull)
@@ -2221,6 +2232,15 @@ oxr_session_rendering_modes_poll(struct oxr_logger *log, struct oxr_session *ses
 	// ADR-047 Amendment 10: every other screen's 3D-mode choice too (in-process:
 	// the registry re-reads the store at most once a second; empty elsewhere).
 	(void)u_screen_modes_refresh_choices(now, false);
+	// Over IPC the service keeps this client's effective table in its shared
+	// memory: follow it here too, so an app that polls without locating (or
+	// between locates) is told when its window changes screen.
+	if (oxr_session_is_ipc_client(sess)) {
+		struct xrt_segment_metrics m;
+		memset(&m, 0, sizeof(m));
+		(void)comp_ipc_client_compositor_get_effective_table(&sess->xcn->base, &m.table);
+		locate_note_effective_table(sess, &m);
+	}
 	const uint32_t gen = u_device_rendering_modes_sync(head, now);
 	const bool slots_moved = gen != sess->rendering_mode_generation;
 	const bool screen_moved = sess->eff_table_gen != sess->eff_table_gen_told;
@@ -4400,6 +4420,18 @@ locate_wants_fixed_viewer(struct oxr_session *sess, const XrViewLocateInfo *info
 #endif
 }
 
+//! An out-of-process session: its compositor is the IPC client compositor.
+static bool
+oxr_session_is_ipc_client(const struct oxr_session *sess)
+{
+	if (sess == NULL || sess->xcn == NULL || sess->sys == NULL || sess->sys->xsysc == NULL ||
+	    !sess->sys->xsysc->info.is_service_mode) {
+		return false;
+	}
+	return !(sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor ||
+	         sess->is_metal_native_compositor || sess->is_gl_native_compositor || sess->is_vk_native_compositor);
+}
+
 /*!
  * XR_DXR_display_info v25 over IPC: the SERVICE computes this client's views
  * and hosts the viewer-tracking provider, so it has to know. The flag rides
@@ -6239,8 +6271,18 @@ static bool
 locate_fetch_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics *out)
 {
 	memset(out, 0, sizeof(*out));
-	if (sess->seg_ipc && sess->xcn != NULL) {
-		return comp_ipc_client_compositor_get_segment_metrics(&sess->xcn->base, out);
+	if (oxr_session_is_ipc_client(sess)) {
+		// ADR-047 Amendment 10 over IPC: the service computes this client's
+		// effective table from where its window is and keeps it in the
+		// client's shared memory; the per-screen segment table (Windows, two
+		// DP-backed screens) still comes by message.
+		const bool have_segs =
+		    sess->seg_ipc && comp_ipc_client_compositor_get_segment_metrics(&sess->xcn->base, out);
+		if (!have_segs) {
+			memset(out, 0, sizeof(*out));
+		}
+		const bool have_table = comp_ipc_client_compositor_get_effective_table(&sess->xcn->base, &out->table);
+		return have_segs || have_table;
 	}
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
 	if (sess->xcn != NULL && sess->is_vk_native_compositor) {

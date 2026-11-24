@@ -1058,6 +1058,7 @@ vkb_segs_update(struct vk_bundle *vk, struct multi_compositor *mc, const struct 
 	// after the per-segment crops.
 	if (!comp_multi_weave_macos_segs_eligible(mc, p) || xrt_display_processor_is_self_submitting(mc->weave.dp) ||
 	    !vkb_segs_sync(vk, mc)) {
+		comp_multi_weave_macos_publish(mc, mc->weave.have_geometry, NULL);
 		return false;
 	}
 	struct comp_weave_window_cg win;
@@ -1065,15 +1066,28 @@ vkb_segs_update(struct vk_bundle *vk, struct multi_compositor *mc, const struct 
 	struct xrt_screen_list proj;
 	struct comp_seg_rect wr;
 	if (comp_weave_screens_project_cg(mc->weave.segs_list, &win, &proj, &wr) == COMP_WEAVE_FRAME_NONE) {
+		comp_multi_weave_macos_publish(mc, true, NULL);
 		return false;
 	}
 	if (comp_weave_screens_compare(mc->weave.segs_proj, &proj) != COMP_WEAVE_SCREENS_SAME) {
 		if (!comp_vk_native_segments_set_screen_geometry(vkb_segs(mc), &proj)) {
+			comp_multi_weave_macos_publish(mc, true, NULL);
 			return false; // cannot happen (same list, same filter): stay single-DP
 		}
 		*mc->weave.segs_proj = proj;
 	}
 	const struct comp_seg_rect canvas = {0, 0, wr.w, wr.h};
+	// ADR-047 Amendment 10: the view size follows the window's screen (the
+	// desktop-Linux engine's rule): no view cap, the instance's worst case clamps.
+	{
+		const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+		(void)comp_vk_native_segments_update_view_size(vkb_segs(mc), &wr, &canvas, mc->weave.head_modes,
+		                                               mc->weave.head_mode_count, 0, info->atlas_width_pixels,
+		                                               info->atlas_height_pixels);
+		struct xrt_effective_mode_table eff;
+		(void)comp_vk_native_segments_get_effective_table(vkb_segs(mc), &eff);
+		comp_multi_weave_macos_publish(mc, true, &eff);
+	}
 	// Submits are synchronous: nothing of ours is in flight, release is safe.
 	const bool split =
 	    comp_vk_native_segments_update(vkb_segs(mc), &wr, &canvas, (int32_t)WEAVE_VK_FORMAT, true, 0);
@@ -1747,6 +1761,9 @@ vkb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_m
 			    .transparent_background = false, // the engine never declares transparency to its DP
 			    .atlas_encoding = -1,            // nor an atlas encoding
 			    .primary_dp = mc->weave.dp,
+			    // ADR-047 Amendment 10: each other screen's DP draws THAT
+			    // screen's entry for the session's slot.
+			    .active_slot = mc->weave.hw_2d_confirmed ? 0u : 1u,
 			};
 			(void)comp_vk_native_segments_record(vkb_segs(mc), &sf);
 			// The record leaves the target in PRESENT_SRC_KHR (the DP contract
