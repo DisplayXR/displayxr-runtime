@@ -283,7 +283,7 @@ struct proxy
 	bool ever_lost;     //!< a LOST was raised (RESTORED owed at the next bring-up)
 	bool restart_owed;  //!< an abnormal loss: respawn after the backoff even with no command queued
 	bool want_describe; //!< no cached describe: spawn once to describe (conv_host_proxy_request_describe)
-	bool luid_restart;  //!< the adapter LUID changed under a live host: respawn it on the new one
+	bool luid_restart;  //!< the adapter LUID or the bound binary changed under a live host: close + respawn it
 	bool luid_kill_sent; //!< ... and the supervisor thread already ended it (exit 20)
 	uint64_t spawned_luid; //!< --adapter-luid the current / last host was given
 	uint64_t hello_luid;   //!< the adapter the host says it opened
@@ -1318,17 +1318,21 @@ do_spawn(struct proxy *p, int32_t *out_exit_code)
 		return false;
 	}
 	char parent[32], luid[32];
+	// A registration rebind (conv_host_proxy_rebind) rewrites the path on
+	// another thread: this spawn uses the copy it took under the lock.
+	char binary[sizeof(p->provider_binary)];
 	(void)snprintf(parent, sizeof(parent), "%ld", os_process_current_pid());
 	os_mutex_lock(&p->m);
 	p->spawned_luid = p->cfg.adapter_luid;
 	(void)snprintf(luid, sizeof(luid), "%llx", (unsigned long long)p->spawned_luid);
+	memcpy(binary, p->provider_binary, sizeof(binary));
 	os_mutex_unlock(&p->m);
 	const char *args[16 + 8];
 	uint32_t n = 0;
 	args[n++] = CONV_HOST_ARG_PROVIDER;
 	args[n++] = p->provider_id;
 	args[n++] = CONV_HOST_ARG_BINARY;
-	args[n++] = p->provider_binary;
+	args[n++] = binary;
 	args[n++] = CONV_HOST_ARG_CHANNEL;
 	args[n++] = token;
 	args[n++] = CONV_HOST_ARG_PARENT;
@@ -3063,6 +3067,51 @@ conv_host_proxy_config_changed(struct conv_host *h)
 		U_LOG_W("[conv:%s] registration changed: the host may respawn (%s gate cleared)", p->provider_id,
 		        conv_supervisor_state_str(st.state));
 	}
+}
+
+bool
+conv_host_proxy_rebind(struct conv_host *h, const char *provider_binary, bool replaced)
+{
+	struct proxy *p = px(h);
+	if (provider_binary == NULL || provider_binary[0] == '\0') {
+		return false;
+	}
+	char next[sizeof(p->provider_binary)];
+	conv_host_wire_set_str(next, sizeof(next), provider_binary);
+	os_mutex_lock(&p->m);
+	if (strcmp(p->provider_binary, next) == 0 && !replaced) {
+		os_mutex_unlock(&p->m);
+		return false;
+	}
+	memcpy(p->provider_binary, next, sizeof(p->provider_binary));
+	// What the proxy knows describes the previous binary: describe the new
+	// one at its first spawn, and ask for that spawn (demand_locked).
+	p->described = false;
+	p->want_describe = true;
+	// A host still up is running the previous binary (Restart Manager did not
+	// reach it): the supervisor thread ends it as closed for update -- the
+	// adapter-change path (no backoff, no crash accounting, respawn owed).
+	const bool alive = p->proc != NULL;
+	if (alive) {
+		p->luid_restart = true;
+	}
+	os_cond_broadcast(&p->cond);
+	os_mutex_unlock(&p->m);
+	U_LOG_W("[conv:%s] registration rebound: the next host spawn loads %s%s", p->provider_id, next,
+	        alive ? "; closing the host still running the previous binary (closed for update)" : "");
+	return true;
+}
+
+void
+conv_host_proxy_get_binary(struct conv_host *h, char *buf, size_t size)
+{
+	struct proxy *p = px(h);
+	if (buf == NULL || size == 0) {
+		return;
+	}
+	os_mutex_lock(&p->m);
+	(void)snprintf(buf, size, "%s", p->provider_binary);
+	os_mutex_unlock(&p->m);
 }
 
 void
