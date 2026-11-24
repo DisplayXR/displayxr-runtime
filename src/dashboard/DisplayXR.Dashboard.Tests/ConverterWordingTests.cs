@@ -197,7 +197,7 @@ public class ConverterWordingTests
         var off = Snapshot(new[] { BuiltIn(hidden: true), Provider("a", "A", "DISABLED", enabled: false) });
         var module = Components.Build(off, NoModule).Single(x => x.Id == "conversion");
         var card = Assert.Single(module.Items);
-        Assert.Equal("Conversion module", card.Name);
+        Assert.Equal("Converter", card.Name); // one name in every state, a backend named or not
         Assert.Equal(PlainState.Off, card.State);
         Assert.Equal(("Off", Level.Plain), PlainStates.Chip(card.State));
         Assert.Equal("No 2D-to-3D converter is turned on.", card.Summary);
@@ -211,6 +211,7 @@ public class ConverterWordingTests
         // A converter is selected for a task: the card is as before.
         var on = Snapshot(new[] { Provider("b", "B", "LOADED") }, new[] { TaskRow(0, "b", "depth-mono", true) });
         var asBefore = Components.Build(on, NoModule).Single(x => x.Id == "conversion");
+        Assert.Equal("Converter", asBefore.Items[0].Name);
         Assert.Equal(PlainState.Standby, asBefore.Items[0].State);
         Assert.Null(asBefore.Items[0].Summary);
         Assert.Equal("none available", asBefore.ConnectedLine);
@@ -226,6 +227,10 @@ public class ConverterWordingTests
         var ready = Components.Build(off, present).Single(x => x.Id == "conversion");
         Assert.Equal(PlainState.Ready, ready.Items[0].State);
         Assert.Equal("1 available", ready.ConnectedLine);
+
+        // The same item has the same name in every state of the card.
+        Assert.Equal(new[] { "Converter" }, new[] { card, none.Items[0], asBefore.Items[0], old.Items[0], ready.Items[0] }
+            .Select(i => i.Name).Distinct());
     }
 
     // ── (a) names ───────────────────────────────────────────────────────────
@@ -279,7 +284,7 @@ public class ConverterWordingTests
         shown.AddRange(new[]
         {
             Components.BuiltInConverterName, Components.BuiltInConverterLine, Components.NoConverterOn,
-            Components.NoConverterInstalled, Components.ModuleName, Components.ModuleNameUnnamed,
+            Components.NoConverterInstalled, Components.ModuleName,
         });
         shown.AddRange(Enum.GetValues<PlainState>().Select(x => PlainStates.Chip(x)?.Text ?? ""));
         shown.AddRange(Enum.GetValues<RowStatus>().Select(x => new ComponentRow("k", null, null, x).StatusChip?.Text ?? ""));

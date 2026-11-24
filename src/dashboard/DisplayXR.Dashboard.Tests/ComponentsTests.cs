@@ -148,8 +148,8 @@ public class ComponentsTests
         Assert.Equal(PlainState.Ready, PlainStates.ModelPack("installed"));
         Assert.Equal(PlainState.Standby, PlainStates.ModelPack("downloading"));
 
-        Assert.Equal(new[] { "In use", "Ready", "Standby", "Turned off", "Off", "Needs attention" },
-            new[] { PlainState.InUse, PlainState.Ready, PlainState.Standby, PlainState.TurnedOff, PlainState.Off, PlainState.NeedsAttention }
+        Assert.Equal(new[] { "In use", "Ready", "Standby", "Turned off", "Off", "Not available on this PC", "Needs attention" },
+            new[] { PlainState.InUse, PlainState.Ready, PlainState.Standby, PlainState.TurnedOff, PlainState.Off, PlainState.NotAvailable, PlainState.NeedsAttention }
                 .Select(x => PlainStates.Chip(x)!.Value.Text));
         Assert.Null(PlainStates.Chip(PlainState.None));
     }

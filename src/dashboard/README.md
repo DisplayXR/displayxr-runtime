@@ -112,16 +112,32 @@ reports one). Names are shown verbatim from the components'
 own registration, with two exceptions in 2D to 3D, where the registered word is technical and is
 kept as a line of Details instead: the built-in adapter (`dp-lift`) is the row *Converter in the
 display driver* with the line "Built into the runtime for display drivers that carry their own
-converter.", and the display driver's conversion module is the row *Converter* (*Conversion module*
-when it names no backend), its backend id under Details. The built-in adapter is not a row at all
-while the CLI reports it `hidden` (superseded by a provider), and it is then not counted.
+converter.", and the display driver's conversion module is the row *Converter* in every state
+(available or not, a backend named or not), its backend id under Details. The built-in adapter is
+not a row at all while the CLI reports it `hidden` (superseded by a provider), and it is then not
+counted.
 
-When no converter is selected for any task, the **2D to 3D** line is a sentence instead of counts:
-"No 2D-to-3D converter is turned on." (at least one provider is turned off and none is on; the
-built-in adapter has no switch and is not counted) or "No 2D-to-3D converter is installed." (no row
-is shown). The conversion module's card then reads **Off** with the same sentence, not *Standby*
-with "none available" (`Components.NoConverterLine`). Otherwise the line lists its non-zero parts
-only ("2 installed · in use for 1 task"); a zero is never printed. Tests: `ConverterWordingTests`,
+When no converter is selected for any task, the **2D to 3D** line may be a sentence instead of
+counts. The sentence is about what can convert on this machine, not about the Enabled values alone
+(`Components.NoConverterLine`, which classifies each provider with `Components.UseOf` from the
+fields the CLI reports: `load`, `enabled`, `hidden`, `bad_descriptors`, and `conv list`'s `enabled`
+/ `enabled_source` / `built_in`). First match:
+
+| Providers (no task selected) | 2D to 3D line | Display driver's card |
+|---|---|---|
+| one is turned on and can serve (warming, a model or a prerequisite missing) | the counts ("2 installed") | *Standby*, "none available" |
+| none of those, and one that could convert is turned off | "No 2D-to-3D converter is turned on." | **Off**, the same sentence |
+| none of those, and one is turned on and broken (a load failure, the provenance gate, malformed descriptors), or the built-in adapter is shown | the counts; the row reads *Needs attention* | *Standby*, "none available" |
+| none at all, or only ones that cannot convert here (probe declined, the hidden built-in adapter) | "No 2D-to-3D converter is installed." | **Off**, the same sentence |
+
+A provider whose probe declined (`load` = `PROBE_DECLINED`, e.g. the reference provider on real
+hardware, which ships turned on) is never counted as a converter that is on or one that could be
+turned on, whatever its Enabled value; its row reads **Not available on this PC**. `NEGOTIATED`
+(the conversion loader's word for "loaded") is not a failure. The card reads **Off** only when the
+display driver has no converter of its own; one it does have keeps its own state. The count line
+lists its non-zero parts only ("2 installed · in use for 1 task"); a zero is never printed. Tests:
+`ConverterAvailabilityTests` (the rule, on `conv-list-*-win.json` fixtures written in the CLI's
+shape) and `ConverterWordingTests`,
 which also pins that no name, summary or prerequisite name of the catalog fixtures, and no row name,
 row line, section title or section line the Dashboard builds, names a vendor's converter technology.
 
@@ -185,7 +201,8 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   installed model pack), **Standby** (registered and allowed but not loaded or not needed:
   `NOT_ATTEMPTED`, `DECLINED`, superseded, a controller not running), **Turned off** (its Enabled
   value, or the loader's `DISABLED`), **Off** (the conversion module while no converter is selected
-  for any task: it has no switch of its own), **Needs attention** (refused by the provenance gate: "Blocked:
+  for any task: it has no switch of its own), **Not available on this PC** (a conversion provider
+  whose probe declined, `PROBE_DECLINED`: its switch changes nothing), **Needs attention** (refused by the provenance gate: "Blocked:
   publisher not verified"; any
   other load failure, malformed descriptors, a failing task). A connected client or a summary line
   has none. Every other chip is a labelled line of Details (*Load state*, *Platform*, *Role*,
