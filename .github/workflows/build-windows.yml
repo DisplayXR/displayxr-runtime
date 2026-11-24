@@ -821,11 +821,15 @@ jobs:
             reg delete $dpRoot /v PreferredPlugin /f | Out-Null
             reg delete "$dpRoot\sim-display-alt" /f | Out-Null
 
-            # 3b. Preferred wins (conversion): `PreferredProvider\<task>` = sim-conversion for
-            # a task where the built-in dp-lift row outranks it by ProbeOrder (150 vs 250).
-            # Read from the headless `conv list --json` selection, the same pass the
-            # conversion core runs; the task is picked from the data so the assertion
-            # does not depend on which capabilities the sim provider happens to ship.
+            # 3b. Preferred wins (conversion): `PreferredProvider\<task>` = sim-conversion-alt
+            # for a task where sim-conversion outranks it by ProbeOrder (250 vs 260). The
+            # alt row is a second registration of the same DLL, as cells 2 and 3c do for
+            # the other classes. (This cell used to rank sim-conversion behind the built-in
+            # dp-lift row; since #2769 a default sim-display offers no lift, so that row is
+            # not there, which the first two assertions pin.) Read from the headless
+            # `conv list --json` selection, the same pass the conversion core runs; the
+            # task is picked from the data so the assertion does not depend on which
+            # capabilities the sim provider happens to ship.
             function ConvList-Json {
               $raw = (& $cli conv list --json 2>$null | Out-String)
               $s = $raw.IndexOf('{'); $e = $raw.LastIndexOf('}')
@@ -835,16 +839,26 @@ jobs:
             function ConvRowList { return ConvList-Json }
             function ConvListRow($o, $id) { $o.providers | Where-Object { $_.id -eq $id } | Select-Object -First 1 }
             $cl = ConvList-Json
-            $behind = $cl.tasks | Where-Object { $_.provider -eq "sim-conversion" -and -not $_.selected } | Select-Object -First 1
-            Expect ($null -ne $behind) "conversion: sim-conversion offers a task where it is ranked behind the selection (rows: $(($cl.tasks | ForEach-Object { $_.task + ':' + $_.provider + ':' + $_.selected }) -join ', '))"
+            Expect ($null -eq (ConvListRow $cl "dp-lift")) "conversion: a default sim-display offers no lift, so no dp-lift row is listed (#2769)"
+            $o = Selftest-Json
+            Expect (-not $o.conversion_providers.dp_lift_declared) "conversion: selftest agrees, dp_lift_declared is false"
+            Reg-Row $cvRoot "sim-conversion-alt" $simConv 260
+            reg add "$cvRoot\sim-conversion-alt\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
+            $cl = ConvList-Json
+            Expect ((ConvListRow $cl "sim-conversion-alt").load -eq "NEGOTIATED") "conversion: the second row of the same DLL negotiates (got '$((ConvListRow $cl 'sim-conversion-alt').load)')"
+            $behind = $cl.tasks | Where-Object { $_.provider -eq "sim-conversion-alt" -and -not $_.selected } | Select-Object -First 1
+            Expect ($null -ne $behind) "conversion: sim-conversion-alt offers a task where it is ranked behind the selection (rows: $(($cl.tasks | ForEach-Object { $_.task + ':' + $_.provider + ':' + $_.selected }) -join ', '))"
             if ($null -ne $behind) {
               $convTask = $behind.task
-              reg add "$cvRoot\PreferredProvider" /v $convTask /t REG_SZ /d "sim-conversion" /f | Out-Null
+              $before = $cl.tasks | Where-Object { $_.task -eq $convTask -and $_.selected } | Select-Object -First 1
+              Expect ($before.provider -eq "sim-conversion") "conversion: by ProbeOrder alone $convTask is served by sim-conversion (got '$($before.provider)')"
+              reg add "$cvRoot\PreferredProvider" /v $convTask /t REG_SZ /d "sim-conversion-alt" /f | Out-Null
               $cl = ConvList-Json
               $sel = $cl.tasks | Where-Object { $_.task -eq $convTask -and $_.selected } | Select-Object -First 1
-              Expect ($sel.provider -eq "sim-conversion") "conversion: PreferredProvider\$convTask=sim-conversion is selected over ProbeOrder (got '$($sel.provider)')"
+              Expect ($sel.provider -eq "sim-conversion-alt") "conversion: PreferredProvider\$convTask=sim-conversion-alt is selected over ProbeOrder (got '$($sel.provider)')"
               reg delete "$cvRoot\PreferredProvider" /v $convTask /f | Out-Null
             }
+            reg delete "$cvRoot\sim-conversion-alt" /f | Out-Null
 
             # 3c. Preferred wins (input): a second row of the same DLL (sim-input-alt,
             # 210) is ranked first by `PreferredPlugin` although sim-input (200)
@@ -1124,7 +1138,7 @@ jobs:
             foreach ($k in @("$dpRoot\sim-display", "$dpRoot\sim-display-alt", "$dpRoot\abi-fixture-dp",
                              "$inRoot\sim-input", "$inRoot\sim-input-alt", "$inRoot\abi-fixture-input",
                              "$inRoot\sim-stylus",
-                             "$cvRoot\sim-conversion", "$cvRoot\abi-fixture-conv",
+                             "$cvRoot\sim-conversion", "$cvRoot\sim-conversion-alt", "$cvRoot\abi-fixture-conv",
                              "HKCU\Software\DisplayXR\DisplayProcessors\sim-display",
                              "HKCU\Software\DisplayXR\ConversionProviders\sim-conversion",
                              "$inRoot\Policy", "HKCU\Software\DisplayXR\InputProviders\Policy",

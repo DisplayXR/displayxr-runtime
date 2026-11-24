@@ -128,6 +128,8 @@ struct ipc_server_conv
 	bool io_set;
 	ipc_server_conv_gpu_hook_fn gpu_hook;
 	void *gpu_hook_ud;
+	ipc_server_conv_display_plugins_hook_fn display_plugins_hook; //!< #2769
+	void *display_plugins_hook_ud;
 	uint64_t next_wire;
 	struct sc_stream streams[IPC_SERVER_CONV_MAX_STREAMS];
 	//! ADR-053 P5 step C: the CPU route (cpu_only) still serves spec-3 SBS /
@@ -683,6 +685,35 @@ ipc_server_conv_set_gpu_hook(struct ipc_server_conv *sc, ipc_server_conv_gpu_hoo
 	sc->gpu_hook = fn;
 	sc->gpu_hook_ud = ud;
 	os_mutex_unlock(&sc->mtx);
+}
+
+void
+ipc_server_conv_set_display_plugins_hook(struct ipc_server_conv *sc,
+                                         ipc_server_conv_display_plugins_hook_fn fn,
+                                         void *ud)
+{
+	if (sc == NULL) {
+		return;
+	}
+	os_mutex_lock(&sc->mtx);
+	sc->display_plugins_hook = fn;
+	sc->display_plugins_hook_ud = ud;
+	os_mutex_unlock(&sc->mtx);
+}
+
+void
+ipc_server_conv_display_plugins_reprobed(struct ipc_server_conv *sc)
+{
+	if (sc == NULL) {
+		return;
+	}
+	os_mutex_lock(&sc->mtx);
+	ipc_server_conv_display_plugins_hook_fn hook = sc->display_plugins_hook;
+	void *hook_ud = sc->display_plugins_hook_ud;
+	os_mutex_unlock(&sc->mtx);
+	if (hook != NULL) {
+		hook(hook_ud);
+	}
 }
 
 void

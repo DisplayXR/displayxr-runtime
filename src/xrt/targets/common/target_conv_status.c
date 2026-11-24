@@ -909,6 +909,7 @@ target_conv_status_build_from_entries_hinted(struct xrt_conversion_plugin_entry 
 	g_headless_entry = NULL;
 
 	// The static dp-lift row (Windows: the lift slots are a D3D11-service feature).
+	// Listed only when the active display driver offers lift (#2769).
 #ifdef XRT_OS_WINDOWS
 	if (dp_has_lift_factory(active_dp)) {
 		struct conv_provider_desc d;
@@ -936,9 +937,14 @@ target_conv_status_build_from_entries_hinted(struct xrt_conversion_plugin_entry 
 		               "dp-lift row: static describe (lift-only factory present; DEPTH_MONO, DEPTH_VIDEO, "
 		               "VIEWS_MONO INSTALLED, not instantiated)");
 	} else {
+		// #2769: the same rule as the live service (service_conversion.c,
+		// dp_lift_evaluate): no lift-only factory = the display driver offers
+		// no lift = no row, anywhere.
 		(void)snprintf(out->dp_lift_note, sizeof(out->dp_lift_note),
-		               active_dp == NULL ? "dp-lift row: no active display plug-in (OK)"
-		                                 : "dp-lift row: not declared headless (no lift-only factory; OK)");
+		               active_dp == NULL
+		                   ? "dp-lift row: no active display plug-in (OK)"
+		                   : "dp-lift row: not listed, the display driver offers no lift (no lift-only "
+		                     "factory; OK)");
 	}
 #else
 	(void)active_dp;

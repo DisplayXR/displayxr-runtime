@@ -65,6 +65,11 @@ extern "C" {
 struct conv_dp_lift_snapshot
 {
 	bool factory_present;         //!< a lift-only (or a lift-capable) factory resolves right now
+	/*! The active display plug-in exports the LIFT-ONLY factory right now
+	 *  (#2769): the one cheap, truthful sign that it offers lift at all. The
+	 *  service registers the `dp-lift` row only on it; the adapter itself
+	 *  never reads it. */
+	bool lift_only_factory;
 	bool attempted;               //!< an activation attempt finished
 	bool have_module;             //!< the lift DP is alive and answered lift_get_caps
 	bool has_depth_slot;          //!< the DP carries lift_get_depth (ADR-048 Addendum A era: OFFAXIS_CAMERA)

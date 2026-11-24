@@ -723,6 +723,7 @@ be_snapshot(void *ud, conv_dp_lift_snapshot *out)
 		(void)l->resolve(l->resolve_ud, &lf, &ff);
 	}
 	out->factory_present = lf != nullptr || ff != nullptr;
+	out->lift_only_factory = lf != nullptr; // #2769: what the service lists the dp-lift row on
 	std::lock_guard<std::mutex> g(l->mtx);
 	// #1812: the adapter's warm polls this while the module is ACTIVATING, so
 	// the stall WARN fires even while the lift thread is blocked in a vendor call.
