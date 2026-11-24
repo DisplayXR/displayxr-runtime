@@ -3,21 +3,33 @@
 /*!
  * @file
  * @brief  XR_DXR_stereo_camera consumer probe for Android: the Android stand-in
- *         for `displayxr-cli camera probe` (docs/roadmap/stereo-camera-android.md §12.3).
+ *         for `displayxr-cli camera probe`
+ * (docs/roadmap/stereo-camera-android.md §12.3).
  *
  * A CAMERA_CONSUMER-only XrInstance (no session): enumerate, read the
  * calibration, create + start one NV12 shared-memory stream, map the sealed
  * memfd read-only, wait on the per-stream eventfd, acquire for N seconds, then
  * report:
  *   - delivered rate and frameIndex gaps,
- *   - captureTime -> now latency (XR_KHR_convert_timespec_time, CLOCK_MONOTONIC),
+ *   - captureTime -> now latency (XR_KHR_convert_timespec_time,
+ * CLOCK_MONOTONIC),
  *   - ROW ALIGNMENT of the last frame: 2-D block matching (dx AND dy, sub-pixel
  *     dy) of textured 32x32 blocks of the left eye against the right eye: the
  *     median / p90 |dy| over the whole eye and in the outer 15 % columns (a
  *     rectified pair must bring them to ~0), and the sign of the horizontal
- *     disparity (positive = correct eye order for a scene in front of the camera),
+ *     disparity (positive = correct eye order for a scene in front of the
+ * camera),
  *   - the service's stream stats.
  * The last frame is written to files/cam_last.nv12 for eyeballing.
+ *
+ * Spec v8 (the `v8` extra, see MainActivity): lists every camera's capture
+ * modes and control capabilities, runs the stream in a chosen mode (with the
+ * calibration of that mode), sets focus / metering / exposure controls and
+ * logs the per-frame capture state (focus distance + state, exposure, ISO,
+ * per-eye skew), and takes one still halfway through: ready event, read-only
+ * section, its capture state, its calibration, the row alignment of the still
+ * itself, written to files/still_last.nv12. A runtime older than v8 lacks the
+ * functions: the probe says so and runs as before.
  *
  * Vendor-neutral: it knows nothing about which plug-in produced the frames.
  */
@@ -61,7 +73,46 @@ struct fns
 	PFN_xrAcquireStereoCameraFrameDXR acquire{};
 	PFN_xrGetStereoCameraStreamStatsDXR stats{};
 	PFN_xrConvertTimespecTimeToTimeKHR ts2xr{};
+        // Spec v8 (optional: a v7 runtime has none of them).
+        PFN_xrEnumerateStereoCameraModesDXR modes{};
+        PFN_xrSetStereoCameraControlsDXR set_controls{};
+        PFN_xrReleaseStereoCameraControlsDXR release_controls{};
+        PFN_xrRequestStereoCameraStillDXR request_still{};
+        PFN_xrAcquireStereoCameraStillDXR acquire_still{};
+        PFN_xrReleaseStereoCameraStillDXR release_still{};
 };
+
+//! The `v8` extra: "key=value;key=value".
+std::string v8_opt(const std::string &v8, const char *key) {
+        const std::string k = std::string(key) + "=";
+        size_t at = 0;
+        while (at < v8.size()) {
+          size_t end = v8.find(';', at);
+          if (end == std::string::npos) {
+            end = v8.size();
+          }
+          if (v8.compare(at, k.size(), k) == 0) {
+            return v8.substr(at + k.size(), end - at - k.size());
+          }
+          at = end + 1;
+        }
+        return "";
+}
+
+const char *focus_state_str(XrStereoCameraFocusStateDXR s) {
+        switch (s) {
+        case XR_STEREO_CAMERA_FOCUS_STATE_SEARCHING_DXR:
+          return "SEARCHING";
+        case XR_STEREO_CAMERA_FOCUS_STATE_LOCKED_DXR:
+          return "LOCKED";
+        case XR_STEREO_CAMERA_FOCUS_STATE_FIXED_DXR:
+          return "FIXED";
+        case XR_STEREO_CAMERA_FOCUS_STATE_FAILED_DXR:
+          return "FAILED";
+        default:
+          return "UNKNOWN";
+        }
+}
 
 template <typename T>
 bool
@@ -175,13 +226,85 @@ fmt(const char *f, ...)
 	return b;
 }
 
+/*!
+ * Spec v8: acquire the ready still @p id — its read-only section, capture state
+ * and calibration — measure its rows, write its pixels to @p path, release it.
+ */
+std::string take_still(const fns &f, XrStereoCameraStreamDXR stream,
+                       uint64_t id, int64_t latency_ns,
+                       const std::string &path) {
+        XrStereoCameraCaptureResultDXR cr = {
+            XR_TYPE_STEREO_CAMERA_CAPTURE_RESULT_DXR};
+        XrStereoCameraCalibrationDXR cal = {
+            XR_TYPE_STEREO_CAMERA_CALIBRATION_DXR};
+        cal.next = &cr;
+        XrStereoCameraStillDXR st = {XR_TYPE_STEREO_CAMERA_STILL_DXR};
+        st.next = &cal;
+        XrResult r = f.acquire_still(stream, id, &st);
+        if (XR_FAILED(r)) {
+                f.release_still(stream, id);
+                return fmt("still %llu: acquire -> %d", (unsigned long long)id,
+                           (int)r);
+        }
+        const int fd = (int)st.sectionHandle;
+        void *map = fd >= 0 ? mmap(nullptr, st.sectionSize, PROT_READ,
+                                   MAP_SHARED, fd, 0)
+                            : MAP_FAILED;
+        std::string align = "not mapped";
+        if (map != MAP_FAILED) {
+                const uint8_t *y = (const uint8_t *)map + st.planeOffset[0];
+                if (st.format == XR_STEREO_CAMERA_FORMAT_NV12_DXR ||
+                    st.format == XR_STEREO_CAMERA_FORMAT_GRAY8_DXR) {
+                        std::vector<match> m = row_alignment(
+                            y, st.rowPitch[0], (uint32_t)st.extent.width / 2,
+                            (uint32_t)st.extent.height);
+                        std::vector<float> ady, d;
+                        for (const auto &k : m) {
+                                ady.push_back(std::fabs(k.dy));
+                                d.push_back(k.d);
+                        }
+                        align = fmt("%zu blocks, |dy| median %.2f p90 %.2f px, "
+                                    "disparity median %.1f px",
+                                    m.size(), pct(ady, 0.5), pct(ady, 0.9),
+                                    pct(d, 0.5));
+                }
+                FILE *fp = fopen(path.c_str(), "wb");
+                if (fp != nullptr) {
+                        fwrite(map, 1, (size_t)st.sectionSize, fp);
+                        fclose(fp);
+                }
+                munmap(map, st.sectionSize);
+        }
+        if (fd >= 0) {
+                close(fd);
+        }
+        f.release_still(stream, id);
+        const std::string s =
+            fmt("still %llu in %.0f ms: %dx%d %s fmt %d, %llu B; capture focus "
+                "%.3f D %s ISO %u (valid 0x%llx); calibration "
+                "%dx%d/eye f %.1f c %.1f,%.1f baseline %.2f mm; rows: %s; "
+                "written to %s",
+                (unsigned long long)st.requestId, latency_ns / 1e6,
+                st.extent.width, st.extent.height,
+                st.output == XR_STEREO_CAMERA_OUTPUT_RECTIFIED_DXR ? "RECTIFIED"
+                                                                   : "RAW",
+                (int)st.format, (unsigned long long)st.sectionSize,
+                cr.focusDistanceDiopters, focus_state_str(cr.focusState),
+                cr.sensitivityIso, (unsigned long long)cr.validFields,
+                cal.eye[0].imageExtent.width, cal.eye[0].imageExtent.height,
+                cal.eye[0].fx, cal.eye[0].cx, cal.eye[0].cy, cal.baselineMm,
+                align.c_str(), path.c_str());
+        LOGW("%s", s.c_str());
+        return s;
+}
+
 } // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
-    JNIEnv *env, jclass, jobject activity, jstring jcam, jint secs, jstring joutput, jstring jout)
-{
-	std::string result;
+    JNIEnv *env, jclass, jobject activity, jstring jcam, jint secs,
+    jstring joutput, jstring jout, jstring jv8) {
+        std::string result;
 	auto done = [&](const std::string &s) {
 		LOGW("%s", s.c_str());
 		return env->NewStringUTF(s.c_str());
@@ -195,8 +318,13 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 	c = env->GetStringUTFChars(jout, nullptr);
 	std::string out_path = c;
 	env->ReleaseStringUTFChars(jout, c);
+        c = env->GetStringUTFChars(jv8, nullptr);
+        const std::string v8 = c;
+        env->ReleaseStringUTFChars(jv8, c);
+        const std::string still_path =
+            out_path.substr(0, out_path.rfind('/') + 1) + "still_last.nv12";
 
-	JavaVM *vm = nullptr;
+        JavaVM *vm = nullptr;
 	env->GetJavaVM(&vm);
 	PFN_xrInitializeLoaderKHR init_loader = nullptr;
 	if (!get_fn(XR_NULL_HANDLE, "xrInitializeLoaderKHR", &init_loader)) {
@@ -245,7 +373,18 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 		xrDestroyInstance(inst);
 		return done("FAIL extension functions missing");
 	}
-	XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
+        // Spec v8: optional.
+        const bool have_v8 =
+            get_fn(inst, "xrEnumerateStereoCameraModesDXR", &f.modes) &&
+            get_fn(inst, "xrSetStereoCameraControlsDXR", &f.set_controls) &&
+            get_fn(inst, "xrReleaseStereoCameraControlsDXR",
+                   &f.release_controls) &&
+            get_fn(inst, "xrRequestStereoCameraStillDXR", &f.request_still) &&
+            get_fn(inst, "xrAcquireStereoCameraStillDXR", &f.acquire_still) &&
+            get_fn(inst, "xrReleaseStereoCameraStillDXR", &f.release_still);
+        LOGW("spec v8 (modes / controls / stills): %s",
+             have_v8 ? "available" : "NOT available (runtime older than v8)");
+        XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
 	sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
 	XrSystemId sys = XR_NULL_SYSTEM_ID;
 	xrGetSystem(inst, &sgi, &sys);
@@ -253,7 +392,15 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 	uint32_t n = 0;
 	r = f.enumerate(inst, sys, 0, &n, nullptr);
 	std::vector<XrStereoCameraPropertiesDXR> cams(n, {XR_TYPE_STEREO_CAMERA_PROPERTIES_DXR});
-	if (n > 0) {
+        // Spec v8: each camera's control capabilities, chained
+        // (zero-initialised: an older runtime leaves them untouched = no
+        // controls).
+        std::vector<XrStereoCameraControlCapabilitiesDXR> caps(
+            n, {XR_TYPE_STEREO_CAMERA_CONTROL_CAPABILITIES_DXR});
+        for (uint32_t i = 0; i < n; i++) {
+                cams[i].next = &caps[i];
+        }
+        if (n > 0) {
 		r = f.enumerate(inst, sys, n, &n, cams.data());
 	}
 	LOGW("enumerate -> %d, %u camera(s)", (int)r, n);
@@ -265,7 +412,46 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 		     i, (unsigned long long)p.cameraId, p.displayName, (unsigned long long)p.flags, (int)p.state,
 		     p.eyeExtent.width, p.eyeExtent.height, p.maxFrameRate, p.baselineMm, p.horizontalFovDeg,
 		     (unsigned long long)p.supportedFormats, (unsigned long long)p.supportedTransports);
-		const bool front = (p.flags & XR_STEREO_CAMERA_USER_FACING_BIT_DXR) != 0;
+                if (have_v8) {
+                        uint32_t mc = 0;
+                        f.modes(inst, p.cameraId, 0, &mc, nullptr);
+                        std::vector<XrStereoCameraModeDXR> ms(
+                            mc, {XR_TYPE_STEREO_CAMERA_MODE_DXR});
+                        if (mc > 0 && XR_SUCCEEDED(f.modes(inst, p.cameraId, mc,
+                                                           &mc, ms.data()))) {
+                                for (const auto &m : ms) {
+                                        LOGW(
+                                            "      mode %dx%d per eye %.1f "
+                                            "Hz%s%s%s",
+                                            m.eyeExtent.width,
+                                            m.eyeExtent.height, m.maxFrameRate,
+                                            (m.flags &
+                                             XR_STEREO_CAMERA_MODE_DEFAULT_BIT_DXR)
+                                                ? " DEFAULT"
+                                                : "",
+                                            (m.flags &
+                                             XR_STEREO_CAMERA_MODE_STREAM_BIT_DXR)
+                                                ? " STREAM"
+                                                : "",
+                                            (m.flags &
+                                             XR_STEREO_CAMERA_MODE_STILL_BIT_DXR)
+                                                ? " STILL"
+                                                : "");
+                                }
+                        }
+                        const auto &k = caps[i];
+                        LOGW(
+                            "      controls 0x%llx focus modes 0x%llx nearest "
+                            "%.2f D (calibration %d) EV %+.2f..%+.2f step %.3f",
+                            (unsigned long long)k.supportedControls,
+                            (unsigned long long)k.supportedFocusModes,
+                            k.minFocusDistanceDiopters,
+                            (int)k.focusDistanceCalibration,
+                            k.exposureCompensationMinEv,
+                            k.exposureCompensationMaxEv,
+                            k.exposureCompensationStepEv);
+                }
+                const bool front = (p.flags & XR_STEREO_CAMERA_USER_FACING_BIT_DXR) != 0;
 		if (pick < 0 && ((cam_sel == "front" && front) || (cam_sel == "rear" && !front) ||
 		                 (isdigit((unsigned char)cam_sel[0]) && (uint32_t)atoi(cam_sel.c_str()) == i))) {
 			pick = (int)i;
@@ -277,8 +463,49 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 	}
 	const XrStereoCameraPropertiesDXR &cam = cams[pick];
 	const XrStereoCameraOutputDXR want_out = want_raw ? XR_STEREO_CAMERA_OUTPUT_RAW_DXR : XR_STEREO_CAMERA_OUTPUT_RECTIFIED_DXR;
-	XrStereoCameraCalibrationDXR cal = {XR_TYPE_STEREO_CAMERA_CALIBRATION_DXR};
-	cal.output = want_out;
+        // Spec v8: the stream's mode — `mode=WxH`, or `mode=max` for the
+        // largest STREAM mode.
+        XrStereoCameraStreamModeInfoDXR mode_info = {
+            XR_TYPE_STEREO_CAMERA_STREAM_MODE_INFO_DXR};
+        std::vector<XrStereoCameraModeDXR> cam_modes;
+        if (have_v8) {
+                uint32_t mc = 0;
+                f.modes(inst, cam.cameraId, 0, &mc, nullptr);
+                cam_modes.assign(mc, {XR_TYPE_STEREO_CAMERA_MODE_DXR});
+                if (mc == 0 || XR_FAILED(f.modes(inst, cam.cameraId, mc, &mc,
+                                                 cam_modes.data()))) {
+                        cam_modes.clear();
+                }
+        }
+        const std::string mode_opt = v8_opt(v8, "mode");
+        if (!cam_modes.empty() && mode_opt == "max") {
+                int64_t best = 0;
+                for (const auto &m : cam_modes) {
+                        const int64_t a =
+                            (int64_t)m.eyeExtent.width * m.eyeExtent.height;
+                        if ((m.flags & XR_STEREO_CAMERA_MODE_STREAM_BIT_DXR) !=
+                                0 &&
+                            a > best) {
+                                best = a;
+                                mode_info.eyeExtent = m.eyeExtent;
+                        }
+                }
+        } else if (!cam_modes.empty() && !mode_opt.empty()) {
+                sscanf(mode_opt.c_str(), "%dx%d", &mode_info.eyeExtent.width,
+                       &mode_info.eyeExtent.height);
+        }
+        const bool use_mode =
+            mode_info.eyeExtent.width > 0 && mode_info.eyeExtent.height > 0;
+        LOGW("stream mode: %s",
+             use_mode ? fmt("%dx%d per eye", mode_info.eyeExtent.width,
+                            mode_info.eyeExtent.height)
+                            .c_str()
+                      : "the default");
+
+        XrStereoCameraCalibrationDXR cal = {XR_TYPE_STEREO_CAMERA_CALIBRATION_DXR};
+        cal.next = use_mode ? &mode_info
+                            : nullptr; // v8: the numbers of THIS mode's frames
+        cal.output = want_out;
 	r = f.calib(inst, cam.cameraId, &cal);
 	if (XR_SUCCEEDED(r)) {
 		LOGW("calibration (%s): L f=%.1f/%.1f c=%.1f/%.1f  R f=%.1f/%.1f c=%.1f/%.1f  baseline %.2f mm  "
@@ -292,7 +519,9 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 	}
 
 	XrStereoCameraStreamCreateInfoDXR sci = {XR_TYPE_STEREO_CAMERA_STREAM_CREATE_INFO_DXR};
-	sci.cameraId = cam.cameraId;
+        sci.next =
+            use_mode ? &mode_info : nullptr; // v8: absent = the default mode
+        sci.cameraId = cam.cameraId;
 	sci.output = want_out;
 	sci.format = XR_STEREO_CAMERA_FORMAT_NV12_DXR;
 	sci.transport = XR_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY_DXR;
@@ -337,14 +566,68 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 	XrStereoCameraFrameDXR last = {};
 	std::vector<uint8_t> last_buf;
 	bool ended = false;
-	while (mono() - t_start < (int64_t)secs * 1000000000LL && !ended) {
+
+        // Spec v8 controls (`focus=auto|once|manual:<D>|locked`, `point=x,y`,
+        // `ev=<EV>`), set once the first frame is in; and one still
+        // (`still=WxH|max`) halfway.
+        XrStereoCameraControlsDXR ctl = {XR_TYPE_STEREO_CAMERA_CONTROLS_DXR};
+        {
+                const std::string fo = v8_opt(v8, "focus"),
+                                  po = v8_opt(v8, "point"),
+                                  eo = v8_opt(v8, "ev");
+                if (!fo.empty()) {
+                        ctl.validControls |=
+                            XR_STEREO_CAMERA_CONTROL_FOCUS_MODE_BIT_DXR;
+                        ctl.focusMode =
+                            fo == "once"
+                                ? XR_STEREO_CAMERA_FOCUS_MODE_AUTO_ONCE_DXR
+                            : fo.compare(0, 6, "manual") == 0
+                                ? XR_STEREO_CAMERA_FOCUS_MODE_MANUAL_DXR
+                            : fo == "locked"
+                                ? XR_STEREO_CAMERA_FOCUS_MODE_LOCKED_DXR
+                                : XR_STEREO_CAMERA_FOCUS_MODE_CONTINUOUS_AUTO_DXR;
+                        if (ctl.focusMode ==
+                                XR_STEREO_CAMERA_FOCUS_MODE_MANUAL_DXR &&
+                            fo.size() > 7) {
+                                ctl.validControls |=
+                                    XR_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE_BIT_DXR;
+                                ctl.focusDistanceDiopters =
+                                    (float)atof(fo.c_str() + 7);
+                        }
+                }
+                if (!po.empty() &&
+                    sscanf(po.c_str(), "%f,%f", &ctl.meteringPoint.x,
+                           &ctl.meteringPoint.y) == 2) {
+                        ctl.validControls |=
+                            XR_STEREO_CAMERA_CONTROL_METERING_POINT_BIT_DXR;
+                }
+                if (!eo.empty()) {
+                        ctl.validControls |=
+                            XR_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION_BIT_DXR;
+                        ctl.exposureCompensationEv = (float)atof(eo.c_str());
+                }
+        }
+        bool controls_sent = !have_v8 || ctl.validControls == 0;
+        const std::string still_opt = have_v8 ? v8_opt(v8, "still") : "";
+        bool still_asked = still_opt.empty();
+        uint64_t still_id = 0;
+        int64_t still_t0 = 0;
+        std::string still_report =
+            still_opt.empty() ? "no still asked" : "still: never completed";
+        int64_t next_result_log = 0;
+        uint32_t searching = 0, locked = 0;
+
+        while (mono() - t_start < (int64_t)secs * 1000000000LL && !ended) {
 		struct pollfd pfd = {wake_fd, POLLIN, 0};
 		if (wake_fd >= 0 && poll(&pfd, 1, 200) > 0) {
 			uint64_t v;
 			(void)!read(wake_fd, &v, sizeof(v));
 		}
 		XrStereoCameraFrameDXR fr = {XR_TYPE_STEREO_CAMERA_FRAME_DXR};
-		r = f.acquire(stream, &fr);
+                XrStereoCameraCaptureResultDXR cr = {
+                    XR_TYPE_STEREO_CAMERA_CAPTURE_RESULT_DXR}; // v8, zeroed
+                fr.next = &cr;
+                r = f.acquire(stream, &fr);
 		if (r == XR_STEREO_CAMERA_FRAME_NOT_READY_DXR) {
 			not_ready++;
 		} else if (XR_SUCCEEDED(r)) {
@@ -369,7 +652,69 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 			lat_max = std::max(lat_max, lat);
 			frames++;
 			last = fr;
-			// Copy out the newest frame (the slot is only stable until the next acquire).
+                        last.next = nullptr;
+                        // Spec v8: the frame's capture state, logged ~1 Hz.
+                        searching +=
+                            cr.focusState ==
+                                    XR_STEREO_CAMERA_FOCUS_STATE_SEARCHING_DXR
+                                ? 1u
+                                : 0u;
+                        locked +=
+                            cr.focusState ==
+                                    XR_STEREO_CAMERA_FOCUS_STATE_LOCKED_DXR
+                                ? 1u
+                                : 0u;
+                        if (cr.validFields != 0 && now >= next_result_log) {
+                                next_result_log = now + 1000000000LL;
+                                LOGW("frame %llu capture: focus %.3f D %s, "
+                                     "exposure %.3f ms, ISO %u, eye skew %+.3f "
+                                     "ms (valid 0x%llx)",
+                                     (unsigned long long)fr.frameIndex,
+                                     cr.focusDistanceDiopters,
+                                     focus_state_str(cr.focusState),
+                                     cr.exposureTime / 1e6, cr.sensitivityIso,
+                                     (cr.eyeCaptureTime[1] -
+                                      cr.eyeCaptureTime[0]) /
+                                         1e6,
+                                     (unsigned long long)cr.validFields);
+                        }
+                        if (!controls_sent) {
+                                controls_sent = true;
+                                const XrResult cret =
+                                    f.set_controls(stream, &ctl);
+                                LOGW("set controls 0x%llx (focus mode %d, %.2f "
+                                     "D, point %.2f,%.2f, %+.2f EV) -> %d",
+                                     (unsigned long long)ctl.validControls,
+                                     (int)ctl.focusMode,
+                                     ctl.focusDistanceDiopters,
+                                     ctl.meteringPoint.x, ctl.meteringPoint.y,
+                                     ctl.exposureCompensationEv, (int)cret);
+                        }
+                        if (!still_asked &&
+                            now - t_start >= (int64_t)secs * 500000000LL) {
+                                still_asked = true;
+                                XrStereoCameraStillRequestDXR rq = {
+                                    XR_TYPE_STEREO_CAMERA_STILL_REQUEST_DXR};
+                                if (still_opt != "max") {
+                                        sscanf(still_opt.c_str(), "%dx%d",
+                                               &rq.eyeExtent.width,
+                                               &rq.eyeExtent.height);
+                                }
+                                rq.output = want_out;
+                                rq.format = XR_STEREO_CAMERA_FORMAT_NV12_DXR;
+                                still_t0 = now;
+                                const XrResult sret =
+                                    f.request_still(stream, &rq, &still_id);
+                                LOGW("request still (%s) -> %d, id %llu",
+                                     still_opt.c_str(), (int)sret,
+                                     (unsigned long long)still_id);
+                                if (XR_FAILED(sret)) {
+                                        still_report =
+                                            fmt("still: request refused (%d)",
+                                                (int)sret);
+                                }
+                        }
+                        // Copy out the newest frame (the slot is only stable until the next acquire).
 			const uint8_t *slot = (const uint8_t *)map + (size_t)fr.slot * tr.slotStride;
 			const size_t ysz = (size_t)fr.rowPitch[0] * fr.extent.height;
 			const size_t uvsz = (size_t)fr.rowPitch[1] * (fr.extent.height / 2);
@@ -384,8 +729,29 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 		}
 		XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
 		while (xrPollEvent(inst, &ev) == XR_SUCCESS) {
-			LOGW("event type %d", (int)ev.type);
-			ev = {XR_TYPE_EVENT_DATA_BUFFER};
+                        if (ev.type ==
+                            XR_TYPE_EVENT_DATA_STEREO_CAMERA_STILL_READY_DXR) {
+                                const auto *sr = reinterpret_cast<
+                                    const XrEventDataStereoCameraStillReadyDXR
+                                        *>(&ev);
+                                still_report =
+                                    take_still(f, stream, sr->requestId,
+                                               mono() - still_t0, still_path);
+                        } else if (
+                            ev.type ==
+                            XR_TYPE_EVENT_DATA_STEREO_CAMERA_STILL_FAILED_DXR) {
+                                const auto *sf = reinterpret_cast<
+                                    const XrEventDataStereoCameraStillFailedDXR
+                                        *>(&ev);
+                                still_report =
+                                    fmt("still %llu FAILED (%d)",
+                                        (unsigned long long)sf->requestId,
+                                        (int)sf->result);
+                                LOGW("%s", still_report.c_str());
+                        } else {
+                                LOGW("event type %d", (int)ev.type);
+                        }
+                        ev = {XR_TYPE_EVENT_DATA_BUFFER};
 		}
 	}
 	const double dur = first_ns ? (mono() - first_ns) / 1e9 : 0.0;
@@ -431,7 +797,12 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
 	if (wake_fd >= 0) {
 		close(wake_fd);
 	}
-	const int64_t t_stop = mono();
+        if (have_v8 && ctl.validControls != 0) {
+                f.release_controls(stream); // (stop would release them too)
+        }
+        result += fmt("; v8: frames SEARCHING %u / LOCKED %u; %s", searching,
+                      locked, still_report.c_str());
+        const int64_t t_stop = mono();
 	f.stop(stream);
 	f.destroy(stream);
 	LOGW("stop + destroy %.0f ms", (mono() - t_stop) / 1e6);
