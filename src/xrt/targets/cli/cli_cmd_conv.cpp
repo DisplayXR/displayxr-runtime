@@ -44,6 +44,7 @@
 
 #include "cli_common.h"
 #include "cli_component_options.h"
+#include "cli_conv_warm_plan.h"
 #include "cli_ipc.h"
 
 #include "xrt/xrt_config_os.h"
@@ -1224,25 +1225,21 @@ cmd_warm(int argc, const char **argv)
 	if (task != 0) {
 		tasks.push_back(task);
 	} else {
-		bool matched = false;
-		for (uint32_t i = 0; i < snap->conv_task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
-			const struct xrt_status_conv_task &t = snap->conv_tasks[i];
-			if (strcmp(provider_id_of(snap.get(), t), id.c_str()) != 0 || (cap != 0 && t.cap_id != cap) ||
-			    (only_task != 0 && t.task != only_task)) {
-				continue;
-			}
-			matched = true;
-			if (t.selected) {
-				if (std::find(tasks.begin(), tasks.end(), t.task) == tasks.end()) {
-					tasks.push_back(t.task);
-				}
-				continue;
-			}
-			const struct xrt_status_conv_task *sel = selected_row(snap.get(), t.task);
-			P("%s: %s cap %u is not the selected capability (selected: %s) -- `conv warm` warms the "
-			  "selection; `conv use %s %s` first to change it.\n",
-			  t.task_name, id.c_str(), t.cap_id, sel != nullptr ? provider_id_of(snap.get(), *sel) : "none",
-			  t.task_name, id.c_str());
+		// One verdict per TASK, not per row (cli_conv_warm_plan.h): a
+		// provider's sibling rows for a task it is selected for are not
+		// reported, and a task it is not selected for is reported once.
+		const cli_conv_warm_plan plan = cli_conv_warm_plan_for_provider(
+		    snap->conv_tasks,
+		    snap->conv_task_count < XRT_STATUS_MAX_CONV_TASKS ? snap->conv_task_count
+		                                                      : XRT_STATUS_MAX_CONV_TASKS,
+		    snap->conv_providers,
+		    snap->conv_provider_count < XRT_STATUS_MAX_CONV_PROVIDERS ? snap->conv_provider_count
+		                                                              : XRT_STATUS_MAX_CONV_PROVIDERS,
+		    id.c_str(), cap, only_task);
+		const bool matched = plan.matched;
+		tasks = plan.tasks;
+		for (const std::string &note : plan.notes) {
+			P("%s\n", note.c_str());
 			rc = 1;
 		}
 		if (!matched) {
