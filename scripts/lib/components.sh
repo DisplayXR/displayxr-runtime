@@ -101,14 +101,17 @@ COMPONENT_INSTALL_MARKER_LINUX_conversion_open=""
 # OPT-IN (`--with leia-conversion`), never part of the default install.
 # Released (first release v0.1.0): versions.json pins `leia_conversion`, so a
 # missing pin is an error, as for any other component.
-# The Linux .deb glob is EMPTY on purpose. The release does attach
-# displayxr-leia-conversion_<ver>_amd64.deb, but that package installs only
-# next to a Leia SR plug-in release that no longer carries the provider itself.
-# Set it to "displayxr-leia-conversion_*_amd64.deb" once `leia_plugin` pins one.
+# Linux: displayxr-leia-conversion_<ver>_amd64.deb. That package declares
+# Breaks/Replaces against every displayxr-leia-sr that still shipped the provider
+# (older than 2.24.0), so it installs only next to a Leia SR plug-in release that
+# no longer carries it, and in the same apt transaction when an older plug-in
+# package is installed. The only consumer of this glob, the Linux meta-bundle
+# (displayxr-installer scripts/build-bundle-linux.sh), chains the component only
+# while `leia_plugin` pins v2.24.0 or newer, and refuses it below that.
 COMPONENT_REPO_leia_conversion="DisplayXR/displayxr-leia-conversion"
 COMPONENT_PKG_MACOS_leia_conversion=""
 COMPONENT_EXE_WINDOWS_leia_conversion="DisplayXRLeiaConversionSetup-*.exe"
-COMPONENT_DEB_LINUX_leia_conversion=""
+COMPONENT_DEB_LINUX_leia_conversion="displayxr-leia-conversion_*_amd64.deb"
 COMPONENT_INSTALL_MARKER_MACOS_leia_conversion=""
 COMPONENT_INSTALL_MARKER_WINDOWS_leia_conversion="HKLM\\Software\\DisplayXR\\Plugins\\LeiaConversion"
 COMPONENT_INSTALL_MARKER_LINUX_leia_conversion=""
