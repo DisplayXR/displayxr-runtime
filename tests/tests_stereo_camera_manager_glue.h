@@ -289,9 +289,10 @@ scm_status(uint32_t *out_share_streams, char *out_shares, size_t cap);
  * One camera, GRAY8, natively rectified and calibrated (a parallel pinhole at
  * 320x240: fx 200, principal point (159.5, 119.5), baseline 50 mm). It lists
  * modes 320x240 (default, STREAM + STILL), 160x120 (STREAM), 640x480 (STREAM
- * + STILL) and 640x360 (another aspect: the manager must drop it). Frames are
- * delivered every 5 ms at the running mode's size: left half 50, right half
- * 200. A still is a GRAY8 pair at the asked size: left 60, right 180.
+ * + STILL), 640x360 (a centred 16:9 cut: kept), 640x120 (relative height
+ * 0.25: dropped) and 1280x720 (16:9, wider than any 4:3 mode). Frames are delivered every 5 ms at the running mode's
+ * size; each row encodes its position: left half 20 + 100 y / (h - 1), right half that + 120. A still is a GRAY8 pair
+ * at the asked size: left 60, right 180.
  */
 
 struct scm_v8_state
@@ -362,6 +363,10 @@ scm_acquire_still(struct scm_fixture *f,
 
 xrt_result_t
 scm_release_still(struct scm_fixture *f, uint64_t stream_id, uint64_t request_id);
+
+//! The OS session lock (every stream's frames withheld while locked).
+void
+scm_set_session_locked(bool locked);
 
 #ifdef __cplusplus
 }

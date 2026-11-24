@@ -461,6 +461,8 @@ struct scam_rectifier
 	 */
 	bool refine;                      //!< enabled (DXR_STEREO_CAMERA_REFINE)
 	struct u_stereo_rectify_input in; //!< the RAW calibration, rebuilt with a correction
+	//! Spec v8: the input as created, for the DEFAULT mode; every other mode's is derived from it.
+	struct u_stereo_rectify_input base_in;
 	struct u_stereo_vrefine ref;      //!< the controller
 	struct u_stereo_vrefine_measure_params mp;
 	struct ipc_server_stereo_camera *mgr;
@@ -1301,6 +1303,18 @@ client_visible_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s,
 	if (s->vis_checked_ns != 0 && v != s->visible) {
 		U_LOG_W("stereo camera: stream %llu (%s) %s — foreground rule", (unsigned long long)s->id, s->consumer,
 		        v ? "visible again, frames resume" : "has no visible window, frames suspended");
+	}
+	if ((s->vis_checked_ns != 0 && v != s->visible) || (s->vis_checked_ns == 0 && !v)) {
+		// Spec v8 §5.6 / §7.6: the connection is told, so a client that held the
+		// controls knows it lost them and re-applies them once AVAILABLE again.
+		struct xrt_stereo_camera_event ev = {
+		    .kind = XRT_STEREO_CAMERA_EVENT_CAMERA_STATE,
+		    .value = v ? slot_cam(m, s->camera)->state : XRT_STEREO_CAMERA_STATE_SUSPENDED,
+		    .camera_id = slot_cam(m, s->camera)->camera_id,
+		};
+		if (s->internal == NULL) {
+			evq_push_locked(m, s->owner, &ev);
+		}
 	}
 	s->vis_checked_ns = now;
 	s->visible = v;
@@ -2470,6 +2484,7 @@ rectifier_create(const struct scam_camera *cam)
 		r->apply = rectify_apply_passthrough;
 	}
 	r->in = in;
+	r->base_in = in;
 	r->mgr = cam->mgr;
 	r->camera_id = cam->camera_id;
 	r->refine = debug_get_bool_option_stereo_camera_refine();
@@ -2715,6 +2730,39 @@ camera_wants_rectified_locked(struct ipc_server_stereo_camera *m, const struct s
 
 
 /*!
+ * Spec v8 §5.5: the rectifier input for frames of @p w x @p h per eye, derived
+ * from @p base (the default mode's): K rescaled from the calibration's size to
+ * the default mode per axis, then to the mode by u_stereo_camera_mode_intrinsics
+ * (same horizontal field of view, centred vertical crop / extension). The
+ * default size returns @p base unchanged.
+ */
+static struct u_stereo_rectify_input
+rect_input_for_size(const struct u_stereo_rectify_input *base, uint32_t w, uint32_t h)
+{
+	struct u_stereo_rectify_input in = *base;
+	if (w == base->width && h == base->height) {
+		return in;
+	}
+	const uint32_t cw = base->calib_width != 0 ? base->calib_width : base->width;
+	const uint32_t ch = base->calib_height != 0 ? base->calib_height : base->height;
+	for (int e = 0; e < 2; e++) {
+		double kd[4], km[4];
+		u_stereo_camera_scale_intrinsics(base->eye[e].fx, base->eye[e].fy, base->eye[e].cx, base->eye[e].cy, cw,
+		                                 ch, base->width, base->height, kd);
+		u_stereo_camera_mode_intrinsics(kd[0], kd[1], kd[2], kd[3], base->width, base->height, w, h, km);
+		in.eye[e].fx = km[0];
+		in.eye[e].fy = km[1];
+		in.eye[e].cx = km[2];
+		in.eye[e].cy = km[3];
+	}
+	in.width = w;
+	in.height = h;
+	in.calib_width = w;
+	in.calib_height = h;
+	return in;
+}
+
+/*!
  * Spec v8 §5.5: camera thread, lock held, the source now delivers frames of
  * @p w x @p h per eye — rebuild the rectifier's geometry + maps for that size
  * (the online correction carried over, rescaled), and bump the calibration
@@ -2732,9 +2780,8 @@ rectifier_resize_locked(struct ipc_server_stereo_camera *m, struct scam_camera *
 	if (r->job_pending) {
 		return false; // the worker is measuring (or rebuilding) at the old size
 	}
-	struct u_stereo_rectify_input in = r->in;
-	in.width = w;
-	in.height = h;
+	const struct u_stereo_rectify_input plain = rect_input_for_size(&r->base_in, w, h);
+	struct u_stereo_rectify_input in = plain;
 	const double old_f = r->geo.f;
 	if (r->refine && old_f > 0.0) {
 		in.v_offset = r->ref.a / old_f; // the correction in force, normalised
@@ -2765,8 +2812,7 @@ rectifier_resize_locked(struct ipc_server_stereo_camera *m, struct scam_camera *
 	r->geo = g;
 	r->lut[0] = lut[0];
 	r->lut[1] = lut[1];
-	r->in.width = w;
-	r->in.height = h;
+	r->in = plain; // the worker folds its correction in on top of this
 	if (r->pending_ready) {
 		// Built by the worker for the old size: worthless now.
 		u_stereo_rectify_lut_fini(&r->pending_lut[0]);
@@ -2844,15 +2890,70 @@ cam_size_listed(const struct scam_camera *cam, uint32_t w, uint32_t h)
 	return cam_find_mode(cam, w, h, 0) >= 0;
 }
 
+//! Spec v8 §5.5: can a source of @p sw x @p sh per eye serve a stream of @p mw x @p mh (centred rows, scale)?
+static bool
+mode_serves(uint32_t sw, uint32_t sh, uint32_t mw, uint32_t mh)
+{
+	uint32_t y0 = 0, rows = 0;
+	return u_stereo_camera_fit_rows(sw, sh, mw, mh, &y0, &rows);
+}
+
 /*!
- * Spec v8 §5.5 rule 1: the mode the source should run — the largest (by area)
- * any started stream asks for, the default when none asks. Lock held.
+ * Spec v8 §5.5 rule 1: the SMALLEST listed STREAM mode that serves every
+ * started stream of @p cam (and an extra @p xw x @p xh one when non-zero):
+ * at least as wide as each, with at least the vertical extent of each. For
+ * streams of one aspect this is the largest mode any of them asks for.
+ * @return its index, or -1 when no single mode serves them all. Lock held.
+ */
+static int32_t
+covering_mode_locked(struct ipc_server_stereo_camera *m, const struct scam_camera *cam, uint32_t xw, uint32_t xh)
+{
+	int32_t best = -1;
+	uint64_t best_area = 0;
+	for (uint32_t k = 0; k < cam->mode_count; k++) {
+		const struct xrt_stereo_camera_mode *md = &cam->modes[k];
+		if ((md->flags & XRT_STEREO_CAMERA_MODE_STREAM) == 0 ||
+		    (xw != 0 && !mode_serves(md->eye_width, md->eye_height, xw, xh))) {
+			continue;
+		}
+		bool all = true;
+		for (uint32_t i = 0; i < MAX_STREAMS && all; i++) {
+			const struct scam_stream *s = &m->streams[i];
+			if (s->used && s->started && s->camera == cam->index) {
+				all = mode_serves(md->eye_width, md->eye_height, s->eye_w, s->eye_h);
+			}
+		}
+		const uint64_t a = (uint64_t)md->eye_width * md->eye_height;
+		if (all && (best < 0 || a < best_area)) {
+			best = (int32_t)k;
+			best_area = a;
+		}
+	}
+	return best;
+}
+
+/*!
+ * Spec v8 §5.5 rule 1: the mode the source should run — the smallest that
+ * serves every started stream (covering_mode_locked), the default when none
+ * is started. Should none serve them all (an in-process consumer that skipped
+ * the start check), the largest any of them asks for. Lock held.
  */
 static uint32_t
 wanted_mode_locked(struct ipc_server_stereo_camera *m, const struct scam_camera *cam)
 {
 	if (cam->mode_count <= 1) {
 		return 0;
+	}
+	bool any = false;
+	for (uint32_t i = 0; i < MAX_STREAMS && !any; i++) {
+		any = m->streams[i].used && m->streams[i].started && m->streams[i].camera == cam->index;
+	}
+	if (!any) {
+		return 0;
+	}
+	const int32_t cover = covering_mode_locked(m, cam, 0, 0);
+	if (cover >= 0) {
+		return (uint32_t)cover;
 	}
 	int32_t best = -1;
 	uint64_t best_area = 0;
@@ -2881,8 +2982,14 @@ frames_withheld_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s
 	return m->locked || !m->sharing_enabled || !client_visible_locked(m, s, os_monotonic_get_ns());
 }
 
-//! The rectified numbers of geometry @p g (computed at g->width x g->height), for @p w x @p h per eye.
-static void
+/*!
+ * The rectified numbers of geometry @p g (computed at g->width x g->height)
+ * for frames of @p w x @p h per eye served from it exactly as publish serves
+ * them (spec v8 §5.5): the centred rows u_stereo_camera_fit_rows picks, then
+ * a scale. @return false when @p g's frames cannot serve that size (narrower,
+ * or too few rows): the caller computes a geometry for that size instead.
+ */
+static bool
 calibration_from_geo(const struct u_stereo_rectify_result *g,
                      double f,
                      double cx,
@@ -2891,8 +2998,12 @@ calibration_from_geo(const struct u_stereo_rectify_result *g,
                      uint32_t h,
                      struct xrt_stereo_camera_calibration *out)
 {
-	double k[4];
-	u_stereo_camera_scale_intrinsics(f, f, cx, cy, g->width, g->height, w, h, k);
+	uint32_t y0 = 0, rows = 0;
+	if (!u_stereo_camera_fit_rows(g->width, g->height, w, h, &y0, &rows)) {
+		return false;
+	}
+	const double sx = (double)w / (double)g->width, sy = (double)h / (double)rows;
+	const double k[4] = {f * sx, f * sy, (cx + 0.5) * sx - 0.5, (cy - (double)y0 + 0.5) * sy - 0.5};
 	out->output = XRT_STEREO_CAMERA_OUTPUT_RECTIFIED;
 	for (int e = 0; e < 2; e++) {
 		struct xrt_stereo_camera_intrinsics *in = &out->eye[e];
@@ -2912,6 +3023,7 @@ calibration_from_geo(const struct u_stereo_rectify_result *g,
 		out->position[i] = (float)(-g->t_rect[i] / 1000.0);
 	}
 	out->baseline_mm = (float)g->baseline;
+	return true;
 }
 
 
@@ -3008,6 +3120,9 @@ source_rate_hz(const struct scam_camera *cam)
  *
  */
 
+static void
+controls_lose_locked(struct scam_camera *cam, const struct scam_stream *s, const char *why);
+
 /*!
  * Fan one source frame out. @p rf is the service-rectified image of @p f (NULL
  * when the camera has no rectifier or nobody wanted it this frame).
@@ -3072,6 +3187,9 @@ publish_locked(struct ipc_server_stereo_camera *m,
 		// pinned slot is cleared so the last image does not linger.
 		if (m->locked || !m->sharing_enabled || !client_visible_locked(m, s, now)) {
 			u_stereo_camera_ring_clear(&s->ring);
+			// Spec v8 §5.6: a stream whose frames are withheld loses the controls
+			// at once — a background app never holds the lens under the one in front.
+			controls_lose_locked(cam, s, "frames withheld");
 			continue;
 		}
 		// A RECTIFIED stream on a service-rectified camera takes the rectified
@@ -3088,16 +3206,23 @@ publish_locked(struct ipc_server_stereo_camera *m,
 		// Spec v8 §5.5: a stream of a smaller mode is served downscaled; a
 		// frame SMALLER than the stream's mode (the source mid-switch) is never
 		// scaled up — the stream waits for the source to reach its mode.
-		if (s->eye_w > few || s->eye_h > feh) {
+		// A source of another aspect: its centred rows (never letterboxed, never
+		// stretched); a source that cannot cover the mode serves nothing.
+		uint32_t y0 = 0, rows = feh;
+		if (!u_stereo_camera_fit_rows(few, feh, s->eye_w, s->eye_h, &y0, &rows)) {
 			continue;
 		}
-		const bool scale = s->eye_w != few || s->eye_h != feh;
+		const bool scale = s->eye_w != few || s->eye_h != rows;
 		if (!u_stereo_camera_decimator_accept(&s->dec, f->time_ns)) {
 			continue;
 		}
-		const uint8_t *cplanes[2] = {src->planes[0], src->planes[1]};
+		// The centred rows (y0 and rows are even: NV12 chroma rows are halves).
+		const uint8_t *cplanes[2] = {
+		    src->planes[0] + (size_t)y0 * src->pitches[0],
+		    src->planes[1] != NULL ? src->planes[1] + (size_t)(y0 / 2) * src->pitches[1] : NULL};
 		uint32_t cpitches[2] = {src->pitches[0], src->pitches[1]};
 		if (scale) {
+			const uint8_t *rplanes[2] = {cplanes[0], cplanes[1]};
 			struct u_stereo_camera_planes sl;
 			if (!u_stereo_camera_layout(src->format, s->width, s->height, &sl)) {
 				continue;
@@ -3110,8 +3235,8 @@ publish_locked(struct ipc_server_stereo_camera *m,
 				s->scaled = nb;
 				s->scaled_size = sl.size;
 			}
-			if (!u_stereo_camera_scale(src->format, src->planes, src->pitches, src->width, src->height,
-			                           s->scaled, &sl, s->width, s->height)) {
+			if (!u_stereo_camera_scale(src->format, rplanes, src->pitches, src->width, rows, s->scaled, &sl,
+			                           s->width, s->height)) {
 				continue;
 			}
 			cplanes[0] = s->scaled + sl.offset[0];
@@ -3205,27 +3330,58 @@ stream_by_sid_locked(struct ipc_server_stereo_camera *m, uint64_t id)
 }
 
 /*!
- * The RAW calibration @p c for frames of @p w x @p h per eye (pixel-centre-aware
- * rescale from its own image size); @p output RECTIFIED = a natively rectified
+ * Spec v8 §5.5: per-eye fx fy cx cy of the RAW calibration @p c for frames of
+ * @p w x @p h per eye. Two steps: the calibration's own image size -> the
+ * DEFAULT mode @p dw x @p dh (a per-axis rescale, as v7 always did), then the
+ * default -> the mode (u_stereo_camera_mode_intrinsics: same horizontal field
+ * of view, centred vertical crop / extension). Distortion is unitless.
+ */
+static void
+raw_k_for_size(const struct xrt_plugin_stereo_camera_calibration *c,
+               uint32_t dw,
+               uint32_t dh,
+               uint32_t w,
+               uint32_t h,
+               double out[2][4])
+{
+	for (int e = 0; e < 2; e++) {
+		double kd[4];
+		u_stereo_camera_scale_intrinsics(c->k[e][0], c->k[e][1], c->k[e][2], c->k[e][3], c->image_width,
+		                                 c->image_height, dw, dh, kd);
+		u_stereo_camera_mode_intrinsics(kd[0], kd[1], kd[2], kd[3], dw, dh, w, h, out[e]);
+	}
+}
+
+/*!
+ * The RAW calibration @p c for frames of @p w x @p h per eye (via the default
+ * mode @p dw x @p dh, see raw_k_for_size; 0 x 0 = v7, its own image size); @p output RECTIFIED = a natively rectified
  * source (model NONE). Pose: the right camera in the left camera's frame.
  */
 static void
 calibration_raw_scaled(const struct xrt_plugin_stereo_camera_calibration *c,
                        uint32_t output,
+                       uint32_t dw,
+                       uint32_t dh,
                        uint32_t w,
                        uint32_t h,
                        struct xrt_stereo_camera_calibration *out_calib)
 {
+	double kk[2][4];
 	if (w == 0 || h == 0) {
 		w = c->image_width; // v7: the calibration's own size
 		h = c->image_height;
+		for (int e = 0; e < 2; e++) {
+			for (int i = 0; i < 4; i++) {
+				kk[e][i] = c->k[e][i];
+			}
+		}
+	} else {
+		raw_k_for_size(c, dw, dh, w, h, kk);
 	}
 	out_calib->output = output;
 	for (int e = 0; e < 2; e++) {
 		struct xrt_stereo_camera_intrinsics *in = &out_calib->eye[e];
-		double k[4];
-		u_stereo_camera_scale_intrinsics(c->k[e][0], c->k[e][1], c->k[e][2], c->k[e][3], c->image_width,
-		                                 c->image_height, w, h, k);
+		const double *k = kk[e];
 		in->width = w;
 		in->height = h;
 		in->fx = (float)k[0];
@@ -3270,7 +3426,9 @@ struct scam_still_job
 	bool raw_allowed; //!< may a RAW-flagged still reach this client
 	bool natively_rectified;
 	bool service_rect; //!< the service rectifies this camera (cam->rect)
-	struct u_stereo_rectify_input rin;
+	struct u_stereo_rectify_input base_in; //!< the rectifier's default-mode input
+	double v_offset, v_slope;              //!< the online correction in force (normalised)
+	uint32_t def_w, def_h;                 //!< the camera's default mode
 	uint32_t generation;
 	bool have_calib;
 	struct xrt_plugin_stereo_camera_calibration calib;
@@ -3335,9 +3493,9 @@ still_produce(struct scam_camera *cam,
 			u_stereo_rectify_lut_fini(&cam->still_lut[0]);
 			u_stereo_rectify_lut_fini(&cam->still_lut[1]);
 			cam->still_rect_valid = false;
-			struct u_stereo_rectify_input rin = job->rin;
-			rin.width = ew;
-			rin.height = eh;
+			struct u_stereo_rectify_input rin = rect_input_for_size(&job->base_in, ew, eh); // §5.5
+			rin.v_offset = job->v_offset;
+			rin.v_slope = job->v_slope;
 			int64_t t0 = os_monotonic_get_ns();
 			if (u_stereo_rectify_compute(&rin, &cam->still_geo) &&
 			    u_stereo_rectify_lut_init(&cam->still_lut[0], &cam->still_geo, 1) &&
@@ -3375,7 +3533,7 @@ still_produce(struct scam_camera *cam,
 	}
 	if (output == XRT_STEREO_CAMERA_OUTPUT_RAW || !job->service_rect) {
 		if (job->have_calib) {
-			calibration_raw_scaled(&job->calib, output, ew, eh, &calib);
+			calibration_raw_scaled(&job->calib, output, job->def_w, job->def_h, ew, eh, &calib);
 		} else {
 			calib.output = output;
 		}
@@ -3465,7 +3623,7 @@ camera_v8_service_locked(struct ipc_server_stereo_camera *m, struct scam_camera 
 	struct xrt_plugin_stereo_camera *pc = (struct xrt_plugin_stereo_camera *)src;
 	const int64_t now = os_monotonic_get_ns();
 
-	// 1. Mode (§5.5): the largest a started stream asks for.
+	// 1. Mode (§5.5): the smallest serving every started stream.
 	const uint32_t want = wanted_mode_locked(m, cam);
 	// Not while idle (lingering): the next open starts at mode 0 anyway.
 	if (want != cam->run_mode && cam->started_count > 0 && now >= cam->mode_retry_ns &&
@@ -3478,8 +3636,9 @@ camera_v8_service_locked(struct ipc_server_stereo_camera *m, struct scam_camera 
 			cam->run_mode = want;
 			u_stereo_camera_rate_meter_restart(&cam->rate_meter);
 			U_LOG_W(
-			    "stereo camera %llu: source mode %ux%u -> %ux%u per eye (the largest a started stream asks "
-			    "for)",
+			    "stereo camera %llu: source mode %ux%u -> %ux%u per eye (the smallest serving every "
+			    "started "
+			    "stream)",
 			    (unsigned long long)cam->camera_id, cam->modes[from].eye_width, cam->modes[from].eye_height,
 			    cam->modes[want].eye_width, cam->modes[want].eye_height);
 		} else {
@@ -3489,7 +3648,7 @@ camera_v8_service_locked(struct ipc_server_stereo_camera *m, struct scam_camera 
 			for (uint32_t i = 0; i < MAX_STREAMS; i++) {
 				struct scam_stream *s = &m->streams[i];
 				if (s->used && s->started && !s->ended && s->camera == cam->index &&
-				    (s->eye_w > rm->eye_width || s->eye_h > rm->eye_height)) {
+				    !mode_serves(rm->eye_width, rm->eye_height, s->eye_w, s->eye_h)) {
 					stream_end_locked(m, s, XRT_STEREO_CAMERA_END_SOURCE_BUSY);
 					ended++;
 				}
@@ -3612,13 +3771,15 @@ camera_v8_service_locked(struct ipc_server_stereo_camera *m, struct scam_camera 
 	job.natively_rectified = (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED) != 0;
 	job.service_rect = cam->rect != NULL && !job.natively_rectified;
 	if (job.service_rect) {
-		job.rin = cam->rect->in;
+		job.base_in = cam->rect->base_in;
 		if (cam->rect->refine && cam->rect->geo.f > 0.0) {
-			job.rin.v_offset = cam->rect->ref.a / cam->rect->geo.f; // the correction in force
-			job.rin.v_slope = cam->rect->ref.b;
+			job.v_offset = cam->rect->ref.a / cam->rect->geo.f; // the correction in force
+			job.v_slope = cam->rect->ref.b;
 		}
 	}
 	job.generation = cam->calibration_generation;
+	job.def_w = cam->info.eye_width;
+	job.def_h = cam->info.eye_height;
 	job.have_calib = cam->have_calib && !cam->calib_nominal;
 	job.calib = cam->calib;
 	const uint64_t sid = s->id;
@@ -4021,8 +4182,12 @@ struct scam_candidate
  * Spec v8 (rescan step 3, no manager lock): a NEW plug-in camera's modes and
  * control capabilities. The list always starts with the default mode (the
  * info's eye size); the plug-in's mode 0 must be that, or its list is ignored.
- * Modes with another aspect (another field of view) are dropped; STREAM modes
- * need stereo_camera_set_mode; STILL sizes need the three still slots.
+ * Every mode must be expressible as the default's horizontal field of view
+ * about the same axis with a centred vertical crop / extension (§5.5): its
+ * relative vertical extent within [1/2, 2] of the default's and, for a
+ * calibrated camera, its derived principal point inside the frame; others are
+ * dropped. STREAM modes need stereo_camera_set_mode; STILL sizes need the
+ * three still slots.
  */
 static void
 candidate_v8_build(struct ipc_server_stereo_camera *m, struct scam_candidate *c)
@@ -4066,8 +4231,9 @@ candidate_v8_build(struct ipc_server_stereo_camera *m, struct scam_candidate *c)
 			c->modes[0].flags |=
 			    (pm[0].flags & XRT_PLUGIN_STEREO_CAMERA_MODE_STILL) ? XRT_STEREO_CAMERA_MODE_STILL : 0u;
 		}
-		const double aspect0 = (double)c->info.eye_width / (double)c->info.eye_height;
-		bool aspect_logged = false;
+		// Relative vertical extent (h/w over the default's h/w): a 16:9 default's 4:3 mode is 1.33.
+		const double hw0 = (double)c->info.eye_height / (double)c->info.eye_width;
+		bool drop_logged = false;
 		for (uint32_t i = 1; i < n; i++) {
 			const struct xrt_plugin_stereo_camera_mode *p = &pm[i];
 			uint32_t flags = 0;
@@ -4081,16 +4247,29 @@ candidate_v8_build(struct ipc_server_stereo_camera *m, struct scam_candidate *c)
 			    (p->eye_height & 1u) != 0 || p->eye_width > 16384 || p->eye_height > 16384) {
 				continue;
 			}
-			const double aspect = (double)p->eye_width / (double)p->eye_height;
-			if (fabs(aspect / aspect0 - 1.0) > 0.01) {
-				if (!aspect_logged) {
-					aspect_logged = true;
+			const double rel = ((double)p->eye_height / (double)p->eye_width) / hw0;
+			bool expressible = rel >= 0.5 - 1e-9 && rel <= 2.0 + 1e-9;
+			if (expressible && c->have_calib) {
+				// The derived principal point must land inside the mode's frame.
+				double k[2][4];
+				raw_k_for_size(&c->calib, c->info.eye_width, c->info.eye_height, p->eye_width,
+				               p->eye_height, k);
+				for (int e = 0; e < 2; e++) {
+					expressible = expressible && k[e][2] >= 0.0 && k[e][2] < p->eye_width &&
+					              k[e][3] >= 0.0 && k[e][3] < p->eye_height;
+				}
+			}
+			if (!expressible) {
+				if (!drop_logged) {
+					drop_logged = true;
 					U_LOG_W(
-					    "stereo camera: \"%s\" mode %ux%u has another aspect than the default "
-					    "%ux%u (another "
-					    "field of view) — dropped (spec v8 §5.5)",
+					    "stereo camera: \"%s\" mode %ux%u is not the default %ux%u's horizontal "
+					    "field of "
+					    "view with a centred vertical crop / extension (relative height %.2f) — "
+					    "dropped "
+					    "(spec v8 §5.5)",
 					    c->info.display_name, p->eye_width, p->eye_height, c->info.eye_width,
-					    c->info.eye_height);
+					    c->info.eye_height, rel);
 				}
 				continue;
 			}
@@ -5858,6 +6037,23 @@ controls_release_locked(struct scam_camera *cam)
 	os_cond_signal(&cam->cond);
 }
 
+/*!
+ * Spec v8 §5.6: @p s's frames are withheld (background / foreground rule, lock,
+ * sharing off): if it holds @p cam's controls it loses them now and the camera
+ * goes back to its defaults. Its client was told SUSPENDED (§7.6) and sets its
+ * controls again once it is told the camera is back. Lock held.
+ */
+static void
+controls_lose_locked(struct scam_camera *cam, const struct scam_stream *s, const char *why)
+{
+	if (cam->control_holder == 0 || cam->control_holder != s->id) {
+		return;
+	}
+	controls_release_locked(cam);
+	U_LOG_W("stereo camera %llu: stream %llu lost the controls (%s) — back to the source's defaults",
+	        (unsigned long long)cam->camera_id, (unsigned long long)s->id, why);
+}
+
 //! Spec v8 §5.7: still @p s->still ends without pixels; the owner is told why. Lock held.
 static void
 still_fail_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s, xrt_result_t why)
@@ -6414,8 +6610,10 @@ fill_properties_locked(struct ipc_server_stereo_camera *m,
 		// Spec §3: per eye, RECTIFIED (the service's rectified focal when it
 		// rectifies; the plug-in's own for a natively rectified source).
 		double fx = cam->calib.k[0][0], cx = 0.0, cy = 0.0;
+		double fov_w = cam->info.eye_width;
 		if (cam->rect != NULL) {
 			rectified_intrinsics(cam->rect, &fx, &cx, &cy);
+			fov_w = cam->rect->geo.width; // v8: the rectifier runs at the source's mode
 		}
 		// Amendment 4: a NOMINAL model reports only what the user configured;
 		// a default it fell back to is not a fact about the device (0 = unknown).
@@ -6424,7 +6622,7 @@ fill_properties_locked(struct ipc_server_stereo_camera *m,
 		}
 		if (fx > 0.0 && (!cam->calib_nominal || cam->hfov_known)) {
 			out_props->horizontal_fov_deg =
-			    (float)(2.0 * atan(cam->info.eye_width / (2.0 * fx)) * 180.0 / 3.14159265358979323846);
+			    (float)(2.0 * atan(fov_w / (2.0 * fx)) * 180.0 / 3.14159265358979323846);
 		}
 	}
 	out_props->supported_formats = XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_GRAY8) |
@@ -6529,10 +6727,25 @@ fill_calibration_locked(const struct scam_camera *cam,
 			w = cam->info.eye_width;
 			h = cam->info.eye_height;
 		}
-		calibration_from_geo(&cam->rect->geo, f, cx, cy, w, h, out_calib);
+		if (calibration_from_geo(&cam->rect->geo, f, cx, cy, w, h, out_calib)) {
+			return;
+		}
+		// The source's current mode cannot serve this size (e.g. it runs 16:9
+		// and a 4:3 mode is asked): the geometry the service builds when the
+		// source runs exactly that mode, correction included. calibrationGeneration
+		// moves if the frames later come from another source mode.
+		struct u_stereo_rectify_input in = rect_input_for_size(&cam->rect->base_in, w, h);
+		if (cam->rect->refine && cam->rect->geo.f > 0.0) {
+			in.v_offset = cam->rect->ref.a / cam->rect->geo.f;
+			in.v_slope = cam->rect->ref.b;
+		}
+		struct u_stereo_rectify_result g;
+		if (u_stereo_rectify_compute(&in, &g)) {
+			(void)calibration_from_geo(&g, g.f, g.cx, g.cy, w, h, out_calib);
+		}
 		return;
 	}
-	calibration_raw_scaled(&cam->calib, output, w, h, out_calib);
+	calibration_raw_scaled(&cam->calib, output, cam->info.eye_width, cam->info.eye_height, w, h, out_calib);
 }
 
 /*!
@@ -6973,6 +7186,18 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 		        (unsigned long long)cam->camera_id, (unsigned long long)s->id);
 		return XRT_ERROR_STEREO_CAMERA_BUSY;
 	}
+	// Spec v8 §5.5: one source mode must serve every started stream of the camera,
+	// this one included (a 16:9 1920 stream and a 4:3 1280 stream need a mode at
+	// least 1920 wide and 4:3 tall). None: BUSY — the camera is in use in a way
+	// this request cannot share; retry when the other stream stops.
+	if (cam->mode_count > 1 && covering_mode_locked(m, cam, s->eye_w, s->eye_h) < 0) {
+		os_mutex_unlock(&m->lock);
+		U_LOG_W(
+		    "stereo camera %llu: stream %llu (%ux%u per eye) start refused — no listed mode serves it together "
+		    "with the started streams (BUSY)",
+		    (unsigned long long)cam->camera_id, (unsigned long long)s->id, s->eye_w, s->eye_h);
+		return XRT_ERROR_STEREO_CAMERA_BUSY;
+	}
 	s->delegating = dec.delegating || s->delegating;
 	s->delegated = dec.delegated;
 	s->consent_why = (uint32_t)dec.why;
@@ -7308,6 +7533,19 @@ ipc_handle_stereo_camera_set_controls(volatile struct ipc_client_state *ics,
 		return xret;
 	}
 	struct scam_camera *cam = slot_cam(m, s->camera);
+	if (cam->control_holder != 0 && cam->control_holder != s->id) {
+		// Spec v8 §5.6: a holder whose frames are withheld right now (it went to
+		// the background before a frame told publish so) never blocks this one.
+		struct scam_stream *h = stream_by_sid_locked(m, cam->control_holder);
+		if (h == NULL || !h->started || h->ended || frames_withheld_locked(m, h)) {
+			U_LOG_W(
+			    "stereo camera %llu: stream %llu lost the controls (its frames are withheld) to stream "
+			    "%llu",
+			    (unsigned long long)cam->camera_id, (unsigned long long)cam->control_holder,
+			    (unsigned long long)s->id);
+			controls_release_locked(cam);
+		}
+	}
 	const struct xrt_stereo_camera_control_caps *k = &cam->caps;
 	const uint32_t v = c->valid_controls;
 	if (!cam->have_caps || (v & ~k->supported_controls) != 0) {
@@ -7748,6 +7986,9 @@ ipc_server_stereo_camera_set_session_locked(bool locked, const char *why)
 			for (uint32_t i = 0; i < MAX_STREAMS; i++) {
 				if (m->streams[i].used) {
 					u_stereo_camera_ring_clear(&m->streams[i].ring);
+					// Spec v8 §5.6: frames withheld = the controls hold is lost.
+					controls_lose_locked(slot_cam(m, m->streams[i].camera), &m->streams[i],
+					                     "session locked");
 				}
 			}
 		}

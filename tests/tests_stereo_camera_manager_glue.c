@@ -1213,13 +1213,19 @@ static struct
 	struct xrt_plugin_stereo_camera_controls ctl;
 } g_v8 = {.lock = PTHREAD_MUTEX_INITIALIZER};
 
-static const struct xrt_plugin_stereo_camera_mode k_v8_modes[4] = {
+#define V8_MODES 6
+static const struct xrt_plugin_stereo_camera_mode k_v8_modes[V8_MODES] = {
     {sizeof(struct xrt_plugin_stereo_camera_mode), 320, 240, 30.0f,
      XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM | XRT_PLUGIN_STEREO_CAMERA_MODE_STILL},
     {sizeof(struct xrt_plugin_stereo_camera_mode), 160, 120, 30.0f, XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM},
     {sizeof(struct xrt_plugin_stereo_camera_mode), 640, 480, 15.0f,
      XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM | XRT_PLUGIN_STEREO_CAMERA_MODE_STILL},
+    // Spec v8 §5.5: the default's horizontal field of view, a centred 16:9 cut: kept.
     {sizeof(struct xrt_plugin_stereo_camera_mode), 640, 360, 30.0f, XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM},
+    // Relative height 0.25: not a vertical crop / extension the rule allows: dropped.
+    {sizeof(struct xrt_plugin_stereo_camera_mode), 640, 120, 30.0f, XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM},
+    // A wide 16:9 mode no 4:3 mode covers: 1280x720 + any 4:3 stream has no common mode.
+    {sizeof(struct xrt_plugin_stereo_camera_mode), 1280, 720, 30.0f, XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM},
 };
 
 static uint32_t
@@ -1286,9 +1292,12 @@ v8_wait_frame(struct xrt_plugin_stereo_camera *cam, int64_t timeout_ns, struct x
 		return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
 	}
 	g_v8.frame = buf;
+	// Rows encode where they are in the source frame (crop checks): left half
+	// 20 + 100 y / (h - 1), right half 140 + 100 y / (h - 1).
 	for (uint32_t y = 0; y < h; y++) {
-		memset(buf + (size_t)y * 2 * w, 50, w);
-		memset(buf + (size_t)y * 2 * w + w, 200, w);
+		const uint8_t v = (uint8_t)(20.0 + 100.0 * y / (double)(h - 1) + 0.5);
+		memset(buf + (size_t)y * 2 * w, v, w);
+		memset(buf + (size_t)y * 2 * w + w, (uint8_t)(v + 120), w);
 	}
 	g_v8.seq++;
 	memset(out, 0, sizeof(*out));
@@ -1312,10 +1321,10 @@ v8_enumerate_modes(struct xrt_plugin_instance *inst,
 {
 	(void)inst;
 	(void)index;
-	for (uint32_t i = 0; i < 4 && i < capacity && out != NULL; i++) {
+	for (uint32_t i = 0; i < V8_MODES && i < capacity && out != NULL; i++) {
 		out[i] = k_v8_modes[i];
 	}
-	return 4;
+	return V8_MODES;
 }
 
 static xrt_result_t
@@ -1325,7 +1334,7 @@ v8_set_mode(struct xrt_plugin_stereo_camera *cam, uint32_t mode_index)
 	pthread_mutex_lock(&g_v8.lock);
 	g_v8.st.set_mode_calls++;
 	xrt_result_t xret = XRT_SUCCESS;
-	if (mode_index >= 4 || (g_v8.refuse_modes && mode_index != 0)) {
+	if (mode_index >= V8_MODES || (g_v8.refuse_modes && mode_index != 0)) {
 		xret = XRT_ERROR_INPUT_UNSUPPORTED;
 	} else {
 		g_v8.st.last_mode_index = mode_index;
@@ -1569,6 +1578,12 @@ scm_acquire_still(struct scm_fixture *f,
 	munmap(p, size);
 #endif
 	return XRT_SUCCESS;
+}
+
+void
+scm_set_session_locked(bool locked)
+{
+	ipc_server_stereo_camera_set_session_locked(locked, "test");
 }
 
 xrt_result_t

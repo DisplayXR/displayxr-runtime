@@ -235,6 +235,30 @@ TEST_CASE("spec v8: SBS downscale keeps each eye to its own half, in every forma
 	CHECK(k[0] == Catch::Approx(800.0));
 	CHECK(k[2] == Catch::Approx(639.5));
 	CHECK(k[3] == Catch::Approx(479.5));
+
+	// Spec v8 §5.5: a mode of another vertical extent (the tablet: 16:9 default
+	// 1280x720 cut from a 4:3 1280x960 sensor) keeps the principal point's offset
+	// from the centre, scaled by the width.
+	u_stereo_camera_mode_intrinsics(1000.0, 1000.0, 639.5, 359.5 + 7.0, 1280, 720, 1280, 960, k);
+	CHECK(k[0] == Catch::Approx(1000.0));
+	CHECK(k[3] == Catch::Approx(479.5 + 7.0));
+	u_stereo_camera_mode_intrinsics(1000.0, 1000.0, 639.5, 359.5 + 7.0, 1280, 720, 2560, 1920, k);
+	CHECK(k[0] == Catch::Approx(2000.0));
+	CHECK(k[2] == Catch::Approx(1279.5));
+	CHECK(k[3] == Catch::Approx(959.5 + 14.0));
+	// Centred rows: never letterbox, never stretch.
+	uint32_t y0 = 0, rows = 0;
+	REQUIRE(u_stereo_camera_fit_rows(1280, 960, 1280, 720, &y0, &rows));
+	CHECK(y0 == 120);
+	CHECK(rows == 720);
+	REQUIRE(u_stereo_camera_fit_rows(1920, 1440, 1280, 720, &y0, &rows));
+	CHECK(y0 == 180);
+	CHECK(rows == 1080);
+	REQUIRE(u_stereo_camera_fit_rows(640, 480, 640, 480, &y0, &rows));
+	CHECK(y0 == 0);
+	CHECK(rows == 480);
+	CHECK_FALSE(u_stereo_camera_fit_rows(1280, 720, 640, 480, &y0, &rows)); // 16:9 cannot serve 4:3
+	CHECK_FALSE(u_stereo_camera_fit_rows(640, 480, 1280, 960, &y0, &rows)); // never upscale
 }
 
 TEST_CASE("stereo camera layout", "[stereo_camera]")

@@ -924,6 +924,46 @@ u_stereo_camera_scale(uint32_t format,
 }
 
 void
+u_stereo_camera_mode_intrinsics(double fx,
+                                double fy,
+                                double cx,
+                                double cy,
+                                uint32_t from_w,
+                                uint32_t from_h,
+                                uint32_t to_w,
+                                uint32_t to_h,
+                                double out[4])
+{
+	const double s = from_w > 0 ? (double)to_w / (double)from_w : 1.0;
+	out[0] = fx * s;
+	out[1] = fy * s;
+	out[2] = (cx + 0.5) * s - 0.5;
+	out[3] = (cy + 0.5 - (double)from_h * 0.5) * s + (double)to_h * 0.5 - 0.5;
+}
+
+bool
+u_stereo_camera_fit_rows(
+    uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h, uint32_t *out_y0, uint32_t *out_rows)
+{
+	if (src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 || dst_w > src_w) {
+		return false;
+	}
+	const double exact = (double)dst_h * (double)src_w / (double)dst_w;
+	uint32_t rows = (uint32_t)(exact / 2.0 + 0.5) * 2u; // even (NV12)
+	rows = rows < 2 ? 2 : rows;
+	if (rows > src_h) {
+		if (exact <= (double)src_h + 1.0) {
+			rows = src_h & ~1u; // rounding only: take them all
+		} else {
+			return false;
+		}
+	}
+	*out_rows = rows;
+	*out_y0 = ((src_h - rows) / 2u) & ~1u;
+	return true;
+}
+
+void
 u_stereo_camera_scale_intrinsics(double fx,
                                  double fy,
                                  double cx,

@@ -9,7 +9,7 @@
 | **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **R2 implemented**: the service-side rectifier (`u_stereo_rectify`, CPU) — RECTIFIED frames + rectified calibration from any CALIBRATED source, golden-tested against OpenCV, and a distorted sim fake with ground truth. **Not yet:** consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports (the rectifier has the seam), state-change events, the Leia provider (L1), the browser (B1). **Amendment 4 implemented** (2026-10-07): a vendor-neutral, service-owned source for plain UVC side-by-side stereo webcams (§9a) — Windows Media Foundation; desktop Linux V4L2 since 2026-10-18 (§9a; no SBS webcam has run on it yet). Provisional type values `1004999300–310` (relocated from `290–300` when `XR_DXR_weave` v14 took `290`; `XR_DXR_lift` holds `270–289`), pending Khronos registry |
 | **R1 decisions** | stereo-only (names/structs kept open: `viewCount`, next chains) · camera provider = `xrt_plugin_iface` slots · service clients only (in-process enumerates zero) · raw frames never reach web pages (`RAW` refused to `PRESENT_OWNER` clients) — see [roadmap §G](../../roadmap/stereo-camera-source.md#g-open-questions--maintainer-decisions) |
 | **Decision record** | [ADR-043](../../adr/ADR-043-stereo-camera-source.md) |
-| **Spec v8** (2026-11) | **Implemented** (runtime, hardware-free): capture modes with service-side downscaling (§5.5), focus / metering / exposure controls with one holder per camera and the per-frame capture state (§5.6), stills over a read-only shared-memory section (§5.7), plug-in slots (§9b), sim_display fake, `displayxr-cli camera modes / set / still`. **Not yet:** the `AHardwareBuffer` still transport; the Leia provider's implementation of the §9b slots |
+| **Spec v8** (2026-11) | **Implemented** (runtime, hardware-free): capture modes with service-side downscaling (§5.5), focus / metering / exposure controls with one holder per camera and the per-frame capture state (§5.6), stills over a read-only shared-memory section (§5.7), plug-in slots (§9b), sim_display fake, `displayxr-cli camera modes / set / still`. **Not yet:** the `AHardwareBuffer` still transport; the Leia provider's implementation of the §9b slots. Known limits: §5.8 |
 | **Plug-in contract** | appended `xrt_plugin_iface` camera slots, `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (§9); v8 slots `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES` / `_CONTROLS` / `_STILL` (§9b) |
 | **Second source** | the service's own UVC side-by-side webcam source, opt-in per device (§9a, ADR-043 Amendment 4) |
 | **Browser / Android integration + plan** | [roadmap/stereo-camera-source.md](../../roadmap/stereo-camera-source.md) |
@@ -449,11 +449,23 @@ XrStereoCameraStreamCreateInfoDXR ci = {XR_TYPE_STEREO_CAMERA_STREAM_CREATE_INFO
 - **Every camera lists at least one mode** — its default. A camera whose source lists no modes
   (a plug-in that predates v8, the UVC source of §9a, an app entry) reports exactly that one, so a
   consumer never needs a v7 fallback path beyond "the runtime is older than v8".
-- **One field of view.** Every mode of a camera images the same field of view: a mode is a scale of
-  the default mode (same aspect within 1 %, same optical centre). One calibration, rescaled, therefore
-  describes every mode, and a smaller mode can be served from a larger one by scaling. A source whose
-  sensor modes crop lists only one crop family; the service drops a listed mode whose aspect differs
-  from the default's (one WARN per camera).
+- **One horizontal field of view.** Every mode of a camera has the default mode's **horizontal**
+  field of view, about the same optical axis, with square pixels; its **vertical** extent may differ —
+  a centred vertical crop or extension of the default. The reference case is the tablet: its default
+  is the centre 16:9 cut (1280×720) of a 4:3 sensor (1280×960), and the camera app wants the full 4:3
+  for stills and may stream it. One calibration (the default's) therefore describes every mode, with
+  `s = width / width_default`:
+
+  ```
+  f' = f·s     cx' = (cx + ½)·s − ½     cy' = (cy + ½ − H_default/2)·s + H/2 − ½     distortion unchanged
+  ```
+
+  (pixel centres at integer coordinates, as everywhere in this spec; in an edge-origin convention the
+  same rule reads `cy' = (cy − H_default/2)·s + H/2`). The service drops, with one WARN per camera, a
+  listed mode that is not expressible this way: a relative height `(H/W) / (H_default/W_default)`
+  outside [½, 2], or — for a calibrated camera — a derived principal point outside the mode's frame.
+  Sizes alone cannot reveal a mode that crops HORIZONTALLY; listing one is a plug-in contract
+  violation (§9b).
 - **Absent = default.** Without `XrStereoCameraStreamModeInfoDXR` the stream runs the default mode,
   exactly as in v7. With it, `eyeExtent` must equal a `STREAM` mode's (`XR_ERROR_VALIDATION_FAILURE`
   otherwise). The stream's frames, ring and `XrStereoCameraStreamInfoDXR::extent` are then
@@ -461,19 +473,26 @@ XrStereoCameraStreamCreateInfoDXR ci = {XR_TYPE_STEREO_CAMERA_STREAM_CREATE_INFO
 - **Calibration of a mode.** Chain the same `XrStereoCameraStreamModeInfoDXR` on
   `XrStereoCameraCalibrationDXR::next` and `xrGetStereoCameraCalibrationDXR` returns the numbers of
   frames of that per-eye size (`eye[i].imageExtent` = it). Absent = the default mode's, as before.
-  RAW numbers are the device calibration rescaled pixel-centre-aware (`f' = f·s`,
-  `c' = (c + ½)·s − ½`); RECTIFIED numbers are those of the rectifier the source currently runs,
-  rescaled the same way — so frames and numbers never disagree, and `calibrationGeneration` moves
-  when they change (below).
+  RAW numbers are the device calibration carried to the mode by the rule above; RECTIFIED numbers
+  are those of the rectifier the source currently runs, carried through the same centred-rows crop
+  and scale its frames go through (or, when the source runs a mode that cannot serve that size, the
+  geometry the service builds for the mode itself) — so frames and numbers never disagree, and
+  `calibrationGeneration` moves when they change (below).
 
 **One capture, several modes (principle 2).** Two streams of one camera may ask for different
 modes. The service decides what the source runs:
 
-1. **The source runs the largest mode any started stream asks for** (by pixel area; the default
-   mode when none asks). Every stream whose mode is smaller is served from it, **downscaled by the
-   service** per eye (integer box pre-reduction, then bilinear, each half sampling only its own
-   half), before the format conversion. A stream never receives frames of a smaller mode scaled up:
-   while the source runs a smaller mode (during a switch), such a stream simply gets no frames.
+1. **The source runs the smallest STREAM mode that serves every started stream** — at least as wide
+   as each and at least as tall relative to its width (the default mode when none is started). For
+   streams of one aspect this is simply the largest mode any of them asks for. Every other stream is
+   served from it: **the centred rows** of the stream's aspect (rows = H·W_source/W, even), **then
+   downscaled by the service** per eye (integer box pre-reduction, then bilinear, each half sampling
+   only its own half), before the format conversion — **never letterboxed, never stretched**, never
+   scaled up. A 16:9 stream on a source running 4:3 gets the middle 16:9 band; while the source runs a
+   mode that cannot serve a stream (during a switch), that stream simply gets no frames.
+   **A start no single listed mode can serve together with the started streams is refused with
+   `XR_ERROR_STEREO_CAMERA_BUSY_DXR`** (e.g. a 1920×1080 16:9 stream while a 4:3 stream runs and no
+   4:3 mode is 1920 wide); it may be started once the other stream stops.
 2. **A mode change is a reconfigure, not a restart.** When the wanted mode changes (a larger stream
    starts, the largest one stops) the service asks the open source to switch
    (`stereo_camera_set_mode`, §9b). The source keeps its open state, sequence numbers keep counting,
@@ -534,8 +553,20 @@ Rules:
 - **One controller per camera.** The first stream that sets controls **holds** them. Another stream
   of the same camera — any connection — gets `XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR` until the
   holder calls `xrReleaseStereoCameraControlsDXR`, stops, ends (§7.4) or is destroyed (its connection
-  closing included). When the hold ends the camera returns to its defaults (every field unset), so a
-  call's preview never inherits another app's manual focus.
+  closing included) — **or its frames are withheld** (below). When the hold ends the camera returns to
+  its defaults (every field unset), so a call's preview never inherits another app's manual focus.
+- **The hold does not survive the background.** The moment the holder's frames are withheld — its
+  app goes to the background or loses its visible window (§7.2, including the Android front-camera
+  rule), the session locks, sharing is switched off — it loses the hold and the camera returns to its
+  defaults. A foreground app is therefore never blocked by a background one: its
+  `xrSetStereoCameraControlsDXR` succeeds even if the old holder has not yet had a frame withheld
+  (the service checks the holder's state on the spot). The holder's connection is told with the
+  existing `XrEventDataStereoCameraStateChangedDXR`: `SUSPENDED` when its frames stop (§7.6 — v8
+  makes this guaranteed for the foreground rule too, which before only stopped the frames), the
+  camera's state again when they resume. **A client that set controls re-applies them after a
+  `SUSPENDED` → `AVAILABLE` transition** (and treats any `XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR`
+  as "someone else in front holds them now"). Re-applying is idempotent, except that setting
+  `AUTO_ONCE` again starts a new search.
 - **Same gate as frames.** Controls need a **started** stream (`XR_ERROR_CALL_ORDER_INVALID`
   otherwise): start is the authorisation point (§7.1), so controls need exactly the consent a
   stream does. A stream whose frames are withheld right now — the session is locked, sharing is off,
@@ -543,7 +574,7 @@ Rules:
   `XR_ERROR_PERMISSION_INSUFFICIENT`: an app in the background never moves the lens under the app in
   front. An ended stream gets `XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR`.
 - Controls are applied by the camera thread between two frames (≤ one frame period, at most 100 ms),
-  and re-applied after the source re-opens.
+  and re-applied after the source re-opens while the hold lasts.
 
 **Reported state.** Chain `XrStereoCameraCaptureResultDXR` on `XrStereoCameraFrameDXR::next`
 (zero-initialised: an older runtime leaves it untouched) and each acquired frame carries the state
@@ -618,6 +649,25 @@ xrReleaseStereoCameraStillDXR(stream, id);
   camera), converts it and copies it into a fresh section. Transport is **shared memory only** in v8;
   an `AHardwareBuffer` still (Android, zero-copy for 12 MP pairs) is the next step and its struct
   type value (1004999469) is held back for it.
+
+### 5.8 Known limits (v8, as built)
+
+- **A large RECTIFIED still is slow today.** The service rectifies a still on the camera's own
+  thread, building a remap table for the still size on first use (cached per camera): the first
+  1280×960-per-eye still on the distorted sim fake took 1.2–1.4 s in a Debug build, and a 12 MP pair's
+  table is ~180 MB while it exists. That camera's stream frames stall meanwhile. **A RAW still stays
+  cheap** — no rectifier, one copy (or format conversion) into its section — and is the intended path
+  for a camera app that rectifies on its own GPU with the still's calibration. Moving still
+  rectification off the camera thread is a follow-up.
+- **Per-stream downscale runs under the manager lock**, one pass per stream (like the format
+  conversion it precedes). Measured on this Mac, distorted fake, a 1280×960 RECTIFIED stream plus a
+  default 640×480 RECTIFIED stream served downscaled from it: Debug build ~7.5 Hz and ~9 Hz; **Release
+  build 30.0 Hz and 29.8 Hz (the full source rate), mean source-to-publish latency 26–28 ms** — so
+  the Debug rates are a Debug artefact, not a design limit. Sharing one scaled image per target size
+  and scaling outside the lock are follow-ups.
+- Centred rows are rounded to an even count (NV12): when `H·W_source/W` is not an integer the served
+  stream's numbers carry `fx ≠ fy` by at most one row in `H`; they always describe the frames exactly.
+- Shared memory only; the `AHardwareBuffer` still (and stream) transport is the next step.
 
 ## 6. Coexistence with eye tracking
 
@@ -865,6 +915,10 @@ The service queues, per connection (16 deep, oldest dropped), and the client dra
   is pending per connection.
 - `XrEventDataStereoCameraStillReadyDXR` / `XrEventDataStereoCameraStillFailedDXR` (spec v8) — a
   still the connection requested completed (§5.7). Never coalesced.
+- Spec v8: a connection whose stream's frames stop under the **foreground rule** (§7.2) is now also
+  told `XrEventDataStereoCameraStateChangedDXR` `SUSPENDED`, and the camera's state when they resume
+  (the lock and the sharing toggle already were). It is the signal that a controls hold was lost
+  (§5.6).
 
 ## 8. Errors
 
@@ -875,7 +929,7 @@ The service queues, per connection (16 deep, oldest dropped), and the client dra
 | `XR_ERROR_PERMISSION_INSUFFICIENT` | the OS camera privacy switch denies the app (§7.1 row 4, delegating clients included); RAW asked by a browser / delegating client; a client class that may not use cameras (or `xrCreateSession` from a `CAMERA_CONSUMER`); (v8) controls or a still on a stream whose frames are withheld right now (§7.2), a RAW still to a browser / delegating client |
 | `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` | §7.1: the user / the stored decision refused, the prompt was unanswered or unavailable; retryable after consent. A browser maps it to `NotAllowedError`. A registered delegating client gets it too when its delegation was skipped — it declined (`DECLINE_DELEGATION_BIT`, §2a) or its entry is untrusted (§7.1.1) — and no stored Allow / prompt answer allowed it |
 | `XR_ERROR_STEREO_CAMERA_DISABLED_DXR` | §7.4: sharing is off (user toggle or `DXR_STEREO_CAMERA=0`) |
-| `XR_ERROR_STEREO_CAMERA_BUSY_DXR` | the plug-in could not open the source and its retry is pending; retry later. A browser maps it to `NotReadableError` |
+| `XR_ERROR_STEREO_CAMERA_BUSY_DXR` | the plug-in could not open the source and its retry is pending; retry later. A browser maps it to `NotReadableError`. (v8) a start no single listed mode can serve together with the camera's started streams (§5.5) |
 | `XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR` | start / acquire on a stream the service ended (§7.4); destroy it and create a new one |
 | `XR_ERROR_FEATURE_UNSUPPORTED` | GPU transport requested on a platform without it; (v8) a control the camera does not have, a still on a camera without still sizes |
 | `XR_ERROR_LIMIT_REACHED` | more than 8 streams per camera service-wide; (v8) a still requested while the stream's previous still is pending or unreleased |
@@ -1032,9 +1086,16 @@ void         (*stereo_camera_release_still)(cam);
 
 Rules a plug-in must keep:
 
-- **Modes.** List mode 0 = the default; list only modes of the **same field of view** (a scale of the
-  default; the runtime drops another aspect with one WARN) and only modes the source can really
-  run now — a tracking-shared camera lists none that would hurt tracking. A camera opens in mode 0;
+- **Modes.** List mode 0 = the default. Every other mode must have the **default's horizontal field
+  of view about the same optical axis, with square pixels**; its vertical extent may differ — a
+  centred vertical crop or extension of the default (e.g. the full 4:3 sensor, 1280×960, beside a
+  16:9 default cut from its centre, 1280×720). Do **not** list a mode that crops horizontally, is
+  off-centre, or has non-square pixels: the runtime derives every mode's calibration from the one
+  you return for the default (`s = w / w_default`, `f' = f·s`, `cx' = (cx + ½)·s − ½`,
+  `cy' = (cy + ½ − h_default/2)·s + h/2 − ½`, distortion unchanged) and would silently describe such
+  a mode wrongly (it drops only modes whose relative height is outside [½, 2] or whose derived
+  principal point leaves the frame). List only modes the source can really run now — a
+  tracking-shared camera lists none that would hurt tracking. A camera opens in mode 0;
   the runtime calls `set_mode` right after `stereo_camera_open` (before the first `wait_frame`) when
   it wants another, so **configure the capture session lazily**. `set_mode` on an open camera is a
   reconfigure: keep the sequence counting, pause frames at most 500 ms, deliver frames of the new size
@@ -1042,7 +1103,9 @@ Rules a plug-in must keep:
   the frame). An error leaves the camera where it was. A plug-in that lists several STREAM modes
   without `set_mode` is listed with mode 0 only. STILL-only sizes need no `set_mode`.
 - **Controls.** `get_control_caps` advertises only what the source does; the runtime never sends an
-  unadvertised control. `set_controls` always receives the **whole** wanted state: a field whose bit
+  unadvertised control. `set_controls` always receives the **whole** wanted state (including
+  `valid_controls == 0` the moment the holding app is backgrounded, locked out or stops — apply it
+  promptly: the camera must be back on its defaults for whoever is in front): a field whose bit
   is clear means "the source's own default", and `valid_controls == 0` (the app released, stopped or
   left) means back to the defaults. AUTO_ONCE is edge-triggered by `focus_trigger`: start a new search
   whenever it changes. The metering point is normalised in the **raw left eye of the frame the plug-in
@@ -1053,7 +1116,8 @@ Rules a plug-in must keep:
 - **Stills.** `request_still` returns at once; the runtime polls `poll_still` after every
   `wait_frame` while one is outstanding (one at a time per camera). READY hands over ONE RAW SBS pair
   in a native format (GRAY8 / NV12 / BGRA8), of the requested size **or smaller** (protecting
-  tracking), same field of view, planes valid until `release_still`; FAILED ends the request. The
+  tracking) with the same horizontal field of view (its calibration is derived by the §5.5 rule from
+  its actual size), planes valid until `release_still`; FAILED ends the request. The
   stream's frames may pause for at most 1 s around a still and must resume by themselves. The runtime
   gives up after 10 s (and closes nothing).
 
@@ -1262,9 +1326,13 @@ The whole path (enumerate → consent → start → acquire → rectify) then ru
 
 **Spec v8 (as built).** The fake also implements every §9b slot, with no extra knob:
 
-- **Modes:** the configured size (default, STREAM + STILL), half of it (STREAM) and double (STREAM +
-  STILL, capped at 4096 px). `set_mode` re-renders the same scene at the new size (fx scales with the
-  width, so every mode images one field of view and the rescaled calibration is exact).
+- **Modes:** the configured size (default, STREAM + STILL), half of it (STREAM), double (STREAM +
+  STILL, capped at 4096 px), and the other aspect at the same horizontal field of view: a default
+  wider than 4:3 (`_SIZE=640x360`, the tablet's shape) adds the full 4:3 sensor as a STREAM mode
+  (640×480) and a double-size 4:3 STILL size (1280×960); a 4:3 default (the 640×480 default) adds its
+  centred 16:9 cut as STREAM modes (640×360, 1280×720). `set_mode` re-renders the scene at the new
+  size; fx scales with the width and, on `_DISTORT=1`, every mode's lenses are the default's carried
+  by the §5.5 rule (`sim_stereo_camera_truth_init_ex`), so the derived calibration is exact.
 - **Controls:** all four, every focus mode, nearest focus 10 D (`APPROXIMATE`), EV −2…+2 in ⅓ steps.
   The fake lens moves towards its target with a 150 ms time constant and reports `SEARCHING` until it
   is within 0.01 D: MANUAL goes to the asked distance, AUTO_ONCE / CONTINUOUS_AUTO to the depth under
@@ -1282,6 +1350,11 @@ doubled; `camera set focus-mode once point 0.5,0.5` settles on the bar at 1.66 D
 default `--rectified` probe (served downscaled from the 1280×960 rectified source) both PASS row
 alignment; `camera still` returns a 2560×960 RECTIFIED still with |dy| median 0.014 px and depths
 1.998 m / 0.600 m from its own calibration, and a RAW still keeps the 2 px raw misalignment.
+With `_SIZE=640x360 _DISTORT=1` (16:9 default, 4:3 sensor): a 640×480 `--rectified` probe and a
+concurrent default (16:9) `--rectified` probe make the source run 640×480; the 16:9 stream, served
+from its centred rows, PASSes (|dy| median 0.016 px, 2.005 m / 0.599 m from the 16:9 numbers), as
+does the 4:3 one; `camera still --size 1280x960` returns a RECTIFIED 4:3 still with |dy| median
+0.013 px and 1.998 m / 0.600 m from its own (derived) calibration.
 
 ## 11. Probe and diagnostics
 
@@ -1390,7 +1463,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
-| 8 | A camera app, not only a call (appended; no public struct changes size; nothing renumbered). **Modes** (§5.5): `xrEnumerateStereoCameraModesDXR` → `XrStereoCameraModeDXR` (`XR_TYPE_STEREO_CAMERA_MODE_DXR` = 1004999319; flags `DEFAULT` / `STREAM` / `STILL`), every camera lists at least its default; `XrStereoCameraStreamModeInfoDXR` (1004999460) chained on the stream create info (absent = the default mode, v7 unchanged) or on the calibration query (numbers for that size); one field of view per camera; the source runs the largest mode any started stream asks for, smaller streams are downscaled by the service, a switch is a reconfigure gap (≤ 500 ms) and never ends a stream unless the source refuses it (then `SOURCE_BUSY` for the streams it cannot serve). **Controls** (§5.6): `XrStereoCameraControlCapabilitiesDXR` (1004999461) chained on the properties; `xrSetStereoCameraControlsDXR` (`XrStereoCameraControlsDXR`, 1004999462: focus mode, focus distance in dioptres, metering point in the stream's left eye, EV) / `xrReleaseStereoCameraControlsDXR`; one holder per camera (`XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR` = −1004999468), started streams only, frames-withheld streams refused; `XrStereoCameraCaptureResultDXR` (1004999463) chained on a frame or a still. **Stills** (§5.7): `xrRequestStereoCameraStillDXR` (`XrStereoCameraStillRequestDXR`, 1004999464) → `XrEventDataStereoCameraStillReadyDXR` (1004999466) / `…StillFailedDXR` (1004999467) → `xrAcquireStereoCameraStillDXR` (`XrStereoCameraStillDXR`, 1004999465: a read-only section + layout, chained capture result + calibration) / `xrReleaseStereoCameraStillDXR`; one still per stream at a time; the stream may pause (≤ 1 s) and resumes by itself; a tracking-shared camera may refuse or downsize. Shared memory only; the `AHardwareBuffer` still transport is the next step (1004999469 held back). Plug-in contract §9b: eight appended slots (`XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES` / `_CONTROLS` / `_STILL`), no ABI bump |
+| 8 | A camera app, not only a call (appended; no public struct changes size; nothing renumbered). **Modes** (§5.5): `xrEnumerateStereoCameraModesDXR` → `XrStereoCameraModeDXR` (`XR_TYPE_STEREO_CAMERA_MODE_DXR` = 1004999319; flags `DEFAULT` / `STREAM` / `STILL`), every camera lists at least its default; `XrStereoCameraStreamModeInfoDXR` (1004999460) chained on the stream create info (absent = the default mode, v7 unchanged) or on the calibration query (numbers for that size); every mode has the default's horizontal field of view about the same axis with a possibly different vertical extent (a 4:3 mode beside a 16:9 default), its calibration derived from the default's (scale by width, principal point kept about the centre); the source runs the smallest mode serving every started stream, the others get their centred rows downscaled by the service (never letterboxed or stretched), a start no single mode can serve with the started streams is `BUSY`, a switch is a reconfigure gap (≤ 500 ms) and never ends a stream unless the source refuses it (then `SOURCE_BUSY` for the streams it cannot serve). **Controls** (§5.6): `XrStereoCameraControlCapabilitiesDXR` (1004999461) chained on the properties; `xrSetStereoCameraControlsDXR` (`XrStereoCameraControlsDXR`, 1004999462: focus mode, focus distance in dioptres, metering point in the stream's left eye, EV) / `xrReleaseStereoCameraControlsDXR`; one holder per camera (`XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR` = −1004999468), started streams only, frames-withheld streams refused, and the hold is lost the moment the holder's frames are withheld (the client is told `SUSPENDED`, re-applies on `AVAILABLE`); `XrStereoCameraCaptureResultDXR` (1004999463) chained on a frame or a still. **Stills** (§5.7): `xrRequestStereoCameraStillDXR` (`XrStereoCameraStillRequestDXR`, 1004999464) → `XrEventDataStereoCameraStillReadyDXR` (1004999466) / `…StillFailedDXR` (1004999467) → `xrAcquireStereoCameraStillDXR` (`XrStereoCameraStillDXR`, 1004999465: a read-only section + layout, chained capture result + calibration) / `xrReleaseStereoCameraStillDXR`; one still per stream at a time; the stream may pause (≤ 1 s) and resumes by itself; a tracking-shared camera may refuse or downsize. Shared memory only; the `AHardwareBuffer` still transport is the next step (1004999469 held back). Plug-in contract §9b: eight appended slots (`XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES` / `_CONTROLS` / `_STILL`), no ABI bump |
 | 7, as built | No API change. NV12/BGRA conversions are BT.601 full range (§5.3). |
 | 7 | `XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR` = `0x20` (appended): set by the runtime exactly when a RECTIFIED stream of the camera delivers rectified frames (natively rectified, or the service's rectifier accepted the calibration at registration). It is the pre-start signal a rectified-only consumer needs: `CALIBRATED` stays set on a pair whose geometry the rectifier rejected, and the RECTIFIED calibration query is a consent point, so neither can be used to filter a camera list. A plug-in's own value of the bit is ignored. Also `XrStereoCameraOrientationDXR` (`XR_TYPE_STEREO_CAMERA_ORIENTATION_DXR` = 1004999318), chained on `XrStereoCameraPropertiesDXR::next`: the clockwise rotation (0/90/180/270) that makes the published frame upright in the device's natural orientation, Camera2 `SENSOR_ORIENTATION` semantics, or `XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR` (`0xFFFFFFFF`); the consumer pre-sets UNKNOWN (§3). Plug-in contract (§9): appended `xrt_plugin_stereo_camera_info::frame_orientation` (0 = unknown, `XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION`); the UVC source reports UNKNOWN (§9a). `displayxr-cli camera list` prints it. No public struct changes size, nothing renumbered |
 | 6 (A2, Android) | No API change. The Android rows of §7: the consent identity is the peer uid's package + signing-certificate digest, the trusted list is built into the runtime, and the consent dialog, the in-use notification with Stop, the lock watch, and "the OS took the camera" = `SUSPENDED` are runtime-owned. A front camera needs a live weave from the same app (`BUSY` otherwise), with or without the developer override |

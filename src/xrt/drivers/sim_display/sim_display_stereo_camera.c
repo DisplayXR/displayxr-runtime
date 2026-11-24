@@ -90,7 +90,7 @@ struct xrt_plugin_stereo_camera
 #define FAKE_FOCUS_TAU_NS 150e6     //!< the lens's time constant
 #define FAKE_STILL_LATENCY_NS 200e6 //!< capture latency; frames pause meanwhile
 #define FAKE_BASE_EXPOSURE_NS 16666667.0
-#define FAKE_MODE_COUNT_MAX 3
+#define FAKE_MODE_COUNT_MAX 5
 
 static void
 fake_render_still(struct xrt_plugin_stereo_camera *cam);
@@ -277,8 +277,10 @@ fake_resize(struct xrt_plugin_stereo_camera *cam, uint32_t w, uint32_t h)
 	                             FAKE_BAR_DEPTH_M);
 	if (cfg->distort) {
 		sim_stereo_camera_distorted_fini(&cam->distorted);
-		if (!sim_stereo_camera_distorted_init(&cam->distorted, w, h, fake_fx(w), cfg->baseline_mm,
-		                                      FAKE_BG_DEPTH_M, FAKE_BAR_DEPTH_M)) {
+		// Spec v8 §5.5: the lens of every mode is the default's, scaled by the width.
+		if (!sim_stereo_camera_distorted_init_ex(&cam->distorted, w, h, fake_fx(w), cfg->baseline_mm,
+		                                         FAKE_BG_DEPTH_M, FAKE_BAR_DEPTH_M,
+		                                         (double)cfg->eye_h * w / cfg->eye_w)) {
 			return false;
 		}
 		// The uncalibrated misalignment is given in pixels of the default size.
@@ -330,6 +332,21 @@ fake_modes(const struct fake_config *cfg, struct xrt_plugin_stereo_camera_mode o
 		out[n++] = (struct xrt_plugin_stereo_camera_mode){
 		    (uint32_t)sizeof(out[0]), cfg->eye_w * 2, cfg->eye_h * 2, cfg->advertised_fps,
 		    XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM | XRT_PLUGIN_STEREO_CAMERA_MODE_STILL};
+	}
+	// The other aspect, same horizontal field of view, centred (spec v8 §5.5):
+	// a default wider than 4:3 (the tablet's 16:9 cut of a 4:3 sensor) gets the
+	// full 4:3 sensor (a stream mode + a double-size 4:3 still); a 4:3 (or taller)
+	// default gets the 16:9 cut (stream modes at its width and at double width).
+	const bool wide = (uint64_t)cfg->eye_w * 3 > (uint64_t)cfg->eye_h * 4;
+	const uint32_t ow = cfg->eye_w, oh = (wide ? cfg->eye_w * 3 / 4 : cfg->eye_w * 9 / 16) & ~1u;
+	if (oh >= 64 && oh != cfg->eye_h) {
+		out[n++] = (struct xrt_plugin_stereo_camera_mode){(uint32_t)sizeof(out[0]), ow, oh, cfg->advertised_fps,
+		                                                  XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM};
+		if (ow * 2 <= 4096 && oh * 2 <= 4096) {
+			out[n++] = (struct xrt_plugin_stereo_camera_mode){
+			    (uint32_t)sizeof(out[0]), ow * 2, oh * 2, wide ? 0.0f : cfg->advertised_fps,
+			    wide ? XRT_PLUGIN_STEREO_CAMERA_MODE_STILL : XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM};
+		}
 	}
 	return n;
 }
@@ -684,8 +701,9 @@ fake_render_still(struct xrt_plugin_stereo_camera *cam)
 		// still size, so the service rectifies it with the rescaled calibration.
 		struct sim_stereo_camera_distorted d;
 		memset(&d, 0, sizeof(d));
-		if (!sim_stereo_camera_distorted_init(&d, w, h, fake_fx(w), cam->cfg.baseline_mm, FAKE_BG_DEPTH_M,
-		                                      FAKE_BAR_DEPTH_M)) {
+		if (!sim_stereo_camera_distorted_init_ex(&d, w, h, fake_fx(w), cam->cfg.baseline_mm, FAKE_BG_DEPTH_M,
+		                                         FAKE_BAR_DEPTH_M,
+		                                         (double)cam->cfg.eye_h * w / cam->cfg.eye_w)) {
 			return;
 		}
 		const double s = (double)w / (double)cam->cfg.eye_w;

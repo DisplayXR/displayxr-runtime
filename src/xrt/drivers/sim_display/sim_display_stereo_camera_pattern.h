@@ -80,6 +80,24 @@ sim_stereo_camera_truth_init(struct sim_stereo_camera_truth *t,
                              double bar_depth_m);
 
 /*!
+ * Spec v8 modes: the truth of a mode that has the default's horizontal field
+ * of view but another vertical extent. @p lens_ref_height is the default
+ * height scaled by this mode's width ratio (default_h * eye_width /
+ * default_w): the lens' off-centre principal point is defined against it, so
+ * every mode's truth equals the default truth rescaled by spec §5.5's rule
+ * (scale by width, principal point kept about the frame centre).
+ */
+void
+sim_stereo_camera_truth_init_ex(struct sim_stereo_camera_truth *t,
+                                uint32_t eye_width,
+                                uint32_t eye_height,
+                                double ideal_fx,
+                                double baseline_mm,
+                                double bg_depth_m,
+                                double bar_depth_m,
+                                double lens_ref_height);
+
+/*!
  * The distorted renderer: the truth + a per-raw-pixel lookup of where each
  * raw pixel looks in the virtual parallel frame (built once).
  */
@@ -99,6 +117,17 @@ sim_stereo_camera_distorted_init(struct sim_stereo_camera_distorted *d,
                                  double baseline_mm,
                                  double bg_depth_m,
                                  double bar_depth_m);
+
+//! As sim_stereo_camera_distorted_init, the truth from sim_stereo_camera_truth_init_ex.
+bool
+sim_stereo_camera_distorted_init_ex(struct sim_stereo_camera_distorted *d,
+                                    uint32_t eye_width,
+                                    uint32_t eye_height,
+                                    double ideal_fx,
+                                    double baseline_mm,
+                                    double bg_depth_m,
+                                    double bar_depth_m,
+                                    double lens_ref_height);
 
 void
 sim_stereo_camera_distorted_fini(struct sim_stereo_camera_distorted *d);

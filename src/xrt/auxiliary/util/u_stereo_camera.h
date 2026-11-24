@@ -241,6 +241,39 @@ u_stereo_camera_scale(uint32_t format,
  * @p to_w x @p to_h image of the same field of view, pixel-centre aware
  * (f' = f s, c' = (c + 1/2) s - 1/2). Distortion is unitless and unchanged.
  */
+/*!
+ * Spec v8 §5.5: the intrinsics of a MODE of @p to_w x @p to_h per eye from
+ * those of the default mode (@p from_w x @p from_h). Every mode has the
+ * default's horizontal field of view about the same optical axis; its vertical
+ * extent may differ (a centred vertical crop or extension). So: scale by the
+ * width ratio s = to_w / from_w on both axes (square pixels), keep the
+ * principal point's offset from the frame centre (scaled), pixel-centre aware:
+ *   f' = f s,  cx' = (cx + 1/2) s - 1/2,  cy' = (cy + 1/2 - from_h / 2) s + to_h / 2 - 1/2.
+ * Distortion is unitless and unchanged.
+ */
+void
+u_stereo_camera_mode_intrinsics(double fx,
+                                double fy,
+                                double cx,
+                                double cy,
+                                uint32_t from_w,
+                                uint32_t from_h,
+                                uint32_t to_w,
+                                uint32_t to_h,
+                                double out[4]);
+
+/*!
+ * Spec v8 §5.5: the centred rows of a @p src_w x @p src_h image (per eye) that,
+ * scaled to @p dst_w x @p dst_h, keep square pixels: rows = dst_h * src_w /
+ * dst_w, rounded to even, starting at an even row. Never letterbox, never
+ * stretch.
+ * @return false when the source has fewer rows than needed (it cannot serve
+ * that aspect) or @p dst_w > @p src_w.
+ */
+bool
+u_stereo_camera_fit_rows(
+    uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h, uint32_t *out_y0, uint32_t *out_rows);
+
 void
 u_stereo_camera_scale_intrinsics(double fx,
                                  double fy,

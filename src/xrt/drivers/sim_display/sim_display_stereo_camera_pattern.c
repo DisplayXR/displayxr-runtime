@@ -189,13 +189,30 @@ sim_stereo_camera_truth_init(struct sim_stereo_camera_truth *t,
                              double bg_depth_m,
                              double bar_depth_m)
 {
+	sim_stereo_camera_truth_init_ex(t, eye_width, eye_height, ideal_fx, baseline_mm, bg_depth_m, bar_depth_m,
+	                                (double)eye_height);
+}
+
+void
+sim_stereo_camera_truth_init_ex(struct sim_stereo_camera_truth *t,
+                                uint32_t eye_width,
+                                uint32_t eye_height,
+                                double ideal_fx,
+                                double baseline_mm,
+                                double bg_depth_m,
+                                double bar_depth_m,
+                                double lens_ref_height)
+{
 	memset(t, 0, sizeof(*t));
-	const double w = eye_width, h = eye_height;
+	// The lens offsets below scale with the WIDTH-scaled default height
+	// (lens_ref_height), not this mode's height: a mode that only crops or
+	// extends the default vertically keeps the same lens about the same axis.
+	const double w = eye_width, h = lens_ref_height;
 	t->eye_width = eye_width;
 	t->eye_height = eye_height;
 	t->ideal_fx = ideal_fx;
 	t->ideal_cx = (w - 1.0) * 0.5;
-	t->ideal_cy = (h - 1.0) * 0.5;
+	t->ideal_cy = ((double)eye_height - 1.0) * 0.5;
 	t->baseline_mm = baseline_mm;
 	t->bg_depth_m = bg_depth_m;
 	t->bar_depth_m = bar_depth_m;
@@ -237,9 +254,24 @@ sim_stereo_camera_distorted_init(struct sim_stereo_camera_distorted *d,
                                  double bg_depth_m,
                                  double bar_depth_m)
 {
+	return sim_stereo_camera_distorted_init_ex(d, eye_width, eye_height, ideal_fx, baseline_mm, bg_depth_m,
+	                                           bar_depth_m, (double)eye_height);
+}
+
+bool
+sim_stereo_camera_distorted_init_ex(struct sim_stereo_camera_distorted *d,
+                                    uint32_t eye_width,
+                                    uint32_t eye_height,
+                                    double ideal_fx,
+                                    double baseline_mm,
+                                    double bg_depth_m,
+                                    double bar_depth_m,
+                                    double lens_ref_height)
+{
 	memset(d, 0, sizeof(*d));
 	sim_stereo_camera_scene_init(&d->scene, eye_width, eye_height, ideal_fx, baseline_mm, bg_depth_m, bar_depth_m);
-	sim_stereo_camera_truth_init(&d->truth, eye_width, eye_height, ideal_fx, baseline_mm, bg_depth_m, bar_depth_m);
+	sim_stereo_camera_truth_init_ex(&d->truth, eye_width, eye_height, ideal_fx, baseline_mm, bg_depth_m,
+	                                bar_depth_m, lens_ref_height);
 	d->ideal_uv = malloc(sizeof(float) * 4 * (size_t)eye_width * eye_height);
 	if (d->ideal_uv == NULL) {
 		return false;

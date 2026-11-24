@@ -417,6 +417,78 @@ TEST_CASE("stereo rectify: END TO END on the distorted sim fake", "[stereo_recti
 	sim_stereo_camera_distorted_fini(&d);
 }
 
+TEST_CASE("spec v8: a 4:3 mode's calibration DERIVED from a 16:9 default rectifies exactly", "[stereo_rectify][v8]")
+{
+	// The tablet case: the default mode is a centred 16:9 cut (640x360) of a 4:3
+	// sensor; the 4:3 mode (640x480) has the same horizontal field of view and a
+	// taller vertical one. The plug-in reports ONE calibration, for the default;
+	// the 4:3 mode's is derived by spec §5.5 (scale by width, principal point kept
+	// about the frame centre) — and must rectify the 4:3 frames as exactly as the
+	// default calibration rectifies the default frames.
+	const uint32_t W = 640, Hd = 360, H = 480;
+	sim_stereo_camera_truth def;
+	sim_stereo_camera_truth_init(&def, W, Hd, k_ideal_fx_640, 50.0, 2.0, 0.6);
+	sim_stereo_camera_distorted d; // the 4:3 frames: the default's lenses about the same axis
+	REQUIRE(sim_stereo_camera_distorted_init_ex(&d, W, H, k_ideal_fx_640, 50.0, 2.0, 0.6, (double)Hd));
+	std::vector<uint8_t> raw(2 * W * H), rect(2 * W * H);
+	sim_stereo_camera_render_gray_distorted(&d, 4321, raw.data(), 2 * W);
+
+	u_stereo_rectify_input in;
+	std::memset(&in, 0, sizeof(in));
+	in.width = W;
+	in.height = H;
+	for (int e = 0; e < 2; e++) {
+		double k[4];
+		u_stereo_camera_mode_intrinsics(def.fx[e], def.fy[e], def.cx[e], def.cy[e], W, Hd, W, H, k);
+		// The derivation reproduces the 4:3 truth exactly (the fake's lens is the default's).
+		CHECK(k[2] == Catch::Approx(d.truth.cx[e]).margin(1e-9));
+		CHECK(k[3] == Catch::Approx(d.truth.cy[e]).margin(1e-9));
+		in.eye[e].fx = k[0];
+		in.eye[e].fy = k[1];
+		in.eye[e].cx = k[2];
+		in.eye[e].cy = k[3];
+		in.eye[e].model = U_STEREO_RECTIFY_MODEL_RADTAN5;
+		std::memcpy(in.eye[e].d, def.dist[e], sizeof(def.dist[e]));
+	}
+	std::memcpy(in.R, def.R, sizeof(in.R));
+	std::memcpy(in.T, def.T_mm, sizeof(in.T));
+	u_stereo_rectify_result r;
+	REQUIRE(u_stereo_rectify_compute(&in, &r));
+	u_stereo_rectify_lut lut;
+	REQUIRE(u_stereo_rectify_lut_init(&lut, &r, 1));
+	u_stereo_rectify_lut_apply(&lut, 1, raw.data(), 2 * W, rect.data(), 2 * W);
+
+	const double ifx = d.truth.ideal_fx, icx = d.truth.ideal_cx, icy = d.truth.ideal_cy;
+	auto to_ideal = [&](uint32_t x, uint32_t y, double *u, double *v) {
+		*u = ifx * (x - r.cx) / r.f + icx;
+		*v = ifx * (y - r.cy) / r.f + icy;
+	};
+	block_stats st = match_blocks(rect.data(), 2 * W, W, H, d.scene, to_ideal);
+	REQUIRE(st.dx_bg.size() > 20);
+	REQUIRE(st.dx_bar.size() > 5);
+	std::vector<float> dy_all = st.dy_bg;
+	dy_all.insert(dy_all.end(), st.dy_bar.begin(), st.dy_bar.end());
+	const float gt_bg = (float)(r.f * 0.05 / 2.0), gt_bar = (float)(r.f * 0.05 / 0.6);
+	const float dy_max = max_abs_dev(dy_all, 0.0f);
+	const float bg_dev = max_abs_dev(st.dx_bg, gt_bg), bar_dev = max_abs_dev(st.dx_bar, gt_bar);
+	std::printf(
+	    "[v8 4:3 from 16:9] RECTIFIED f %.3f: |dy| max %.3f px (%zu blocks); bg err %.3f px, bar err %.3f px\n",
+	    r.f, dy_max, dy_all.size(), bg_dev, bar_dev);
+	CHECK(dy_max <= 0.5f);
+	CHECK(bg_dev <= 0.5f);
+	CHECK(bar_dev <= 0.5f);
+
+	// A 16:9 consumer served from these rectified 4:3 frames takes the centred
+	// rows: the same pixels, so the same alignment; its numbers are the 4:3
+	// rectified ones with the principal point moved up by the crop.
+	uint32_t y0 = 0, rows = 0;
+	REQUIRE(u_stereo_camera_fit_rows(W, H, W, Hd, &y0, &rows));
+	CHECK(y0 == 60);
+	CHECK(rows == 360);
+	u_stereo_rectify_lut_fini(&lut);
+	sim_stereo_camera_distorted_fini(&d);
+}
+
 namespace {
 
 //! A parallel pair of the scene, the right eye shifted DOWN by @p dy_px rows

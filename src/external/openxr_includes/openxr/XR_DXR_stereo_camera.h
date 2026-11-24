@@ -522,8 +522,11 @@ static const XrStereoCameraModeFlagsDXR XR_STEREO_CAMERA_MODE_STILL_BIT_DXR = 0x
 
 /*!
  * One capture mode (xrEnumerateStereoCameraModesDXR). Every mode of a camera
- * images the SAME field of view (a scale of the default mode), so one
- * calibration, rescaled, describes all of them (spec §5.5).
+ * has the default mode's HORIZONTAL field of view about the same optical axis;
+ * its vertical extent may differ (a centred vertical crop or extension, e.g. a
+ * 4:3 mode beside a 16:9 default). One calibration therefore describes all of
+ * them: scale by the width ratio, keep the principal point about the frame
+ * centre (spec §5.5); xrGetStereoCameraCalibrationDXR returns it per mode.
  */
 typedef struct XrStereoCameraModeDXR {
     XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_MODE_DXR
@@ -786,7 +789,9 @@ XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateStereoCameraModesDXR(
 
 //! Spec v8: set focus / metering / exposure on a STARTED stream's camera. The first
 //! stream to set controls holds them (XR_ERROR_STEREO_CAMERA_CONTROL_HELD_DXR for
-//! the others) until it releases, stops or ends. XR_ERROR_FEATURE_UNSUPPORTED on a
+//! the others) until it releases, stops or ends, or its frames are withheld
+//! (background, lock, sharing off: it is told SUSPENDED and must set its controls
+//! again once the camera is AVAILABLE to it). XR_ERROR_FEATURE_UNSUPPORTED on a
 //! camera without (those) controls.
 XRAPI_ATTR XrResult XRAPI_CALL xrSetStereoCameraControlsDXR(
     XrStereoCameraStreamDXR stream, const XrStereoCameraControlsDXR* controls);

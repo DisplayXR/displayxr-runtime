@@ -1116,10 +1116,15 @@ struct xrt_plugin_stereo_camera;
  * One capture mode. The runtime sets @ref struct_size; the plug-in must not
  * write past it. Mode 0 MUST be the default — its eye size equal to
  * xrt_plugin_stereo_camera_info::eye_width / eye_height — or the runtime
- * ignores the list. Every mode images the SAME field of view (a scale of the
- * default: same aspect within 1 %, same optical centre), so the one RAW
- * calibration, rescaled, describes all of them; a mode with another aspect is
- * dropped by the runtime. Frames of a mode are 2 * eye_width x eye_height SBS.
+ * ignores the list. Every mode has the default's HORIZONTAL field of view about
+ * the same optical axis and square pixels; its vertical extent may differ (a
+ * centred vertical crop or extension of the default, e.g. the full 4:3 sensor
+ * beside a 16:9 default cut from it). The one RAW calibration (of the default)
+ * then describes every mode: s = w / w_default, f' = f s, cx' = (cx + 1/2) s - 1/2,
+ * cy' = (cy + 1/2 - h_default / 2) s + h / 2 - 1/2, distortion unchanged. The
+ * runtime drops a mode whose relative height is outside [1/2, 2] of the
+ * default's or whose derived principal point falls outside its frame. Frames
+ * of a mode are 2 * eye_width x eye_height SBS.
  */
 struct xrt_plugin_stereo_camera_mode
 {
