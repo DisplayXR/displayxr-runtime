@@ -150,6 +150,20 @@ segment DP agree. Built for vk_native (Linux X11 + Wayland); the D3D11 / D3D12 /
 managers and the service weave engines publish no table (the session screen's stands) and crop every
 segment in the session's grid.
 
+**Out of process.** An IPC client is told its OWN table: the service computes it from where that
+client's window is and keeps it in the client's shared memory (`ipc_shared_memory.hmd.effective_table`,
+its generation written last, beside the head's table that ADR-066 C1 syncs there); the client's state
+tracker reads it at every locate and every `xrPollEvent`, so the enumerate and the table-changed
+event behave as in-process. Sources: the desktop-Linux and macOS (vk backend) weave engines follow a
+present-owner's bound window with the same manager (`comp_vk_native_segments_update_view_size`) and
+draw each other screen's entry for the session's confirmed 2D/3D slot; the D3D11 service follows a
+direct client's app window, a present-owner's bound window and a workspace tile's footprint over the
+presenter screens (ADR-052 D2). A session that weaves nothing — the DisplayXR Browser enumerates
+from its browser process and weaves from its GPU process — is told the table of the session weaving
+the same window (`util/u_weave_peer.h`). On desktop Linux a present-owner's locate of a window or an
+element wholly on a non-primary screen is framed from that screen's own eyes and geometry
+(`u_weave_locate_reframe`), never the session (3D panel) DP's tracked camera.
+
 ## The lens wish follows coverage (#2247)
 
 A screen's DP is asked for the session's 2D/3D mode while the window covers that

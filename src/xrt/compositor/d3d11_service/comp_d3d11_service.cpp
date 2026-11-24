@@ -15597,11 +15597,6 @@ svc_seg_window_rect(HWND hwnd, struct comp_seg_rect *out)
  *
  */
 
-//! A view_eff older than this is not handed out: the client stopped being
-//! woven / located (focus moved, the workspace took over), so the head's
-//! table stands.
-#define SVC_VIEW_EFF_FRESH_NS ((int64_t)1000 * 1000 * 1000)
-
 //! One WARN per change, the in-process vk_native wording (one grep on every platform).
 static void
 svc_view_size_log(const struct xrt_effective_mode_table *e)
@@ -34534,10 +34529,12 @@ comp_d3d11_service_get_published_table(struct xrt_system_compositor *xsysc,
 	}
 	out_key->valid = hwnd != nullptr;
 	out_key->window_id = (uint64_t)(uintptr_t)hwnd;
-	const int64_t now = (int64_t)os_monotonic_get_ns();
+	// The last table computed for it stands while it is not woven / located
+	// (an unfocused direct client keeps its window's table, as in-process),
+	// so a focus change never flips the app's table back and forth.
 	std::lock_guard<std::mutex> lk(c->seg_mutex); // leaf
-	if (c->view_eff_ns == 0 || now - c->view_eff_ns > SVC_VIEW_EFF_FRESH_NS) {
-		return false; // not woven / located lately: the head's table (or a peer's)
+	if (c->view_eff_ns == 0) {
+		return false; // never computed: a peer weaving the same window, else the head's table
 	}
 	*out_table = c->view_eff;
 	return out_key->valid;

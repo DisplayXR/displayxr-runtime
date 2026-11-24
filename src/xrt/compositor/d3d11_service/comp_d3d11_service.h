@@ -1849,9 +1849,10 @@ comp_d3d11_service_weave_get_segments(struct xrt_compositor *xc, struct xrt_segm
  * (@p out_key, the HWND as id). Called by the IPC main loop with
  * global_state.lock held: takes only the client's leaf `seg_mutex`.
  *
- * @return true when the table is fresh (authoritative for that window, valid
- *         or not); false = nothing recent (a peer weaving the same window may
- *         answer, else the head's table stands).
+ * @return true once a table was computed for it (authoritative for that
+ *         window, valid or not; the last one stands while the client is not
+ *         woven); false = never (a peer weaving the same window may answer,
+ *         else the head's table stands).
  */
 struct u_weave_window_key;
 struct xrt_effective_mode_table;
