@@ -3623,8 +3623,9 @@ gl_compositor_render_hud(struct comp_gl_compositor *c, float dt, uint32_t win_w,
 	data.render_width = c->view_width;
 	data.render_height = c->view_height;
 	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count,
-		                              &data.swapchain_width, &data.swapchain_height);
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes,
+		                              u_device_rendering_modes_envelope_count(c->xdev), &data.swapchain_width,
+		                              &data.swapchain_height);
 	}
 	data.window_width = win_w;
 	data.window_height = win_h;
@@ -9733,8 +9734,8 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	uint32_t atlas_height = c->tile_rows * c->view_height;
 	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
 		u_tiling_compute_system_atlas(c->xdev->rendering_modes,
-		                              c->xdev->rendering_mode_count,
-		                              &atlas_width, &atlas_height);
+		                              u_device_rendering_modes_envelope_count(c->xdev), &atlas_width,
+		                              &atlas_height);
 	}
 	c->atlas_tex_width = atlas_width;
 	c->atlas_tex_height = atlas_height;

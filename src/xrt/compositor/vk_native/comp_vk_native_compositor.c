@@ -716,6 +716,9 @@ struct comp_vk_native_compositor
 	bool dp_tolerates_resample;
 	//! The rendering-mode index @ref dp_tolerates_resample was last read at.
 	uint32_t dp_caps_mode_index;
+	//! ADR-066 C1: the slot-table generation the caps above were read under (a
+	//! 3D-mode switch remaps slot 1 without moving the index).
+	uint32_t dp_caps_mode_gen;
 	//! vk_make_dp_vk called the factory (whether or not it succeeded).
 	bool dp_create_attempted;
 
@@ -4356,8 +4359,9 @@ vk_hud_prepare(struct comp_vk_native_compositor *c, uint32_t target_width, uint3
 		data.render_height = vh;
 	}
 	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count,
-		                              &data.swapchain_width, &data.swapchain_height);
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes,
+		                              u_device_rendering_modes_envelope_count(c->xdev), &data.swapchain_width,
+		                              &data.swapchain_height);
 	}
 	data.window_width = target_width;
 	data.window_height = target_height;
@@ -6188,10 +6192,12 @@ vk_dp_refresh_resample_caps(struct comp_vk_native_compositor *c)
 		return;
 	}
 	const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-	if (idx == c->dp_caps_mode_index) {
+	const uint32_t gen = u_device_rendering_modes_generation(c->xdev);
+	if (idx == c->dp_caps_mode_index && gen == c->dp_caps_mode_gen) {
 		return;
 	}
 	c->dp_caps_mode_index = idx;
+	c->dp_caps_mode_gen = gen;
 	const bool tol =
 	    xrt_display_processor_vk_tolerates_resample((struct xrt_display_processor_vk *)c->display_processor);
 	if (tol == c->dp_tolerates_resample) {
@@ -15380,6 +15386,7 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 			c->dp_caps_mode_index = (c->xdev != NULL && c->xdev->hmd != NULL)
 			                            ? c->xdev->hmd->active_rendering_mode_index
 			                            : UINT32_MAX;
+			c->dp_caps_mode_gen = u_device_rendering_modes_generation(c->xdev);
 		}
 	} else {
 		U_LOG_W("No VK display processor factory provided");

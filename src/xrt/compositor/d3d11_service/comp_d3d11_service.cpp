@@ -2982,7 +2982,8 @@ service_split_stage_a(struct d3d11_service_system *sys,
 		if (reason == nullptr) {
 			uint32_t sys_w = 0, sys_h = 0;
 			if (xdev != nullptr && xdev->rendering_mode_count > 0) {
-				u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &sys_w,
+				u_tiling_compute_system_atlas(xdev->rendering_modes,
+				                              u_device_rendering_modes_envelope_count(xdev), &sys_w,
 				                              &sys_h);
 			}
 			if (sys_w == 0 || sys_h == 0) {
@@ -10312,8 +10313,9 @@ d3d11_service_render_hud(struct d3d11_service_system *sys,
 	data.render_width = render_w;
 	data.render_height = render_h;
 	if (sys->xdev != NULL && sys->xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(sys->xdev->rendering_modes, sys->xdev->rendering_mode_count,
-		                              &data.swapchain_width, &data.swapchain_height);
+		u_tiling_compute_system_atlas(sys->xdev->rendering_modes,
+		                              u_device_rendering_modes_envelope_count(sys->xdev), &data.swapchain_width,
+		                              &data.swapchain_height);
 	}
 	data.window_width = win_w;
 	data.window_height = win_h;
@@ -25423,10 +25425,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				uint32_t restore_idx = UINT32_MAX;
 				if (rhead != nullptr && rhead->hmd != NULL) {
 					uint32_t cur = rhead->hmd->active_rendering_mode_index;
-					bool cur_is_3d = cur < rhead->rendering_mode_count &&
-					                 rhead->rendering_modes[cur].hardware_display_3d;
-					if (!cur_is_3d && U_RENDERING_MODE_3D < rhead->rendering_mode_count &&
-					    rhead->rendering_modes[U_RENDERING_MODE_3D].hardware_display_3d) {
+					bool cur_is_3d = u_rendering_modes_index_is_3d(
+					    rhead->rendering_modes, rhead->rendering_mode_count, cur);
+					if (!cur_is_3d && U_RENDERING_MODE_3D < rhead->rendering_mode_count) {
 						restore_idx = U_RENDERING_MODE_3D;
 					}
 				}
@@ -25568,7 +25569,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// first 3D-capable mode (a table the runtime refused to trim).
 			uint32_t mode_idx = zhead->rendering_mode_count; // invalid sentinel
 			if (U_RENDERING_MODE_3D < zhead->rendering_mode_count &&
-			    zhead->rendering_modes[U_RENDERING_MODE_3D].hardware_display_3d) {
+			    u_rendering_modes_index_is_3d(zhead->rendering_modes, zhead->rendering_mode_count,
+			                                  U_RENDERING_MODE_3D)) {
 				mode_idx = U_RENDERING_MODE_3D;
 			} else {
 				for (uint32_t m = 0; m < zhead->rendering_mode_count; m++) {
@@ -25648,7 +25650,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// Same selection as the zones tier-1 fallback above.
 				uint32_t mode_idx = head->rendering_mode_count; // invalid sentinel
 				if (U_RENDERING_MODE_3D < head->rendering_mode_count &&
-				    head->rendering_modes[U_RENDERING_MODE_3D].hardware_display_3d) {
+				    u_rendering_modes_index_is_3d(head->rendering_modes, head->rendering_mode_count,
+				                                  U_RENDERING_MODE_3D)) {
 					mode_idx = U_RENDERING_MODE_3D;
 				} else {
 					for (uint32_t m = 0; m < head->rendering_mode_count; m++) {
@@ -31198,7 +31201,8 @@ weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_
 	if (active_idx < head->rendering_mode_count && head->rendering_modes[active_idx].hardware_display_3d) {
 		mode_idx = active_idx;
 	} else if (U_RENDERING_MODE_3D < head->rendering_mode_count &&
-	           head->rendering_modes[U_RENDERING_MODE_3D].hardware_display_3d) {
+	           u_rendering_modes_index_is_3d(head->rendering_modes, head->rendering_mode_count,
+	                                         U_RENDERING_MODE_3D)) {
 		mode_idx = U_RENDERING_MODE_3D;
 	} else {
 		for (uint32_t m = 0; m < head->rendering_mode_count; m++) {
@@ -35381,7 +35385,9 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	if (xdev != nullptr && xdev->rendering_mode_count > 0) {
 		max_atlas_w = 0;
 		max_atlas_h = 0;
-		for (uint32_t i = 0; i < xdev->rendering_mode_count; i++) {
+		// ADR-066 C1.4: over the envelope, not just the two slots.
+		const uint32_t env_count = u_device_rendering_modes_envelope_count(xdev);
+		for (uint32_t i = 0; i < env_count; i++) {
 			uint32_t aw = xdev->rendering_modes[i].atlas_width_pixels;
 			uint32_t ah = xdev->rendering_modes[i].atlas_height_pixels;
 			if (aw > max_atlas_w) max_atlas_w = aw;

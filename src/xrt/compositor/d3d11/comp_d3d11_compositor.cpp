@@ -2539,8 +2539,9 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c,
 	data.render_width = render_w;
 	data.render_height = render_h;
 	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count,
-		                              &data.swapchain_width, &data.swapchain_height);
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes,
+		                              u_device_rendering_modes_envelope_count(c->xdev), &data.swapchain_width,
+		                              &data.swapchain_height);
 	}
 	data.window_width = win_w;
 	data.window_height = win_h;
@@ -7610,8 +7611,9 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		if (reason == nullptr) {
 			uint32_t sys_w = 0, sys_h = 0;
 			if (xdev->rendering_mode_count > 0) {
-				u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count,
-				                              &sys_w, &sys_h);
+				u_tiling_compute_system_atlas(xdev->rendering_modes,
+				                              u_device_rendering_modes_envelope_count(xdev), &sys_w,
+				                              &sys_h);
 			}
 			if (sys_w == 0 || sys_h == 0) {
 				sys_w = c->settings.preferred.width;
@@ -8088,8 +8090,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// #2564: bound the atlas's grow headroom by the worst case across modes.
 	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
 		uint32_t cap_w = 0, cap_h = 0;
-		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count, &cap_w,
-		                              &cap_h);
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes,
+		                              u_device_rendering_modes_envelope_count(c->xdev), &cap_w, &cap_h);
 		comp_d3d11_renderer_set_atlas_cap(c->renderer, cap_w, cap_h);
 	}
 

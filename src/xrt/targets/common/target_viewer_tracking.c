@@ -19,6 +19,8 @@
 #include "xrt/xrt_screen.h"
 #include "xrt/xrt_tracking_plugin.h"
 
+#include "util/u_rendering_modes.h"
+
 #include "util/u_eye_history.h"
 #include "util/u_logging.h"
 #include "util/u_viewer_pose_page.h"
@@ -705,7 +707,10 @@ target_viewer_tracking_apply(struct xrt_system_compositor_info *info,
 	info->supported_eye_tracking_modes = supported;
 	info->default_eye_tracking_mode = def;
 	if (mark && head != NULL) {
-		for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+		// Over the envelope (ADR-066 C1): a config switch must not bring in
+		// an entry the composition never marked.
+		const uint32_t n_modes = u_device_rendering_modes_envelope_count(head);
+		for (uint32_t mi = 0; mi < n_modes; mi++) {
 			struct xrt_rendering_mode *m = &head->rendering_modes[mi];
 			if (m->hardware_display_3d || m->view_count > 1) {
 				m->mode_flags |= XRT_RENDERING_MODE_FLAG_HAS_TRACKING;

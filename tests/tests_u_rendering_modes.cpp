@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  ADR-065: the two-mode contract — a display driver's run-time table is
- *         [0] = 2D, [1] = 3D, and the runtime trims a longer one.
+ * @brief  ADR-065 / ADR-066 C1: apps see a display driver's table as two slots,
+ *         [0] = 2D, [1] = 3D; the runtime keeps a longer declared list as the
+ *         sizing envelope and remaps slot 1 live.
  *
  * Pins the pure rule (u_rendering_modes_trim) on the shapes that exist or have
  * existed: a 1-mode device, the shipping 2-mode shape, a vendor table with an
@@ -18,9 +19,11 @@
 
 #include "util/u_rendering_modes.h"
 #include "util/u_tiling.h"
+#include "xrt/xrt_display_status.h"
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -76,7 +79,7 @@ struct table
 	trim(u_rendering_modes_trim_result expect)
 	{
 		u_rendering_modes_trim_info info{};
-		CHECK(u_rendering_modes_trim(modes, &count, &active, &info) == expect);
+		CHECK(u_rendering_modes_trim(modes, &count, &active, U_RENDERING_MODES_NO_PREFERENCE, &info) == expect);
 		CHECK(info.result == expect);
 		return info;
 	}
@@ -90,7 +93,7 @@ TEST_CASE("a one-mode table is left alone", "[u_rendering_modes]")
 	const auto info = t.trim(U_RENDERING_MODES_TRIM_UNCHANGED);
 	CHECK(t.count == 1);
 	CHECK(t.active == 0);
-	CHECK(info.dropped_mask == 0);
+	CHECK(info.envelope_count == 1);
 	CHECK_FALSE(info.renumbered);
 }
 
@@ -144,8 +147,9 @@ TEST_CASE("a vendor table with an optional third mode keeps 2D and its index-1 3
 		CHECK(t.count == 2);
 		CHECK(t.active == 1);
 		CHECK(info.to_driver[1] == 1); // identity: no translation needed
-		CHECK(info.dropped_mask == (1u << 2));
+		CHECK(info.envelope_count == 3); // ADR-066 C1: nothing dropped
 		CHECK(std::strcmp(t.modes[1].mode_name, "3D") == 0);
+		CHECK(std::strcmp(t.modes[2].mode_name, "3D (variant)") == 0);
 	}
 	SECTION("active = 0")
 	{
@@ -162,8 +166,9 @@ TEST_CASE("a vendor table with an optional third mode keeps 2D and its index-1 3
 		CHECK(info.to_driver[1] == 2);
 		CHECK(info.from_driver[2] == 1);
 		CHECK(info.from_driver[1] == 1); // dropped, but a 3D mode
-		CHECK(info.dropped_mask == (1u << 1));
 		CHECK(std::strcmp(t.modes[1].mode_name, "3D (variant)") == 0);
+		// ADR-066 C1: the driver's entry 1 is kept, swapped to where the variant was.
+		CHECK(std::strcmp(t.modes[2].mode_name, "3D") == 0);
 		CHECK(t.modes[1].mode_index == 1);
 	}
 }
@@ -199,10 +204,12 @@ TEST_CASE("the old six-mode sim-display table trims to 2D + the mode it started 
 		CHECK(t.modes[0].mode_index == 0);
 		CHECK(t.modes[1].mode_index == 1);
 		CHECK(u_rendering_modes_max_view_count(t.modes, t.count) == r.kept_views);
-		// Every original mode but 0 and the kept one is dropped.
+		// ADR-066 C1: nothing is dropped - the full list stays as the envelope,
+		// the kept entry swapped into slot 1.
+		CHECK(info.envelope_count == 6);
+		CHECK(std::strcmp(t.modes[r.expect_kept].mode_name, old_sim_table()[1].mode_name) == 0);
 		for (uint32_t i = 0; i < 6; i++) {
-			const bool dropped = (info.dropped_mask & (1u << i)) != 0;
-			CHECK(dropped == (i != 0 && i != r.expect_kept));
+			CHECK(t.modes[i].mode_index == i);
 		}
 		// Each original index maps to a run-time index: 2D -> 0, any 3D -> 1.
 		CHECK(info.from_driver[0] == 0);
@@ -228,7 +235,6 @@ TEST_CASE("a table whose mode 0 is not the flat mode is refused, untouched", "[u
 	CHECK(t.active == 2);
 	CHECK(std::strcmp(t.modes[0].mode_name, "3D first") == 0);
 	CHECK(std::strcmp(t.modes[2].mode_name, "Quad") == 0);
-	CHECK(info.dropped_mask == 0);
 	for (uint32_t i = 0; i < 3; i++) {
 		CHECK(info.from_driver[i] == i);
 		CHECK(t.modes[i].mode_index == i);
@@ -249,68 +255,49 @@ TEST_CASE("a long table with no 3D mode is refused too", "[u_rendering_modes]")
 	CHECK(t.active == 1);
 }
 
-TEST_CASE("the max view count and the worst-case atlas come from the trimmed table", "[u_rendering_modes]")
+TEST_CASE("the max view count and the worst-case atlas come from the full envelope", "[u_rendering_modes]")
 {
-	// A driver whose dropped mode was the widest AND the largest: a 3x3 quilt
-	// at half scale is 1.5x the panel. Untrimmed it would size every swapchain
-	// for 9 views and 2880x1620; trimmed to {2D, stereo} it is 2 views and the
-	// panel. (The case the sizing note in docs/specs/runtime/multiview-tiling.md
-	// is about: the 2D mode dominates the shipping tables, not every table.)
+	// ADR-066 C1.5: sizing goes back to the full declared list. A 3x2 quilt at
+	// half scale is 1.5x the panel's width: it sizes the atlas and the view
+	// count whichever entry slot 1 maps to, so a later switch to it needs no
+	// reallocation.
 	const std::vector<xrt_rendering_mode> v = {
 	    mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
 	    mk(2, 0.5f, 1.0f, true, 2, 1, "Stereo"),
-	    mk(9, 0.5f, 0.5f, true, 3, 3, "Quilt 3x3"),
+	    mk(6, 0.5f, 0.5f, true, 3, 2, "Quilt 3x2"),
 	};
 	const uint32_t W = 1920, H = 1080;
-
-	table untrimmed(v, 1);
-	for (uint32_t i = 0; i < untrimmed.count; i++) {
-		u_tiling_compute_mode(&untrimmed.modes[i], W, H);
-	}
-	uint32_t uw = 0, uh = 0;
-	u_tiling_compute_system_atlas(untrimmed.modes, untrimmed.count, &uw, &uh);
-	CHECK(uw == 2880);
-	CHECK(uh == 1620);
-	CHECK(u_rendering_modes_max_view_count(untrimmed.modes, untrimmed.count) == 9);
-
-	SECTION("started in the stereo mode: the quilt is dropped")
-	{
-		table t(v, 1);
-		t.trim(U_RENDERING_MODES_TRIM_TRIMMED);
-		for (uint32_t i = 0; i < t.count; i++) {
+	for (uint32_t start : {1u, 2u}) {
+		INFO("started in " << start);
+		table t(v, start);
+		const auto info = t.trim(U_RENDERING_MODES_TRIM_TRIMMED);
+		REQUIRE(info.envelope_count == 3);
+		for (uint32_t i = 0; i < info.envelope_count; i++) {
 			u_tiling_compute_mode(&t.modes[i], W, H);
 		}
 		uint32_t aw = 0, ah = 0;
-		u_tiling_compute_system_atlas(t.modes, t.count, &aw, &ah);
-		CHECK(aw == W);
-		CHECK(ah == H);
-		CHECK(u_rendering_modes_max_view_count(t.modes, t.count) == 2);
-	}
-	SECTION("started in the quilt: the quilt is the 3D mode and still sets the size")
-	{
-		table t(v, 2);
-		t.trim(U_RENDERING_MODES_TRIM_TRIMMED);
-		for (uint32_t i = 0; i < t.count; i++) {
-			u_tiling_compute_mode(&t.modes[i], W, H);
-		}
-		uint32_t aw = 0, ah = 0;
-		u_tiling_compute_system_atlas(t.modes, t.count, &aw, &ah);
+		u_tiling_compute_system_atlas(t.modes, info.envelope_count, &aw, &ah);
 		CHECK(aw == 2880);
-		CHECK(ah == 1620);
-		CHECK(u_rendering_modes_max_view_count(t.modes, t.count) == 9);
+		CHECK(ah == 1080);
+		CHECK(u_rendering_modes_max_view_count(t.modes, info.envelope_count) == 6);
+		// The two presented slots alone would under-size it.
+		CHECK(u_rendering_modes_max_view_count(t.modes, t.count) == (start == 1 ? 2u : 6u));
 	}
 }
 
 TEST_CASE("degenerate trim inputs are harmless", "[u_rendering_modes]")
 {
 	uint32_t count = 3, active = 0;
-	CHECK(u_rendering_modes_trim(nullptr, &count, &active, nullptr) == U_RENDERING_MODES_TRIM_UNCHANGED);
+	CHECK(u_rendering_modes_trim(nullptr, &count, &active, U_RENDERING_MODES_NO_PREFERENCE, nullptr) ==
+	      U_RENDERING_MODES_TRIM_UNCHANGED);
 	CHECK(count == 3);
 	xrt_rendering_mode m[XRT_MAX_RENDERING_MODES]{};
-	CHECK(u_rendering_modes_trim(m, nullptr, &active, nullptr) == U_RENDERING_MODES_TRIM_UNCHANGED);
+	CHECK(u_rendering_modes_trim(m, nullptr, &active, U_RENDERING_MODES_NO_PREFERENCE, nullptr) ==
+	      U_RENDERING_MODES_TRIM_UNCHANGED);
 	// A NULL active is allowed: the trim picks the first 3D mode.
 	table t(old_sim_table(), 0);
-	CHECK(u_rendering_modes_trim(t.modes, &t.count, nullptr, nullptr) == U_RENDERING_MODES_TRIM_TRIMMED);
+	CHECK(u_rendering_modes_trim(t.modes, &t.count, nullptr, U_RENDERING_MODES_NO_PREFERENCE, nullptr) ==
+	      U_RENDERING_MODES_TRIM_TRIMMED);
 	CHECK(t.count == 2);
 	CHECK(std::strcmp(t.modes[1].mode_name, "Anaglyph") == 0);
 	// An out-of-range active becomes 2D.
@@ -416,8 +403,14 @@ TEST_CASE("enforce: a kept index 1 needs no translation", "[u_rendering_modes][d
 	    1);
 	CHECK(u_device_enforce_two_rendering_modes(&h.xdev, "test") == U_RENDERING_MODES_TRIM_TRIMMED);
 	CHECK(h.xdev.rendering_mode_count == 2);
-	CHECK(h.xdev.set_property == fake_head::set_prop); // not wrapped
+	CHECK(u_device_rendering_modes_envelope_count(&h.xdev) == 3);
+	// ADR-066 C1: wrapped anyway, so a later remap needs no new wrapper; the
+	// translation is identity today.
+	CHECK(h.xdev.set_property != fake_head::set_prop);
 	CHECK(h.hmd.active_rendering_mode_index == 1);
+	CHECK(xrt_device_set_property(&h.xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 1) == XRT_SUCCESS);
+	CHECK(h.set_calls.back() == 1);
+	h.xdev.destroy(&h.xdev);
 }
 
 TEST_CASE("enforce: the old sim-display started in Quad", "[u_rendering_modes][device]")
@@ -474,13 +467,14 @@ TEST_CASE("enforce: the old sim-display started in Quad", "[u_rendering_modes][d
 	}
 }
 
-TEST_CASE("enforce: started in 2D, the device max view count drops to the kept mode's", "[u_rendering_modes][device]")
+TEST_CASE("enforce: started in 2D, the device max view count stays the envelope's", "[u_rendering_modes][device]")
 {
 	fake_head h(old_sim_table(), 0);
 	CHECK(u_device_enforce_two_rendering_modes(&h.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
 	CHECK(h.hmd.active_rendering_mode_index == 0);
-	CHECK(h.hmd.view_count == 2); // was 4 (Quad), Quad dropped
-	CHECK(h.xdev.set_property == fake_head::set_prop);
+	CHECK(h.hmd.view_count == 4); // ADR-066 C1.5: Quad is still in the envelope
+	CHECK(u_device_rendering_modes_envelope_count(&h.xdev) == 6);
+	h.xdev.destroy(&h.xdev);
 }
 
 TEST_CASE("enforce: a refused table keeps its count and functions", "[u_rendering_modes][device]")
@@ -876,4 +870,334 @@ TEST_CASE("keys: no table means V is hardware-only and a digit does nothing", "[
 	CHECK(u_rendering_modes_decide_key(vendor.data(), 2, 0, false, 2, false, 0).action ==
 	      U_RENDERING_MODE_KEY_NOTHING);
 	CHECK(u_rendering_modes_decide_key(nullptr, 0, 0, false, 5, false, 0).action == U_RENDERING_MODE_KEY_NOTHING);
+}
+
+
+/*
+ *
+ * ADR-066 C1: 3D by position, live remaps, the per-screen choice, the
+ * start-up-only listing and the status the runtime computes.
+ *
+ */
+
+namespace {
+
+xrt_rendering_mode
+passthrough_entry()
+{
+	xrt_rendering_mode m = mk(1, 1.0f, 1.0f, false, 1, 1, "Same as 2D");
+	m.mode_flags |= XRT_RENDERING_MODE_FLAG_3D_PASSTHROUGH;
+	return m;
+}
+
+//! A driver with a live config: CONFIGURED_3D_MODE answers `configured` (its numbering).
+struct config_driver
+{
+	xrt_device xdev{};
+	xrt_hmd_parts hmd{};
+	int32_t configured = 1;
+	bool answers = true;
+	std::vector<int32_t> set_calls;
+	std::vector<uint32_t> seen_views; //!< rendering_modes[value].view_count during OUTPUT_MODE
+	bool destroyed = false;
+
+	static config_driver *
+	of(xrt_device *x)
+	{
+		return reinterpret_cast<config_driver *>(x);
+	}
+
+	static xrt_result_t
+	set_prop(xrt_device *x, xrt_device_property_id p, int32_t v)
+	{
+		config_driver *d = of(x);
+		if (p != XRT_DEVICE_PROPERTY_OUTPUT_MODE || v < 0 || (uint32_t)v >= x->rendering_mode_count) {
+			return XRT_ERROR_NOT_IMPLEMENTED;
+		}
+		d->set_calls.push_back(v);
+		d->seen_views.push_back(x->rendering_modes[v].view_count);
+		x->hmd->active_rendering_mode_index = (uint32_t)v;
+		return XRT_SUCCESS;
+	}
+
+	static xrt_result_t
+	get_prop(xrt_device *x, xrt_device_property_id p, int32_t *out)
+	{
+		config_driver *d = of(x);
+		if (p == XRT_DEVICE_PROPERTY_CONFIGURED_3D_MODE && d->answers) {
+			*out = d->configured;
+			return XRT_SUCCESS;
+		}
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+
+	static void
+	destroy(xrt_device *x)
+	{
+		of(x)->destroyed = true;
+	}
+
+	explicit config_driver(const std::vector<xrt_rendering_mode> &v, int32_t config = 1)
+	{
+		configured = config;
+		xdev.rendering_mode_count = (uint32_t)v.size();
+		for (uint32_t i = 0; i < v.size(); i++) {
+			xdev.rendering_modes[i] = v[i];
+			xdev.rendering_modes[i].mode_index = i;
+		}
+		hmd.view_count = 4;
+		xdev.hmd = &hmd;
+		xdev.set_property = set_prop;
+		xdev.get_property = get_prop;
+		xdev.destroy = destroy;
+		std::snprintf(xdev.str, sizeof(xdev.str), "config driver");
+	}
+
+	~config_driver()
+	{
+		if (!destroyed && xdev.destroy != nullptr) {
+			xdev.destroy(&xdev);
+		}
+	}
+};
+
+//! sim_display's list shape: 2D, Same as 2D, Anaglyph, Cropped SBS, Quad (start-up-only unless declared).
+std::vector<xrt_rendering_mode>
+sim_like_list(bool quad_declared)
+{
+	std::vector<xrt_rendering_mode> v = {
+	    mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),      passthrough_entry(),
+	    mk(2, 0.5f, 0.5f, true, 2, 1, "Anaglyph"), mk(2, 0.5f, 0.5f, true, 1, 2, "Cropped SBS"),
+	    mk(4, 0.5f, 0.5f, true, 2, 2, "Quad"),
+	};
+	if (!quad_declared) {
+		v[4].mode_flags |= XRT_RENDERING_MODE_FLAG_START_UP_ONLY;
+	}
+	return v;
+}
+
+char g_choice[32] = {0};
+uint32_t g_choice_source = 0;
+
+bool
+test_resolver(xrt_device *, char *out, size_t cap, uint32_t *src)
+{
+	if (g_choice[0] == '\0') {
+		return false;
+	}
+	std::snprintf(out, cap, "%s", g_choice);
+	*src = g_choice_source;
+	return true;
+}
+
+uint32_t
+proxy_hook(xrt_device *)
+{
+	return 9;
+}
+
+} // namespace
+
+TEST_CASE("C1: slot 1 is 3D by position, a passthrough entry included", "[u_rendering_modes][adr066]")
+{
+	const std::vector<xrt_rendering_mode> slots = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"), passthrough_entry()};
+	CHECK(u_rendering_mode_is_3d(&slots[1]));
+	CHECK_FALSE(u_rendering_mode_is_flat(&slots[1]));
+	CHECK(u_rendering_modes_index_is_3d(slots.data(), 2, 1));
+	CHECK_FALSE(u_rendering_modes_index_is_3d(slots.data(), 2, 0));
+	// The passthrough slot does not ask for the lens.
+	CHECK_FALSE(u_rendering_modes_index_wants_hw_3d(slots.data(), 2, 1));
+	// V goes 1 -> 0 -> 1 (it used to stay on a flat one-view slot 1).
+	CHECK(u_rendering_modes_toggle_target(slots.data(), 2, 1) == 0);
+	CHECK(u_rendering_modes_toggle_target(slots.data(), 2, 0) == 1);
+	const u_rendering_mode_key_decision d = u_rendering_modes_decide_key(slots.data(), 2, 0, true, -1, false, 2);
+	CHECK(d.action == U_RENDERING_MODE_KEY_APPLY);
+	CHECK(d.target == 1);
+	CHECK_FALSE(d.want_3d); // the lens stays 2D
+}
+
+TEST_CASE("C1: choice names are the slug of the driver's mode name", "[u_rendering_modes][adr066]")
+{
+	char b[32];
+	u_rendering_mode_slug("Same as 2D", b, sizeof(b));
+	CHECK(std::string(b) == "same_as_2d");
+	u_rendering_mode_slug("Cropped SBS", b, sizeof(b));
+	CHECK(std::string(b) == "cropped_sbs");
+	u_rendering_mode_slug("  Quad!! ", b, sizeof(b));
+	CHECK(std::string(b) == "quad");
+	const xrt_rendering_mode m = mk(2, 0.5f, 0.5f, true, 2, 1, "Squeezed SBS");
+	CHECK(u_rendering_mode_matches_choice(&m, "squeezed_sbs"));
+	CHECK(u_rendering_mode_matches_choice(&m, "Squeezed SBS"));
+	CHECK_FALSE(u_rendering_mode_matches_choice(&m, "sbs"));
+}
+
+TEST_CASE("C1: a remap swaps the slot-1 entry in place and keeps the full list", "[u_rendering_modes][adr066]")
+{
+	table t(sim_like_list(true), 0);
+	u_rendering_modes_trim_info info{};
+	REQUIRE(u_rendering_modes_trim(t.modes, &t.count, &t.active, 2, &info) == U_RENDERING_MODES_TRIM_TRIMMED);
+	REQUIRE(std::string(t.modes[1].mode_name) == "Anaglyph");
+	REQUIRE(info.envelope_count == 5);
+	CHECK(t.active == 0);
+
+	// Anaglyph -> Quad -> Same as 2D -> Anaglyph: always the same 5 entries.
+	CHECK(u_rendering_modes_remap(t.modes, 5, 2, 4, &info));
+	CHECK(std::string(t.modes[1].mode_name) == "Quad");
+	CHECK(info.to_driver[1] == 4);
+	CHECK(u_rendering_modes_remap(t.modes, 5, 4, 1, &info));
+	CHECK(std::string(t.modes[1].mode_name) == "Same as 2D");
+	CHECK(u_rendering_modes_remap(t.modes, 5, 1, 2, &info));
+	CHECK(std::string(t.modes[1].mode_name) == "Anaglyph");
+	CHECK(std::string(t.modes[2].mode_name) == "Same as 2D");
+	for (uint32_t i = 0; i < 5; i++) {
+		CHECK(t.modes[i].mode_index == i);
+	}
+	// Refused: 0 (the 2D entry), out of range, the current one.
+	CHECK_FALSE(u_rendering_modes_remap(t.modes, 5, 2, 0, &info));
+	CHECK_FALSE(u_rendering_modes_remap(t.modes, 5, 2, 5, &info));
+	CHECK_FALSE(u_rendering_modes_remap(t.modes, 5, 2, 2, &info));
+}
+
+TEST_CASE("C1: a start-up-only listing stays out of the envelope and is never selected", "[u_rendering_modes][adr066]")
+{
+	table t(sim_like_list(false), 0);
+	u_rendering_modes_trim_info info{};
+	REQUIRE(u_rendering_modes_trim(t.modes, &t.count, &t.active, 4, &info) == U_RENDERING_MODES_TRIM_TRIMMED);
+	CHECK(info.original_count == 5);
+	CHECK(info.envelope_count == 4);
+	CHECK(std::string(t.modes[1].mode_name) == "Same as 2D"); // Quad refused: the first selectable
+	CHECK(u_rendering_modes_max_view_count(t.modes, info.envelope_count) == 2);
+	CHECK_FALSE(u_rendering_modes_remap(t.modes, info.envelope_count, 1, 4, &info));
+}
+
+TEST_CASE("C1: an entry wider than XRT_MAX_VIEWS is never selected or sized for", "[u_rendering_modes][adr066]")
+{
+	std::vector<xrt_rendering_mode> v = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
+	                                     mk(12, 0.25f, 0.25f, true, 4, 3, "Light field"),
+	                                     mk(2, 0.5f, 0.5f, true, 2, 1, "Stereo")};
+	table t(v, 1);
+	u_rendering_modes_trim_info info{};
+	REQUIRE(u_rendering_modes_trim(t.modes, &t.count, &t.active, 1, &info) == U_RENDERING_MODES_TRIM_TRIMMED);
+	CHECK(std::string(t.modes[1].mode_name) == "Stereo");
+	CHECK(u_rendering_modes_max_view_count(t.modes, info.envelope_count) == 2);
+}
+
+TEST_CASE("C1: the driver's config applies live: remap, generation, OUTPUT_MODE re-issued",
+          "[u_rendering_modes][adr066][device]")
+{
+	u_rendering_modes_set_choice_resolver(nullptr);
+	config_driver d(sim_like_list(true), /* Same as 2D */ 1);
+	REQUIRE(u_device_enforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+	REQUIRE(std::string(d.xdev.rendering_modes[1].mode_name) == "Same as 2D");
+	REQUIRE(d.hmd.view_count == 4); // the envelope's max, Quad declared
+	const uint32_t gen0 = u_device_rendering_modes_generation(&d.xdev);
+
+	SECTION("in 2D: the table moves, nothing reaches the driver")
+	{
+		d.configured = 2;
+		CHECK(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+		CHECK(u_device_rendering_modes_generation(&d.xdev) == gen0 + 1);
+		CHECK(std::string(d.xdev.rendering_modes[1].mode_name) == "Anaglyph");
+		CHECK(d.xdev.rendering_mode_count == 2);
+		CHECK(d.hmd.active_rendering_mode_index == 0);
+		CHECK(d.set_calls.empty());
+		CHECK(d.hmd.view_count == 4); // never re-sized
+		// No change: no remap, no bump.
+		CHECK_FALSE(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+		CHECK(u_device_rendering_modes_generation(&d.xdev) == gen0 + 1);
+	}
+	SECTION("in 3D: the index stays 1 and the driver is told its new entry")
+	{
+		CHECK(xrt_device_set_property(&d.xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 1) == XRT_SUCCESS);
+		CHECK(d.set_calls.back() == 1);
+		d.configured = 4; // Quad
+		CHECK(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+		CHECK(d.hmd.active_rendering_mode_index == 1);
+		CHECK(d.set_calls.back() == 4);  // its own numbering
+		CHECK(d.seen_views.back() == 4); // and it read ITS Quad entry
+		CHECK(std::string(d.xdev.rendering_modes[1].mode_name) == "Quad");
+		CHECK(d.xdev.rendering_mode_count == 2);
+	}
+	SECTION("a value outside the declared 3D entries is refused, the slot kept")
+	{
+		d.configured = 0;
+		CHECK_FALSE(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+		d.configured = 7;
+		CHECK_FALSE(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+		CHECK(u_device_rendering_modes_generation(&d.xdev) == gen0);
+		CHECK(std::string(d.xdev.rendering_modes[1].mode_name) == "Same as 2D");
+	}
+}
+
+TEST_CASE("C1: the per-screen choice outranks the driver's default", "[u_rendering_modes][adr066][device]")
+{
+	config_driver d(sim_like_list(false), 1);
+	u_rendering_modes_set_choice_resolver(test_resolver);
+	g_choice[0] = '\0';
+	REQUIRE(u_device_enforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+	REQUIRE(d.hmd.view_count == 2); // Quad listed start-up-only: not in the envelope
+
+	std::snprintf(g_choice, sizeof(g_choice), "%s", "cropped_sbs");
+	g_choice_source = XRT_STATUS_MODE_3D_SOURCE_USER;
+	CHECK(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+	CHECK(std::string(d.xdev.rendering_modes[1].mode_name) == "Cropped SBS");
+
+	xrt_status_mode_3d st{};
+	u_device_rendering_modes_fill_status(&d.xdev, &st);
+	CHECK(st.valid);
+	CHECK(std::string(st.active) == "cropped_sbs");
+	CHECK(std::string(st.setting) == "cropped_sbs");
+	CHECK(st.source == XRT_STATUS_MODE_3D_SOURCE_USER);
+	// The driver's order, every 3D listing, with what the runtime says about each.
+	REQUIRE(st.choice_count == 4);
+	CHECK(std::string(st.choices[0].name) == "same_as_2d");
+	CHECK(st.choices[0].passthrough);
+	CHECK(st.choices[0].views == 1);
+	CHECK(st.choices[0].applies == XRT_STATUS_MODE_3D_APPLIES_NOW);
+	CHECK(std::string(st.choices[1].label) == "Anaglyph");
+	CHECK(std::string(st.choices[3].name) == "quad");
+	CHECK(st.choices[3].applies == XRT_STATUS_MODE_3D_APPLIES_RESTART_APP);
+	CHECK(std::string(st.choices[3].reason).find("start-up") != std::string::npos);
+
+	SECTION("a choice the list cannot serve falls back to the driver's default")
+	{
+		std::snprintf(g_choice, sizeof(g_choice), "%s", "quad");
+		d.configured = 2;
+		CHECK(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+		CHECK(std::string(d.xdev.rendering_modes[1].mode_name) == "Anaglyph");
+		u_device_rendering_modes_fill_status(&d.xdev, &st);
+		CHECK(st.source == XRT_STATUS_MODE_3D_SOURCE_DRIVER_DEFAULT);
+	}
+	SECTION("cleared: the driver's default again")
+	{
+		g_choice[0] = '\0';
+		CHECK(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+		CHECK(std::string(d.xdev.rendering_modes[1].mode_name) == "Same as 2D");
+	}
+	u_rendering_modes_set_choice_resolver(nullptr);
+	g_choice[0] = '\0';
+}
+
+TEST_CASE("C1: the in-process sync polls at most once a second; an IPC proxy uses its hook",
+          "[u_rendering_modes][adr066][device]")
+{
+	u_rendering_modes_set_choice_resolver(nullptr);
+	config_driver d(sim_like_list(true), 1);
+	REQUIRE(u_device_enforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+	const uint64_t s = 1000ull * 1000ull * 1000ull;
+	const uint32_t g0 = u_device_rendering_modes_sync(&d.xdev, 10 * s); // first poll: immediate
+	d.configured = 2;
+	CHECK(u_device_rendering_modes_sync(&d.xdev, 10 * s + s / 2) == g0); // throttled
+	CHECK(u_device_rendering_modes_sync(&d.xdev, 11 * s) == g0 + 1);     // applied
+
+	// An IPC head proxy: published envelope, generation from its hook.
+	xrt_device proxy{};
+	proxy.rendering_mode_count = 2;
+	u_device_rendering_modes_publish(&proxy, 5, 3);
+	CHECK(u_device_rendering_modes_envelope_count(&proxy) == 5);
+	CHECK(u_device_rendering_modes_generation(&proxy) == 3);
+	u_device_rendering_modes_set_sync_hook(&proxy, proxy_hook);
+	CHECK(u_device_rendering_modes_sync(&proxy, 0) == 9);
+	u_device_rendering_modes_forget(&proxy);
+	CHECK(u_device_rendering_modes_envelope_count(&proxy) == 2);
 }

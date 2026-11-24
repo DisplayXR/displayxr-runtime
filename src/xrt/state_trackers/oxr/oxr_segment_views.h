@@ -101,8 +101,21 @@ oxr_segment_views_multiview_count(uint32_t device_max_views, uint32_t set_capaci
 	if (set_capacity == 0) {
 		set_capacity = 1;
 	}
-	uint32_t n = device_max_views * set_capacity;
-	return n > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : n;
+	// ADR-066 C1.5: only FULL view sets. floor(XRT_MAX_VIEWS / max views)
+	// sets, at least 1 and at most the capacity; never a partial last set
+	// (5 views x 2 screens is one set of 5, not 8). One device entry wider
+	// than XRT_MAX_VIEWS is never selectable (u_rendering_modes); clamp.
+	if (device_max_views >= XRT_MAX_VIEWS) {
+		return XRT_MAX_VIEWS;
+	}
+	uint32_t sets = XRT_MAX_VIEWS / device_max_views;
+	if (sets > set_capacity) {
+		sets = set_capacity;
+	}
+	if (sets < 1) {
+		sets = 1;
+	}
+	return sets * device_max_views;
 }
 
 /*!

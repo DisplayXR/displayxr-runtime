@@ -26,6 +26,7 @@
 #include "xrt/xrt_limits.h"
 #include "xrt/xrt_screen.h"
 
+#include "util/u_rendering_modes.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_tiling.h"
@@ -2131,8 +2132,8 @@ split_wire_xbridge(struct comp_hub_d3d11 *s, uint32_t dxgi_format, uint32_t widt
 	// so a mode switch never reallocates the heap mid-flight.
 	uint32_t sys_w = 0, sys_h = 0;
 	if (s->xdev != nullptr && s->xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(s->xdev->rendering_modes, s->xdev->rendering_mode_count, &sys_w,
-		                              &sys_h);
+		u_tiling_compute_system_atlas(s->xdev->rendering_modes,
+		                              u_device_rendering_modes_envelope_count(s->xdev), &sys_w, &sys_h);
 	}
 	if (sys_w == 0 || sys_h == 0) {
 		sys_w = width;
