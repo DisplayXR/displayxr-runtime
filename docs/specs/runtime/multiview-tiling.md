@@ -91,10 +91,12 @@ The tiling algorithm uses `ceil` (not `round`) for the column count, which biase
 | 4K 3D display (3840x2160) | 2D | 1 | 1.0x1.0 | 3840x2160 | 1x1 | 3840x2160 | |
 | 4K 3D display (3840x2160) | Stereo | 2 | 0.5x0.5 | 1920x1080 | 2x1 | 3840x1080 | SBS (horizontal) |
 
-System swapchain for sim_display: a device serves two modes at run time, 2D and the 3D kind
-selected at start-up ([ADR-065](../../adr/ADR-065-two-runtime-rendering-modes.md)), so the
-worst case is taken over those two — max(1920,1920) x max(1080,540) = **1920x1080** with the
-anaglyph kind, and the same with the quad kind (max(1920,1920) x max(1080,1080)).
+System swapchain for sim_display: apps see two slots, 2D and the screen's 3D mode, but the
+worst case is taken over the driver's **full declared list**
+(ADR-066 (design PR #2792) C1.5): Same as
+2D (1920x1080), Anaglyph / Interlaced / Blend (1920x540), Cropped SBS (960x1080), Squeezed SBS
+(1920x1080), and Quad (1920x1080) when it is declared — **1920x1080** whichever 3D mode is
+selected, so every live switch fits the swapchain already allocated.
 System swapchain for Looking Glass: max(2560,1536) x max(1600,1280) = **2560x1600** (display res).
 System swapchain for the 3840x2160 display: max(3840,3840) x max(2160,1080) = **3840x2160** (display res).
 
@@ -102,8 +104,10 @@ In all of these examples the 2D mode (1 view at full display) dominates and the 
 tile smaller views that fit within. **That is a property of these tables, not a rule.** A
 multiview quilt whose tiles add up to more than the panel (e.g. a 3x3 quilt at 0.5x0.5 is
 1.5x the panel in each dimension) makes the 3D mode the worst case. Because only 2D and the
-selected kind are sized for (ADR-065), such a driver's allocation is max(2D, the selected
-kind), not the largest over every kind it could offer.
+whole declared list is sized for (ADR-066 C1, which restored the pre-ADR-065 rule), such a
+driver's allocation is the largest over every entry it declares, so a live 3D-mode switch to it
+never needs a reallocation. An entry the driver lists as start-up-only
+(`XRT_RENDERING_MODE_FLAG_START_UP_ONLY`) is outside the envelope and cannot be switched to live.
 
 ---
 
@@ -290,7 +294,7 @@ The app swapchain flows **into** the compositor; the target swapchain flows **ou
 
 ### Swapchain images are worst-case sized
 
-Swapchain images are runtime-allocated (via `xrCreateSwapchain`) and **fixed at init** to the worst-case dimensions across all rendering modes — under ADR-065 the two a driver serves at run time, 2D and the 3D kind selected at start-up (nothing is ever rebuilt, ADR-010):
+Swapchain images are runtime-allocated (via `xrCreateSwapchain`) and **fixed at init** to the worst-case dimensions across all rendering modes — the driver's full declared list, the envelope behind the two slots apps see (ADR-066 C1; nothing is ever rebuilt, ADR-010). Sizing call sites pass `u_device_rendering_modes_envelope_count(xdev)`, never `rendering_mode_count` (= 2):
 
 ```
 swapchain_width  = max(tile_columns[i] * view_width[i])  across all modes i
