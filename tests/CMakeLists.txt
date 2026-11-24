@@ -149,6 +149,7 @@ set(tests
     tests_dp_atlas_encoding_query
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
+    tests_oxr_mode_observed_rule
     tests_oxr_tracking_properties_rule
     tests_oxr_hosted_raw_views_rule
     tests_oxr_input_providers_rule
@@ -1419,6 +1420,14 @@ target_include_directories(
 	tests_oxr_mode_fillable_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 target_link_libraries(tests_oxr_mode_fillable_rule PRIVATE xrt-interfaces)
+
+# #2801 - what an in-process session is told when the compositor moved the
+# rendering mode (the runtime's V / 0 / 1 keys on a runtime-owned window). Only
+# the rule is host-drivable, like the two above; same include + xrt-interfaces.
+target_include_directories(
+	tests_oxr_mode_observed_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+target_link_libraries(tests_oxr_mode_observed_rule PRIVATE xrt-interfaces)
 
 # #1631 — what XrSystemTrackingProperties advertises on a 3D display: the head's
 # own flags OR the display processor's eye-tracking capability OR any tracked

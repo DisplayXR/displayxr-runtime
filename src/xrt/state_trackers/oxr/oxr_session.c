@@ -88,6 +88,7 @@
 #include "oxr_conversions.h"
 #include "oxr_xret.h"
 #include "oxr_legacy_mode_rule.h" // #1510/#1499 mode floor
+#include "oxr_mode_observed_rule.h" // #2801 compositor-moved mode -> event
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1413,6 +1414,56 @@ oxr_session_mono_auto_2d_explicit(struct oxr_logger *log, struct oxr_session *se
 	}
 	return true;
 }
+
+/*!
+ * #2801: tell an in-process session that the compositor moved the rendering
+ * mode. The runtime's mode keys (V, '0', '1', ADR-065) are applied by the
+ * in-process compositor that owns the window: it writes the head device's
+ * active index and asks the display processor for the hardware state, and it
+ * owns no session event sink. So the app of a runtime-owned window was never
+ * told, and its mode table and this session's hardware state went stale. A
+ * window-bound app handles the keys itself and is answered by
+ * xrRequestDisplayRenderingModeDXR, which sends these same two events.
+ *
+ * Called from xrPollEvent; one compare when nothing moved. Every writer of the
+ * index in this file and the request path record what they wrote in
+ * last_rendering_mode_index, so only a change made behind the session's back
+ * is reported, once (oxr_mode_observed_rule.h).
+ */
+static void
+oxr_session_mode_observed_poll(struct oxr_logger *log, struct oxr_session *sess)
+{
+	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+	if (head == NULL || head->hmd == NULL) {
+		return;
+	}
+	const bool in_process = sess->sys->xsysc == NULL || !sess->sys->xsysc->info.is_service_mode;
+	const bool hidden = oxr_session_window_hidden(sess);
+	const struct oxr_mode_observed_decision d =
+	    oxr_mode_observed_decide(head->rendering_modes, head->rendering_mode_count, sess->last_rendering_mode_index,
+	                             head->hmd->active_rendering_mode_index, sess->hardware_display_3d, in_process,
+	                             oxr_frame_sync_is_session_running(&sess->frame_sync),
+	                             sess->sys->inst->extensions.DXR_display_info, hidden || sess->mono_auto_2d.active);
+	if (!d.sync) {
+		return;
+	}
+	sess->last_rendering_mode_index = d.current;
+	if (d.sync_hardware) {
+		sess->hardware_display_3d = d.hardware_3d;
+		// ADR-062 D1, as on the request path: 3D chosen while the window is
+		// hidden is reported on the visible edge.
+		if (hidden && d.hardware_3d) {
+			sess->window_hidden_seen = true;
+			sess->window_hidden_3d_owed = true;
+		}
+	}
+	if (d.push_mode_event) {
+		oxr_event_push_XrEventDataRenderingModeChanged(log, sess, d.previous, d.current);
+	}
+	if (d.push_hardware_event) {
+		oxr_event_push_XrEventDataHardwareDisplayStateChanged(log, sess, d.hardware_3d ? XR_TRUE : XR_FALSE);
+	}
+}
 #endif // OXR_HAVE_DXR_display_info
 
 static XrResult
@@ -2049,6 +2100,8 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 			}
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
 			head->hmd->active_rendering_mode_index = 0;
+			// Our own write, not a change to report (#2801).
+			sess->last_rendering_mode_index = 0;
 		}
 		oxr_session_request_display_mode(log, sess, false);
 	}
@@ -2202,6 +2255,11 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 
 	// ADR-062 D1: report a visibility-driven lens edge (in-process sessions).
 	oxr_session_visibility_poll(log, sess);
+
+#ifdef OXR_HAVE_DXR_display_info
+	// #2801: report a mode the in-process compositor's keys moved.
+	oxr_session_mode_observed_poll(log, sess);
+#endif
 
 	// In-process device loss (XRT_ERROR_COMPOSITOR_DEVICE_LOST, armed from
 	// xrWaitFrame): the transition the out-of-process path gets from
