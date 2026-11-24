@@ -55,24 +55,25 @@ set "COMPONENT_MARKER_conversion_open=HKLM\Software\DisplayXR\ConversionProvider
 
 REM Leia 2D-to-3D conversion provider (ADR-053), split out of the Leia SR plug-in.
 REM Opt-in only (--with leia-conversion). It needs the NeurD runtime, which has its
-REM own installer and is never fetched here. NOT RELEASED YET: versions.json has no
-REM leia_conversion field until the first release adds it, and until then the flag
-REM warns and skips (COMPONENTS_AWAITING_FIRST_RELEASE below).
+REM own installer and is never fetched here. Released (first release v0.1.0):
+REM versions.json pins leia_conversion, so a missing pin is an error.
 set "COMPONENT_REPO_leia_conversion=DisplayXR/displayxr-leia-conversion"
 set "COMPONENT_EXE_leia_conversion=DisplayXRLeiaConversionSetup-*.exe"
 set "COMPONENT_MARKER_leia_conversion=HKLM\Software\DisplayXR\Plugins\LeiaConversion"
 
 REM Ultraleap hands input provider (ADR-034), moved out of the runtime trunk.
 REM Opt-in only (--with ultraleap). It needs the Ultraleap tracking software and a
-REM camera. NOT RELEASED YET, as above. A build only installs on the runtime release
-REM it was built at (ADR-063): its installer exits 3 on any other runtime.
+REM camera. NOT RELEASED YET: versions.json has no ultraleap field until the first
+REM release adds it, and until then the flag warns and skips
+REM (COMPONENTS_AWAITING_FIRST_RELEASE below). A build only installs on the runtime
+REM release it was built at (ADR-063): its installer exits 3 on any other runtime.
 set "COMPONENT_REPO_ultraleap=DisplayXR/displayxr-ultraleap"
 set "COMPONENT_EXE_ultraleap=DisplayXRUltraleapSetup-*.exe"
 set "COMPONENT_MARKER_ultraleap=HKLM\Software\DisplayXR\Plugins\Ultraleap"
 
 REM Components that may have NO pin in versions.json yet (no release). Mirrors
 REM COMPONENTS_AWAITING_FIRST_RELEASE in scripts\lib\components.sh; keep in sync.
-set "COMPONENTS_AWAITING_FIRST_RELEASE=leia_conversion ultraleap"
+set "COMPONENTS_AWAITING_FIRST_RELEASE=ultraleap"
 
 set "COMPONENT_REPO_mcp_tools=DisplayXR/displayxr-mcp"
 set "COMPONENT_EXE_mcp_tools=DisplayXRMCPSetup-*.exe"
@@ -204,9 +205,9 @@ call :read_pin leia_plugin LEIA_TAG
 call :read_pin conversion_open CONVOPEN_TAG
 call :read_pin mcp_tools MCP_TAG
 call :read_pin browser BROWSER_TAG
-REM Not released yet: an absent pin is expected, so these two are read only when
+call :read_pin leia_conversion LEIACONV_TAG
+REM Not released yet: an absent pin is expected, so this one is read only when
 REM asked for, and :read_pin_optional never raises the exit code.
-if "%WITH_LEIA_CONVERSION%"=="1" call :read_pin_optional leia_conversion LEIACONV_TAG
 if "%WITH_ULTRALEAP%"=="1" call :read_pin_optional ultraleap ULTRALEAP_TAG
 
 REM --- Staging dir ---
@@ -348,7 +349,7 @@ call set "_IC_MARKER=%%COMPONENT_MARKER_%_IC_NAME%%%"
 
 if "%_IC_TAG%"=="" (
     echo WARN: skipping %_IC_NAME% — no pin in versions.json 1>&2
-    echo       ^(leia_conversion and ultraleap have none until their first release.^) 1>&2
+    echo       ^(ultraleap has none until its first release.^) 1>&2
     exit /b 0
 )
 
