@@ -24,6 +24,7 @@
 
 #include "util/comp_segments.h"
 
+#include "util/u_logging.h"
 #include "util/u_screen_modes.h"
 
 #include "xrt/xrt_display_metrics.h"
@@ -240,6 +241,122 @@ comp_segments_view_size_update(struct comp_segments_view_size *vs,
 	    !u_screen_modes_effective_equal(&vs->eff, &next) || vs->eff.majority_screen_id != next.majority_screen_id;
 	vs->eff = next;
 	return changed;
+}
+
+/*!
+ * @ref comp_segments_view_size_update from the window's placement: cuts the
+ * manager's own segment table (so it runs also on frames whose split update
+ * did not, e.g. zero-copy on the session screen, and the size follows the
+ * window back) and takes the window's size from @p canvas when it has one,
+ * else from @p window_desktop. Same return.
+ */
+static inline bool
+comp_segments_view_size_update_for_window(struct comp_segments_view_size *vs,
+                                          const struct comp_seg_rect *window_desktop,
+                                          const struct comp_seg_rect *canvas,
+                                          const struct comp_segments_screen *screens,
+                                          uint32_t screen_count,
+                                          const struct xrt_rendering_mode *head_modes,
+                                          uint32_t head_count,
+                                          uint32_t max_views,
+                                          uint32_t cap_w,
+                                          uint32_t cap_h,
+                                          uint64_t now_ns)
+{
+	if (vs == NULL || window_desktop == NULL) {
+		return false;
+	}
+	struct comp_segment_table t;
+	comp_segments_compute(window_desktop, canvas, screens, screen_count, &t);
+	const uint32_t ww = canvas != NULL && canvas->w > 0 ? canvas->w : window_desktop->w;
+	const uint32_t wh = canvas != NULL && canvas->h > 0 ? canvas->h : window_desktop->h;
+	return comp_segments_view_size_update(vs, &t, screens, screen_count, head_modes, head_count, max_views, cap_w,
+	                                      cap_h, ww, wh, now_ns);
+}
+
+/*!
+ * The frame's mode as the compositor lays its atlas out (ADR-047 Amendment
+ * 10): @p mode with the geometry of slot @p slot of the effective table @p eff
+ * overlaid (view count, tiles, view scale, view and atlas size), so the
+ * renderer's layout and view size are the table the app was told. The lens
+ * state and every other field stay @p mode's (the app's slot). Pure.
+ *
+ * @return false (and @p out untouched) when @p eff is NULL / invalid, @p slot
+ *         is not 0 or 1, or @p mode is NULL: the frame keeps @p mode.
+ */
+static inline bool
+comp_segments_view_size_overlay_mode(const struct xrt_rendering_mode *mode,
+                                     const struct xrt_effective_mode_table *eff,
+                                     uint32_t slot,
+                                     struct xrt_rendering_mode *out)
+{
+	if (mode == NULL || eff == NULL || out == NULL || !eff->valid || slot >= 2) {
+		return false;
+	}
+	const struct xrt_effective_mode_slot *e = &eff->slot[slot];
+	*out = *mode;
+	out->view_count = e->view_count;
+	out->tile_columns = e->tile_columns;
+	out->tile_rows = e->tile_rows;
+	out->view_scale_x = e->view_scale_x;
+	out->view_scale_y = e->view_scale_y;
+	out->view_width_pixels = e->view_width_pixels;
+	out->view_height_pixels = e->view_height_pixels;
+	out->atlas_width_pixels = e->tile_columns * e->view_width_pixels;
+	out->atlas_height_pixels = e->tile_rows * e->view_height_pixels;
+	return true;
+}
+
+/*!
+ * Where segment tile @p v comes from and goes to (ADR-047 Amendment 10): the
+ * segment's tile @p v takes the session's view @p v — the first
+ * @ref comp_segments_segment_grid::views views of the session atlas
+ * (@p session_cols wide), laid out in the segment's own grid @p g. Pure; the
+ * caller iterates v over [0, g->views).
+ */
+static inline void
+comp_segments_view_size_tile_map(const struct comp_segments_segment_grid *g,
+                                 uint32_t session_cols,
+                                 uint32_t v,
+                                 uint32_t *out_src_col,
+                                 uint32_t *out_src_row,
+                                 uint32_t *out_dst_col,
+                                 uint32_t *out_dst_row)
+{
+	const uint32_t sc = session_cols > 0 ? session_cols : 1;
+	const uint32_t dc = g != NULL && g->cols > 0 ? g->cols : 1;
+	*out_src_col = v % sc;
+	*out_src_row = v / sc;
+	*out_dst_col = v % dc;
+	*out_dst_row = v / dc;
+}
+
+/*!
+ * The one change-only WARN every segment manager logs when its effective
+ * table moved (ADR-047 Amendment 10), so one grep works on every platform
+ * and compositor. Call only on a change.
+ */
+static inline void
+comp_segments_view_size_log_change(const struct xrt_effective_mode_table *e)
+{
+	if (e == NULL) {
+		return;
+	}
+	if (!e->valid) {
+		U_LOG_W(
+		    "view size: the window is on the session screen - its app is told the session display's "
+		    "table (ADR-047 Amendment 10)");
+		return;
+	}
+	U_LOG_W(
+	    "view size: the window covers %u screen(s), majority 0x%016llx - its app is told slot 0 "
+	    "'%s' %ux%u tiles x %.3f x %.3f, slot 1 '%s' %u view(s) %ux%u tiles x %.3f x %.3f%s "
+	    "(ADR-047 Amendment 10)",
+	    e->screen_count, (unsigned long long)e->majority_screen_id, e->slot[0].mode_name, e->slot[0].tile_columns,
+	    e->slot[0].tile_rows, (double)e->slot[0].view_scale_x, (double)e->slot[0].view_scale_y,
+	    e->slot[1].mode_name, e->slot[1].view_count, e->slot[1].tile_columns, e->slot[1].tile_rows,
+	    (double)e->slot[1].view_scale_x, (double)e->slot[1].view_scale_y,
+	    (e->clamped[0] || e->clamped[1]) ? " - clamped to the instance's worst case" : "");
 }
 
 #ifdef __cplusplus

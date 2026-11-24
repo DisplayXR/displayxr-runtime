@@ -135,7 +135,8 @@ the owning plug-in's `get_rendering_modes_for_monitor` list and that screen's ow
 `comp_segments_view_size_segment_grid` turns the entry into the grid the segment's crop is laid out
 in (one tile for a one-view entry or for one the atlas cannot fill, else the entry's own tiles,
 filled with the session's first views), and the segment DP is told which entry to draw through
-`xrt_display_processor_vk::set_output_entry` on change. The primary segment keeps the session's
+`set_output_entry` slot of its API's DP vtable (`xrt_display_processor_vk` / `_d3d11` / `_d3d12` /
+`_gl`) on change. The primary segment keeps the session's
 grid.
 
 The window's **effective table** — what its app enumerates — is held by the manager
@@ -146,9 +147,17 @@ segment table on every weave with a placed window, also when the split update do
 answers `xrEnumerateDisplayRenderingModesDXR` from it and queues
 `XrEventDataRenderingModeTableChangedDXR` on a change. vk_native then lays its atlas out from the
 same table (tiles and scale overlaid on the frame's mode), so the app, the compositor and each
-segment DP agree. Built for vk_native (Linux X11 + Wayland); the D3D11 / D3D12 / GL / Metal
-managers and the service weave engines publish no table (the session screen's stands) and crop every
-segment in the session's grid.
+segment DP agree. Built for vk_native (Linux X11 + Wayland, and Windows, where the same code runs)
+and the Windows in-process D3D11 / D3D12 / GL compositors, which hold the same
+`comp_segments_view_size` in their segment managers (`comp_{d3d11,d3d12,gl}_segments_update_view_size`
+/ `_get_effective_table`), overlay it on the frame's mode with `comp_segments_view_size_overlay_mode`,
+crop each non-primary segment in its screen's entry (`comp_d3d11_segments_frame::screen_entries`, and
+the D3D12 / GL twins) and tell its DP through the per-API `set_output_entry` slot (D3D11 slot 36,
+D3D12 slot 27, GL slot 25, VK slot 20). Under the #918 weave-on-scanout split the D3D11 hub
+(`comp_hub_d3d11`, which segments for the D3D11, D3D12, GL and Vulkan sessions it serves) does the same,
+switched by its owner through `comp_hub_d3d11_set_view_size_policy` (off for a legacy app). Every
+manager logs the same change-only WARN (`comp_segments_view_size_log_change`, "view size: ...").
+The D3D11 service, the Metal compositor and the service weave engines are covered separately.
 
 ## The lens wish follows coverage (#2247)
 

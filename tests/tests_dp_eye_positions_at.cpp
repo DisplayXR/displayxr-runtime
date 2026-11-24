@@ -49,6 +49,8 @@ static_assert(offsetof(xrt_display_processor_d3d11, get_eye_positions_at) ==
 static_assert(offsetof(xrt_display_processor_d3d11, get_eye_positions_at) + sizeof(void *) ==
               offsetof(xrt_display_processor_d3d11, accepts_atlas_encoding));
 static_assert(offsetof(xrt_display_processor_d3d11, accepts_atlas_encoding) + sizeof(void *) ==
+              offsetof(xrt_display_processor_d3d11, set_output_entry)); // ADR-047 Amendment 10 appended it
+static_assert(offsetof(xrt_display_processor_d3d11, set_output_entry) + sizeof(void *) ==
               sizeof(xrt_display_processor_d3d11));
 static_assert(offsetof(xrt_display_processor_d3d12, get_eye_positions_at) ==
               offsetof(xrt_display_processor_d3d12, set_present_origin) + sizeof(void *));
@@ -56,6 +58,8 @@ static_assert(offsetof(xrt_display_processor_d3d12, get_eye_positions_at) ==
 static_assert(offsetof(xrt_display_processor_d3d12, get_eye_positions_at) + sizeof(void *) ==
               offsetof(xrt_display_processor_d3d12, snap_window_rect));
 static_assert(offsetof(xrt_display_processor_d3d12, snap_window_rect) + sizeof(void *) ==
+              offsetof(xrt_display_processor_d3d12, set_output_entry)); // ADR-047 Amendment 10 appended it
+static_assert(offsetof(xrt_display_processor_d3d12, set_output_entry) + sizeof(void *) ==
               sizeof(xrt_display_processor_d3d12));
 static_assert(offsetof(xrt_display_processor_gl, get_eye_positions_at) ==
               offsetof(xrt_display_processor_gl, set_present_origin) + sizeof(void *));
@@ -63,6 +67,8 @@ static_assert(offsetof(xrt_display_processor_gl, get_eye_positions_at) ==
 static_assert(offsetof(xrt_display_processor_gl, get_eye_positions_at) + sizeof(void *) ==
               offsetof(xrt_display_processor_gl, snap_window_rect));
 static_assert(offsetof(xrt_display_processor_gl, snap_window_rect) + sizeof(void *) ==
+              offsetof(xrt_display_processor_gl, set_output_entry)); // ADR-047 Amendment 10 appended it
+static_assert(offsetof(xrt_display_processor_gl, set_output_entry) + sizeof(void *) ==
               sizeof(xrt_display_processor_gl));
 static_assert(offsetof(xrt_display_processor_metal, get_eye_positions_at) ==
               offsetof(xrt_display_processor_metal, snap_window_rect) + sizeof(void *));

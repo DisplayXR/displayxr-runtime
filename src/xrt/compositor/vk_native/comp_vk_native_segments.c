@@ -1799,43 +1799,23 @@ comp_vk_native_segments_update_view_size(struct comp_vk_native_segments *segs,
 	if (segs == NULL || !segs->enabled || window_desktop == NULL) {
 		return false;
 	}
-	// Its own table: the update above may not run this frame (zero-copy on
-	// the primary, a self-submitting DP), and the size must still follow the
-	// window back.
-	struct comp_segment_table t;
-	comp_segments_compute(window_desktop, canvas, segs->screens, segs->screen_count, &t);
-	const uint32_t ww = canvas != NULL && canvas->w > 0 ? canvas->w : window_desktop->w;
-	const uint32_t wh = canvas != NULL && canvas->h > 0 ? canvas->h : window_desktop->h;
-	// Computed on the weave thread's own copy; published under the lock.
+	// Computed on the weave thread's own copy (from its own table: the update
+	// above may not run this frame — zero-copy on the primary, a
+	// self-submitting DP — and the size must still follow the window back);
+	// published under the lock.
 	struct comp_segments_view_size *next = malloc(sizeof(*next));
 	if (next == NULL) {
 		return false;
 	}
 	*next = segs->vs;
-	const bool changed =
-	    comp_segments_view_size_update(next, &t, segs->screens, segs->screen_count, head_modes, head_count,
-	                                   max_views, cap_w, cap_h, ww, wh, os_monotonic_get_ns());
+	const bool changed = comp_segments_view_size_update_for_window(next, window_desktop, canvas, segs->screens,
+	                                                               segs->screen_count, head_modes, head_count,
+	                                                               max_views, cap_w, cap_h, os_monotonic_get_ns());
 	os_mutex_lock(&segs->dp_mutex);
 	segs->vs = *next;
 	os_mutex_unlock(&segs->dp_mutex);
 	if (changed) {
-		const struct xrt_effective_mode_table *e = &next->eff;
-		if (!e->valid) {
-			U_LOG_W(
-			    "view size: the window is on the session screen - its app is told the session display's "
-			    "table (ADR-047 Amendment 10)");
-		} else {
-			U_LOG_W(
-			    "view size: the window covers %u screen(s), majority 0x%016llx - its app is told slot 0 "
-			    "'%s' %ux%u tiles x %.3f x %.3f, slot 1 '%s' %u view(s) %ux%u tiles x %.3f x %.3f%s "
-			    "(ADR-047 Amendment 10)",
-			    e->screen_count, (unsigned long long)e->majority_screen_id, e->slot[0].mode_name,
-			    e->slot[0].tile_columns, e->slot[0].tile_rows, (double)e->slot[0].view_scale_x,
-			    (double)e->slot[0].view_scale_y, e->slot[1].mode_name, e->slot[1].view_count,
-			    e->slot[1].tile_columns, e->slot[1].tile_rows, (double)e->slot[1].view_scale_x,
-			    (double)e->slot[1].view_scale_y,
-			    (e->clamped[0] || e->clamped[1]) ? " - clamped to the instance's worst case" : "");
-		}
+		comp_segments_view_size_log_change(&next->eff);
 	}
 	free(next);
 	return changed;

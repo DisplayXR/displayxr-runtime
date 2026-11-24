@@ -131,6 +131,7 @@ struct xrt_device;
 struct comp_hub_d3d11;
 struct xrt_screen_list;
 struct xrt_segment_metrics;
+struct xrt_effective_mode_table;
 struct xrt_system_compositor_info;
 struct comp_segments_content;
 struct comp_hub_d3d11_handoff;
@@ -1517,7 +1518,8 @@ comp_hub_d3d11_set_screens(struct comp_hub_d3d11 *split,
  * each segment's eyes predicted NOW (the primary from the split's DP, every
  * other screen from its segment DP). App thread (xrLocateViews).
  *
- * @return false when the last weave did not split the window.
+ * @return false when the last weave did not split the window and published no
+ *         valid effective table (ADR-047 Amendment 10).
  */
 bool
 comp_hub_d3d11_get_segment_metrics(struct comp_hub_d3d11 *split, struct xrt_segment_metrics *out);
@@ -1531,6 +1533,28 @@ comp_hub_d3d11_get_segment_metrics(struct comp_hub_d3d11 *split, struct xrt_segm
  */
 void
 comp_hub_d3d11_stage_segment_content(struct comp_hub_d3d11 *split, const struct comp_segments_content *content);
+
+/*!
+ * ADR-047 Amendment 10 (the view size follows the window's screen) under the
+ * split: whether the split computes the window's effective rendering-mode
+ * table and crops each non-primary segment as its own screen's entry —
+ * @p on false for a legacy app, whose size is the compromise (the head
+ * device's table then stands, and every segment keeps the session's grid) —
+ * and the most views one view set of the session carries (@p max_views,
+ * 0 = no limit; comp_*_compositor_set_mode_fill_views). Off until set. Any
+ * thread; read on the weave thread.
+ */
+void
+comp_hub_d3d11_set_view_size_policy(struct comp_hub_d3d11 *split, bool on, uint32_t max_views);
+
+/*!
+ * ADR-047 Amendment 10: the effective table the last weave published (also
+ * in @ref comp_hub_d3d11_get_segment_metrics' `table`), for the owning
+ * compositor to lay its atlas out from the table its app was told. App
+ * thread. Returns its validity (false = the head device's table stands).
+ */
+bool
+comp_hub_d3d11_get_effective_table(struct comp_hub_d3d11 *split, struct xrt_effective_mode_table *out);
 /*! @} */
 
 #ifdef __cplusplus

@@ -13,6 +13,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_modes.h"
 #include "sim_display_settings.h"
 #include "sim_display_zone_common.h"
 #include "sim_display_scanout_common.h"
@@ -261,6 +262,10 @@ struct sim_display_processor_d3d11_impl
 	//! pre-M6 caller — keeps the process-wide panel and the full-target draw.
 	bool screen_bound;
 	uint64_t screen_monitor_id;
+	//! ADR-047 Amendment 10: the declared entry the runtime told this DP to
+	//! draw (set_output_entry), as a kind; -1 = never told (the process-wide
+	//! output, as before). Two sim screens can then show two 3D modes.
+	int32_t entry_kind;
 	int32_t screen_left, screen_top;
 	uint32_t screen_px_w, screen_px_h;
 	float screen_w_m, screen_h_m;
@@ -345,6 +350,12 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	// Read the current mode (2D <-> the device's 3D kind at run time, ADR-065).
 	// Single-view input forces passthrough — 3D shaders need ≥2 views.
 	enum sim_display_output_mode mode = sim_display_output_for_tiles(tile_columns * tile_rows);
+	if (sdp->entry_kind >= 0) {
+		// ADR-047 Amendment 10: this screen's own entry, whatever the
+		// process-wide state says (another vendor may own the head device).
+		mode = tile_columns * tile_rows <= 1 ? SIM_DISPLAY_OUTPUT_PASSTHROUGH
+		                                     : (enum sim_display_output_mode)sdp->entry_kind;
+	}
 	// #817: no phase-sensitive interlace on this backend yet — see the helper.
 	if (sim_interlaced_fallback_to_anaglyph(mode, "D3D11")) {
 		mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
@@ -968,6 +979,28 @@ sim_dp_d3d11_lift_get_depth(struct xrt_display_processor_d3d11 *xdp,
 	return sim_fake_lift_get_depth(sim_dp_d3d11(xdp)->fake_lift, id, d3d11_context, out);
 }
 
+/*!
+ * ADR-047 Amendment 10: draw declared entry @p mode_index of the list
+ * sim_display answers for this screen (get_rendering_modes_for_monitor, the
+ * same list as the head device's). Entry 0 is the 2D entry (passthrough).
+ * Same rule as the Vulkan DP's sim_dp_set_output_entry.
+ */
+static void
+sim_dp_d3d11_set_output_entry(struct xrt_display_processor_d3d11 *xdp, uint32_t mode_index)
+{
+	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
+	const uint32_t n = (uint32_t)(sizeof(sim_display_declared_order) / sizeof(sim_display_declared_order[0]));
+	const int32_t kind =
+	    (int32_t)(mode_index < n ? sim_display_declared_order[mode_index] : SIM_DISPLAY_OUTPUT_PASSTHROUGH);
+	if (kind != sdp->entry_kind) {
+		U_LOG_W("sim_display: DP %p (screen 0x%016llx) draws entry %u ('%s') (ADR-047 Amendment 10)",
+		        (void *)sdp, (unsigned long long)sdp->screen_monitor_id, mode_index,
+		        mode_index == 0 ? "2D"
+		                        : sim_display_kind_desc_get((enum sim_display_output_mode)kind).mode_name);
+	}
+	sdp->entry_kind = kind;
+}
+
 static xrt_result_t
 sim_display_processor_d3d11_create_bound(enum sim_display_output_mode mode,
                                          void *d3d11_device,
@@ -1007,6 +1040,8 @@ sim_display_processor_d3d11_create_bound(enum sim_display_output_mode mode,
 	sdp->base.set_background_2d = sim_dp_d3d11_set_background_2d; // #491 part 3
 	sdp->base.set_window = sim_dp_d3d11_set_window;               // #1008
 	sdp->base.set_present_origin = sim_dp_d3d11_set_present_origin; // multi-screen M6
+	sdp->base.set_output_entry = sim_dp_d3d11_set_output_entry;     // ADR-047 Amendment 10
+	sdp->entry_kind = -1;
 	sim_dp_d3d11_bind_screen(sdp, binding);
 
 	// #224 / ADR-027 local-zone test double config (shared parser — see

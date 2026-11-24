@@ -20,6 +20,7 @@
 #include "util/comp_dp_windowless_d3d11.h" // ADR-060 / #2370 windowless DP rule
 #include "xrt/xrt_plugin.h"                  // create_dp_d3d11_for_screen (ADR-060)
 #include "util/comp_segments_route.h"
+#include "util/comp_segments_view_size.h"
 #include "xrt/xrt_screen.h"
 #include "comp_d3d11_window.h"
 #include "comp_d3d11_state_guard.h"
@@ -1296,6 +1297,42 @@ d3d11_seg_ensure(struct comp_d3d11_compositor *c)
 }
 
 /*!
+ * ADR-047 Amendment 10: does this session follow the window's screen for its
+ * view size and 3D mode? Not for a legacy app (its size is the compromise:
+ * the head device's table stands and every segment keeps the session grid).
+ */
+static void
+d3d11_cap_to_instance_worst_case(const struct comp_d3d11_compositor *c, uint32_t *inout_w, uint32_t *inout_h)
+{
+	if (c->seg_sys_info == nullptr || c->legacy_app_tile_scaling) {
+		return;
+	}
+	if (c->seg_sys_info->atlas_width_pixels > *inout_w) {
+		*inout_w = c->seg_sys_info->atlas_width_pixels;
+	}
+	if (c->seg_sys_info->atlas_height_pixels > *inout_h) {
+		*inout_h = c->seg_sys_info->atlas_height_pixels;
+	}
+}
+
+static bool
+d3d11_view_size_on(const struct comp_d3d11_compositor *c)
+{
+	return c->segments != nullptr && !c->legacy_app_tile_scaling && c->xdev != nullptr && c->xdev->hmd != nullptr;
+}
+
+/*!
+ * ADR-047 Amendment 10: each non-primary segment is cropped and drawn as its
+ * own screen's entry for the frame's slot.
+ */
+static void
+d3d11_seg_frame_entries(const struct comp_d3d11_compositor *c, struct comp_d3d11_segments_frame *sf)
+{
+	sf->screen_entries = d3d11_view_size_on(c);
+	sf->active_slot = c->frame_mode_index;
+}
+
+/*!
  * Multi-screen M3: publish the table this weave took, for the next
  * xrLocateViews to frame per-segment views from (count 0 = one view set
  * unless the window really is woven per segment), and the #2218 zero-copy
@@ -1310,6 +1347,19 @@ d3d11_seg_publish(struct comp_d3d11_compositor *c, bool seg_split, bool seg_woul
 		const struct comp_seg_rect canvas = {0, 0, c->seg_window.w, c->seg_window.h};
 		(void)comp_d3d11_segments_get_metrics(c->segments, &c->seg_window, &canvas,
 		                                      c->display_processor != nullptr, &m);
+	}
+	// ADR-047 Amendment 10: the view size follows the window's screen. Runs
+	// on every weave with a placed window - also the ones that do not split
+	// (zero-copy on the session screen) - so the size follows the window back.
+	// Legacy apps never see the table (their size is the compromise).
+	if (d3d11_view_size_on(c) && c->have_seg_window) {
+		const struct comp_seg_rect canvas = {0, 0, c->seg_window.w, c->seg_window.h};
+		const uint32_t cap_w = c->seg_sys_info != nullptr ? c->seg_sys_info->atlas_width_pixels : 0;
+		const uint32_t cap_h = c->seg_sys_info != nullptr ? c->seg_sys_info->atlas_height_pixels : 0;
+		(void)comp_d3d11_segments_update_view_size(c->segments, &c->seg_window, &canvas,
+		                                           c->xdev->rendering_modes, c->xdev->rendering_mode_count,
+		                                           c->mode_fill_views, cap_w, cap_h);
+		(void)comp_d3d11_segments_get_effective_table(c->segments, &m.table);
 	}
 	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
 	m.generation = c->seg_pub.generation;
@@ -1821,6 +1871,7 @@ d3d11_tt_weave(struct comp_d3d11_compositor *c,
 		sf.outcomp = c->outcomp;
 		sf.client_presents = true; // the app presents the shared texture
 		sf.out_any_flat = &any_flat;
+		d3d11_seg_frame_entries(c, &sf); // ADR-047 Amendment 10
 		comp_d3d11_segments_record(c->segments, &sf);
 		// #2725: woven per screen, not phased from one origin — no snap.
 		comp_tt_drag_snap_update(c->tt.drag_snap, woven.ref, woven.x, woven.y, false);
@@ -3956,6 +4007,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		sf.atlas_encoding = -1; // the in-process D3D11 path declares none to the primary either
 		sf.primary_dp = c->display_processor;
 		sf.outcomp = c->outcomp; // on the output device, like the target
+		d3d11_seg_frame_entries(c, &sf); // ADR-047 Amendment 10
 		comp_d3d11_segments_record(c->segments, &sf);
 		// The segment path leaves the back buffer bound at full viewport;
 		// re-bind through the target so everything after sees exactly the
@@ -5755,6 +5807,31 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			frame_mode = &c->xdev->rendering_modes[idx];
 		}
 	}
+	/*
+	 * ADR-047 Amendment 10: the view size follows the window's screen. When
+	 * the window is on (or across) other screens, the atlas is laid out and
+	 * sized from the table its app was told (the effective table, published
+	 * by the last weave) - the session's tiles and view scale are the head
+	 * screen's only while the window is on it. The lens state stays the
+	 * app's (its slot's): only the geometry is overlaid.
+	 */
+	struct xrt_rendering_mode frame_mode_eff;
+	if (c->hub.split != nullptr) {
+		comp_hub_d3d11_set_view_size_policy(c->hub.split, !c->legacy_app_tile_scaling, c->mode_fill_views);
+	}
+	if (frame_mode != NULL && !c->legacy_app_tile_scaling) {
+		struct xrt_effective_mode_table eff;
+		bool have_eff = false;
+		if (c->hub.split != nullptr) {
+			have_eff = comp_hub_d3d11_get_effective_table(c->hub.split, &eff);
+		} else if (c->segments != nullptr) {
+			have_eff = comp_d3d11_segments_get_effective_table(c->segments, &eff);
+		}
+		if (have_eff &&
+		    comp_segments_view_size_overlay_mode(frame_mode, &eff, c->frame_mode_index, &frame_mode_eff)) {
+			frame_mode = &frame_mode_eff;
+		}
+	}
 	// The worst-case atlas cap follows the table as it is now: a display-info
 	// refresh (hotplug, a larger panel) recomputes the per-mode view sizes, and
 	// a cap left at its create-time value would clamp a legitimately larger
@@ -5762,9 +5839,14 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (frame_mode != NULL && c->renderer != NULL) {
 		uint32_t cap_w = 0, cap_h = 0;
 		comp_d3d11_renderer_get_atlas_cap(c->renderer, &cap_w, &cap_h);
-		if (u_tiling_follow_atlas_cap(c->xdev->rendering_modes, c->xdev->rendering_mode_count, &cap_w,
-		                              &cap_h)) {
-			comp_d3d11_renderer_set_atlas_cap(c->renderer, cap_w, cap_h);
+		uint32_t want_w = cap_w, want_h = cap_h;
+		(void)u_tiling_follow_atlas_cap(c->xdev->rendering_modes, c->xdev->rendering_mode_count, &want_w,
+		                                &want_h);
+		// ADR-047 Amendment 10: the instance's worst case covers every claimed
+		// screen's modes, so a window on another screen fits too.
+		d3d11_cap_to_instance_worst_case(c, &want_w, &want_h);
+		if (want_w != cap_w || want_h != cap_h) {
+			comp_d3d11_renderer_set_atlas_cap(c->renderer, want_w, want_h);
 		}
 	}
 
@@ -11943,7 +12025,9 @@ comp_d3d11_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_
 	{
 		std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 		if (c->hub.split != nullptr) {
-			return comp_hub_d3d11_get_segment_metrics(c->hub.split, out) && out->count > 0;
+			// ADR-047 Amendment 10: a valid effective table is an answer too.
+			(void)comp_hub_d3d11_get_segment_metrics(c->hub.split, out);
+			return out->count > 0 || out->table.valid;
 		}
 	}
 	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
@@ -11963,7 +12047,9 @@ comp_d3d11_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_
 			s->have_eyes = comp_d3d11_segments_get_eyes(c->segments, s->screen_id, &s->eyes);
 		}
 	}
-	return out->count > 0;
+	// ADR-047 Amendment 10: a valid effective table is an answer too (the
+	// window wholly back on the session screen during the dwell).
+	return out->count > 0 || out->table.valid;
 }
 
 extern "C" void
