@@ -926,6 +926,45 @@ conv_core_set_provider_enabled(struct conv_core *core, const char *provider_id, 
 }
 
 bool
+conv_core_rebind_provider(struct conv_core *core, const struct conv_provider_desc *desc)
+{
+	bool changed = false;
+	os_mutex_lock(&core->registry_mtx);
+	const int32_t pi = conv_registry_find_provider(&core->reg, desc->id);
+	if (pi >= 0) {
+		changed = conv_registry_rebind(&core->reg, (uint32_t)pi, desc);
+		// ProbeOrder / Supersedes may have moved the effective capability.
+		core->conv_gen++;
+		core->status_gen++;
+		emit_simple(core, XRT_CONV_WIRE_EVENT_PROVIDERS_CHANGED, 0, 0, 0, 0, -1.0f);
+	}
+	os_mutex_unlock(&core->registry_mtx);
+	return changed;
+}
+
+void
+conv_core_set_provider_registered(struct conv_core *core, const char *provider_id, bool registered)
+{
+	os_mutex_lock(&core->registry_mtx);
+	const int32_t pi = conv_registry_find_provider(&core->reg, provider_id);
+	if (pi >= 0 && core->reg.providers[pi].unregistered == registered) {
+		conv_registry_set_registered(&core->reg, (uint32_t)pi, registered);
+		if (!registered) {
+			core->redescribe[pi] = false;
+			core->retrying[pi] = false;
+		}
+		core->reg.providers[pi].host_failed_reason = 0;
+		core->conv_gen++;
+		core->status_gen++;
+		// The next provider may serve the task now: the selection follows PrewarmOn.
+		core->prewarm_after_describe = true;
+		emit_simple(core, XRT_CONV_WIRE_EVENT_PROVIDERS_CHANGED, 0, 0, 0, 0, -1.0f);
+		os_cond_signal(&core->ctrl_cond);
+	}
+	os_mutex_unlock(&core->registry_mtx);
+}
+
+bool
 conv_core_set_policy(struct conv_core *core, const char *const *preferred, bool allow_research_only)
 {
 	bool changed = false;

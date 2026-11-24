@@ -696,3 +696,227 @@ TEST_CASE("conv_registry: describe cache round-trip and cold boot")
 		CHECK(c->providers[0].first_error == CONV_CAP_ERR_TASK);
 	}
 }
+
+/*
+ *
+ * Registration changes under a running service (discovery spec §3.8.1).
+ *
+ */
+
+namespace {
+
+void
+apply_to_provider(conv_registry &reg, uint32_t provider, uint32_t type, uint64_t now_ns, uint32_t reason = 0)
+{
+	for (uint32_t i = 0; i < reg.row_count; i++) {
+		if (reg.rows[i].provider == provider) {
+			conv_readiness_event e{};
+			e.type = type;
+			e.reason = reason;
+			e.now_ns = now_ns;
+			conv_readiness_apply(&reg.rows[i].rd, &e);
+		}
+	}
+}
+
+std::string
+selected_provider(const conv_registry &reg, uint32_t task)
+{
+	std::vector<conv_select_row> rows;
+	auto r = select_task(reg, task, 0, false, &rows);
+	return r.row >= 0 ? std::string(rows[(size_t)r.row].provider_id) : std::string();
+}
+
+} // namespace
+
+TEST_CASE("conv_registry: a rebound registration reports the new binary and is selected again")
+{
+	auto reg = new_registry();
+	fake fa, fo;
+	fa.caps = {cap(1, XRT_CONV_TASK_DEPTH_MONO), cap(2, XRT_CONV_TASK_DEPTH_VIDEO)};
+	fo.caps = {cap(1, XRT_CONV_TASK_DEPTH_MONO)};
+	auto da = desc("acme-conversion", 50, &fa, "dp-lift", "C:\\old\\acme.dll");
+	auto dopen = desc("open-conversion", 200, &fo, nullptr, "C:\\providers\\open.dll");
+	REQUIRE(conv_registry_add(reg.get(), &da) == 0);
+	REQUIRE(conv_registry_add(reg.get(), &dopen) == 1);
+	conv_registry_describe(reg.get(), 0, S);
+	conv_registry_describe(reg.get(), 1, S);
+	REQUIRE(selected_provider(*reg, XRT_CONV_TASK_DEPTH_MONO) == "acme-conversion");
+
+	// The bug's shape: an installer moved the binary; the host spawned from the
+	// old path fails to load, and selection falls to the next provider.
+	apply_to_provider(*reg, 0, CONV_EV_HOST_FAILED, 2 * S, XRT_CONV_FAIL_LOAD);
+	REQUIRE(selected_provider(*reg, XRT_CONV_TASK_DEPTH_MONO) == "open-conversion");
+
+	// The rebind: the row's facts move, nothing else.
+	conv_provider_desc nd{};
+	nd.id = "acme-conversion";
+	nd.probe_order = 40;
+	nd.supersedes = "";
+	nd.binary_path = "C:\\new\\AcmeConversion\\acme.dll";
+	nd.binary_size = 4321;
+	nd.binary_mtime = 8765;
+	nd.enabled = false; // not read by a rebind
+	CHECK(conv_registry_rebind(reg.get(), 0, &nd));
+	{
+		const conv_provider &p = reg->providers[0];
+		CHECK(std::string(p.binary_path) == "C:\\new\\AcmeConversion\\acme.dll");
+		CHECK(p.binary_size == 4321);
+		CHECK(p.binary_mtime == 8765);
+		CHECK(p.probe_order == 40);
+		CHECK(std::string(p.supersedes).empty());
+		CHECK(p.enabled);           // untouched
+		CHECK(p.iface == &k_iface); // untouched
+		CHECK(p.described);         // the previous binary's rows stay ...
+		CHECK(p.rebound);           // ... and are marked as such
+		CHECK(conv_registry_find_row(reg.get(), 0, 1) >= 0);
+	}
+
+	// The describe cache never files the old rows under the new binary's key.
+	{
+		std::vector<uint8_t> buf(conv_registry_cache_save(reg.get(), nullptr, 0));
+		conv_registry_cache_save(reg.get(), buf.data(), buf.size());
+		auto cold = new_registry();
+		auto ca = desc("acme-conversion", 40, nullptr, nullptr, "C:\\new\\AcmeConversion\\acme.dll");
+		ca.binary_size = 4321;
+		ca.binary_mtime = 8765;
+		auto co = desc("open-conversion", 200, nullptr, nullptr, "C:\\providers\\open.dll");
+		conv_registry_add(cold.get(), &ca);
+		conv_registry_add(cold.get(), &co);
+		CHECK(conv_registry_cache_load(cold.get(), buf.data(), buf.size(), S) == 1);
+		CHECK_FALSE(cold->providers[0].described);
+		CHECK(cold->providers[1].described);
+	}
+
+	// What the core does next (conv_core_provider_changed): the FAILED rows
+	// retry, and the task is this provider's again -- no restart.
+	apply_to_provider(*reg, 0, CONV_EV_REGISTRY_CHANGED, 3 * S);
+	CHECK(selected_provider(*reg, XRT_CONV_TASK_DEPTH_MONO) == "acme-conversion");
+
+	// The new binary answers: its rows replace the old ones (cap 2 is gone,
+	// cap 7 is new), and the provider is no longer `rebound`.
+	fa.caps = {cap(1, XRT_CONV_TASK_DEPTH_MONO), cap(7, XRT_CONV_TASK_VIEWS_MONO)};
+	fa.generation++;
+	CHECK(conv_registry_describe(reg.get(), 0, 4 * S) == 2);
+	CHECK_FALSE(reg->providers[0].rebound);
+	CHECK(conv_registry_find_row(reg.get(), 0, 2) < 0);
+	CHECK(conv_registry_find_row(reg.get(), 0, 7) >= 0);
+	CHECK(selected_provider(*reg, XRT_CONV_TASK_DEPTH_MONO) == "acme-conversion");
+
+	SECTION("the same binary key again is not a change")
+	{
+		CHECK_FALSE(conv_registry_rebind(reg.get(), 0, &nd));
+		CHECK_FALSE(reg->providers[0].rebound);
+	}
+	SECTION("a new size or mtime at the same path is a change (replaced in place)")
+	{
+		nd.binary_mtime = 9999;
+		CHECK(conv_registry_rebind(reg.get(), 0, &nd));
+		CHECK(reg->providers[0].rebound);
+	}
+	SECTION("an unknown provider index is refused")
+	{
+		CHECK_FALSE(conv_registry_rebind(reg.get(), 9, &nd));
+	}
+}
+
+TEST_CASE("conv_registry: a removed registration is gone: no rows, never selected, hides nothing")
+{
+	auto reg = new_registry();
+	fake fa, fl, fo;
+	fa.caps = {cap(1, XRT_CONV_TASK_DEPTH_VIDEO)};
+	fl.caps = {cap(2, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LICENCE_UNKNOWN)};
+	fo.caps = {cap(1, XRT_CONV_TASK_DEPTH_VIDEO)};
+	auto da = desc("acme-conversion", 50, &fa, "dp-lift", "C:\\providers\\acme.dll");
+	auto dl = desc("dp-lift", 150, &fl);
+	dl.flags = CONV_PROV_LICENCE_EXEMPT;
+	auto dopen = desc("open-conversion", 200, &fo, nullptr, "C:\\providers\\open.dll");
+	conv_registry_add(reg.get(), &da);
+	conv_registry_add(reg.get(), &dl);
+	conv_registry_add(reg.get(), &dopen);
+	for (uint32_t i = 0; i < 3; i++) {
+		conv_registry_describe(reg.get(), i, S);
+	}
+	REQUIRE(selected_provider(*reg, XRT_CONV_TASK_DEPTH_VIDEO) == "acme-conversion");
+	REQUIRE(conv_registry_is_hidden(reg.get(), 1));
+	std::vector<uint8_t> before(conv_registry_cache_save(reg.get(), nullptr, 0));
+	conv_registry_cache_save(reg.get(), before.data(), before.size());
+
+	conv_registry_set_registered(reg.get(), 0, false);
+	{
+		const conv_provider &p = reg->providers[0];
+		CHECK(reg->provider_count == 3); // the slot stays: the core cannot remove a provider
+		CHECK(p.unregistered);
+		CHECK_FALSE(p.enabled);
+		CHECK_FALSE(p.described);
+	}
+	CHECK(conv_registry_find_row(reg.get(), 0, 1) < 0);
+	REQUIRE(reg->row_count == 2);
+	CHECK(reg->rows[0].provider == 1); // the other providers' rows keep their owner
+	CHECK(reg->rows[1].provider == 2);
+	CHECK(conv_registry_discovery_settled(reg.get()));
+
+	// Never selected; its Supersedes no longer hides the adapter, so the next
+	// provider by ProbeOrder serves.
+	CHECK_FALSE(conv_registry_is_hidden(reg.get(), 1));
+	CHECK(selected_provider(*reg, XRT_CONV_TASK_DEPTH_VIDEO) == "dp-lift");
+
+	// A late describe (its host answering once more) and the describe cache
+	// must not bring its rows back.
+	CHECK(conv_registry_describe(reg.get(), 0, 2 * S) == -1);
+	CHECK(conv_registry_cache_load(reg.get(), before.data(), before.size(), 2 * S) == 0);
+	CHECK(reg->row_count == 2);
+	// ... and it is not saved either.
+	{
+		std::vector<uint8_t> buf(conv_registry_cache_save(reg.get(), nullptr, 0));
+		conv_registry_cache_save(reg.get(), buf.data(), buf.size());
+		auto cold = new_registry();
+		auto ca = desc("acme-conversion", 50, nullptr, "dp-lift", "C:\\providers\\acme.dll");
+		conv_registry_add(cold.get(), &ca);
+		CHECK(conv_registry_cache_load(cold.get(), buf.data(), buf.size(), S) == 0);
+	}
+
+	SECTION("the row comes back (a reinstall): registered, enabled and described again")
+	{
+		conv_registry_set_registered(reg.get(), 0, true);
+		CHECK_FALSE(reg->providers[0].unregistered);
+		reg->providers[0].enabled = true; // conv_core_set_provider_enabled
+		CHECK(conv_registry_describe(reg.get(), 0, 3 * S) == 1);
+		CHECK(conv_registry_is_hidden(reg.get(), 1));
+		CHECK(selected_provider(*reg, XRT_CONV_TASK_DEPTH_VIDEO) == "acme-conversion");
+	}
+}
+
+TEST_CASE("conv_registry: a registration change under a held maintenance mutex is deferred")
+{
+	auto act = [](bool known, bool gone, bool present, bool row_changed, bool held) {
+		conv_registration_change c{};
+		c.known = known;
+		c.gone = gone;
+		c.present = present;
+		c.row_changed = row_changed;
+		c.maintenance_held = held;
+		return conv_registration_action(&c);
+	};
+
+	// Mutex free: each change has its own action.
+	CHECK(act(false, false, true, false, false) == CONV_REGISTRATION_ADD);
+	CHECK(act(true, false, true, true, false) == CONV_REGISTRATION_REBIND);
+	CHECK(act(true, false, false, false, false) == CONV_REGISTRATION_REMOVE);
+	CHECK(act(true, true, true, false, false) == CONV_REGISTRATION_RESTORE);
+	CHECK(act(true, true, true, true, false) == CONV_REGISTRATION_RESTORE);
+
+	// Mutex held (an installer is mid-write): every one of them waits.
+	CHECK(act(false, false, true, false, true) == CONV_REGISTRATION_DEFER);
+	CHECK(act(true, false, true, true, true) == CONV_REGISTRATION_DEFER);
+	CHECK(act(true, false, false, false, true) == CONV_REGISTRATION_DEFER);
+	CHECK(act(true, true, true, false, true) == CONV_REGISTRATION_DEFER);
+
+	// Nothing about the row changed: KEEP, whatever the mutex says (an
+	// unrelated edit under the root must not queue a wait).
+	CHECK(act(true, false, true, false, false) == CONV_REGISTRATION_KEEP);
+	CHECK(act(true, false, true, false, true) == CONV_REGISTRATION_KEEP);
+	CHECK(act(true, true, false, false, false) == CONV_REGISTRATION_KEEP); // gone and still gone
+	CHECK(act(true, true, false, false, true) == CONV_REGISTRATION_KEEP);
+	CHECK(act(false, false, false, false, true) == CONV_REGISTRATION_KEEP);
+}

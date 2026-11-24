@@ -123,6 +123,19 @@ struct conv_provider
 	//! A failed provider counts as settled for discovery, described or not.
 	uint32_t host_failed_reason;
 
+	//! The provider's registration row / manifest is gone (an uninstall while
+	//! the service runs). The core cannot drop a provider slot (lanes, hosts
+	//! and bindings are per provider index), so the slot stays and is marked:
+	//! no rows, never a candidate, hides nothing, not listed. Cleared when the
+	//! row comes back (conv_registry_set_registered).
+	bool unregistered;
+
+	//! The registration was rebound to another binary (conv_registry_rebind)
+	//! and that binary has not been described yet: the rows are the previous
+	//! binary's. They stay selectable, but the describe cache does not save
+	//! them under the new binary's key. Cleared by the next live describe.
+	bool rebound;
+
 	bool described;      //!< rows exist (live or from the cache)
 	bool from_cache;     //!< rows came from the describe cache, not a live describe
 	uint64_t generation; //!< get_generation() at the last live describe
@@ -159,6 +172,61 @@ conv_registry_find_provider(const struct conv_registry *reg, const char *id);
 
 void
 conv_registry_set_usable(struct conv_registry *reg, uint32_t provider, bool usable);
+
+/*!
+ * The provider's registration row changed while it stays registered (an
+ * installer rewrote `Binary` / `Version` / `ProbeOrder` / `Supersedes`):
+ * take the row's facts from @p desc -- probe_order, supersedes and the
+ * describe-cache key (binary path, size, mtime). `enabled`, `hosting`, the
+ * live iface / host and the rows are NOT touched: the rows keep their
+ * readiness until the new binary is described (a cap_id that survives keeps
+ * it, as on any re-describe), and the provider reads `rebound` until then.
+ *
+ * @return true when the binary key (path, size or mtime) changed.
+ */
+bool
+conv_registry_rebind(struct conv_registry *reg, uint32_t provider, const struct conv_provider_desc *desc);
+
+/*!
+ * The provider's registration row is gone (@p registered false) or back
+ * (true). Gone: its rows are removed, it is disabled and not described, it is
+ * never a candidate, its Supersedes hides nothing, and the describe cache
+ * neither saves nor restores it. The slot itself stays (see
+ * conv_provider::unregistered). Back: only the mark is cleared; the caller
+ * rebinds, enables and re-describes it.
+ */
+void
+conv_registry_set_registered(struct conv_registry *reg, uint32_t provider, bool registered);
+
+/*! @name What to do about one provider id after a registration re-read @{ */
+enum conv_registration_action
+{
+	CONV_REGISTRATION_KEEP = 0, //!< nothing about the row itself changed
+	CONV_REGISTRATION_DEFER,    //!< it changed, but an installer holds the maintenance mutex: act on release
+	CONV_REGISTRATION_ADD,      //!< a new row
+	CONV_REGISTRATION_REBIND,   //!< a known row whose Binary and / or Version changed
+	CONV_REGISTRATION_REMOVE,   //!< a known row that is gone
+	CONV_REGISTRATION_RESTORE,  //!< a row that was gone is back
+};
+
+struct conv_registration_change
+{
+	bool known;            //!< the service already holds a row for the id
+	bool gone;             //!< ... and has it marked removed
+	bool present;          //!< the id is in the fresh enumeration
+	bool row_changed;      //!< known && present: Binary or Version differs from the held row
+	bool maintenance_held; //!< `Global\DisplayXR-ConvMaintenance-<id>` is held (POSIX: never)
+};
+/*! @} */
+
+/*!
+ * The rebind rule (discovery spec §3.8.1), pure: a row that did not change is
+ * KEEP whatever the mutex says; a row that did is DEFER while its maintenance
+ * mutex is held (an installer is mid-write: `Binary` may be new while the
+ * file is not there yet) and ADD / REBIND / REMOVE / RESTORE once it is free.
+ */
+enum conv_registration_action
+conv_registration_action(const struct conv_registration_change *c);
 
 /*!
  * Describe one live provider: provider status, then walk describe_cap() once

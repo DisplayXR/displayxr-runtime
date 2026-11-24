@@ -536,6 +536,111 @@ TEST_CASE("proxy: the ingest adapter LUID reaches the host; a change restarts it
 	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
 }
 
+namespace {
+
+std::vector<std::string>
+read_lines(const std::string &path)
+{
+	std::vector<std::string> out;
+	FILE *f = std::fopen(path.c_str(), "r");
+	if (f == nullptr) {
+		return out;
+	}
+	char line[1100];
+	while (std::fgets(line, sizeof(line), f) != nullptr) {
+		std::string s(line);
+		while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
+			s.pop_back();
+		}
+		out.push_back(s);
+	}
+	std::fclose(f);
+	return out;
+}
+
+} // namespace
+
+TEST_CASE("proxy: a registration rebind makes the next host load the new binary; the old host is not reused",
+          "[conv_proxy]")
+{
+	// Discovery spec §3.8.1: an installer rewrote the provider's `Binary`
+	// while the service runs. The scripted host logs the binary path each
+	// start was given.
+	const std::string log = temp_marker() + ".binaries";
+	std::remove(log.c_str());
+	g_maint_held = false;
+	Fixture fx({"--fake-binary-log", log}, 0, 5, CONV_PROXY_HOST, "sat-test", "old-binary", true, nullptr, true);
+	const uint64_t sid = fx.stream();
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x71, &r));
+	check_views(r, 0x71);
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	REQUIRE(fx.sup().spawns == 1u);
+	{
+		const auto lines = read_lines(log);
+		REQUIRE(lines.size() == 1u);
+		CHECK(lines[0] == "old-binary");
+	}
+
+	// The same path again: nothing to rebind, the host stays.
+	CHECK_FALSE(conv_host_proxy_rebind(fx.host, "old-binary", false));
+	sleep_ms(200);
+	CHECK(fx.sup().spawns == 1u);
+
+	// The rebind lands while the installer still holds the maintenance mutex
+	// (the service defers it in production; the proxy must hold the spawn
+	// either way). The host still running the old binary is closed for
+	// update -- no crash accounting -- and nothing spawns while it is held.
+	g_maint_held = true;
+	sleep_ms(1200); // past the 1 Hz probe: the supervisor has seen the mutex
+	CHECK(conv_host_proxy_rebind(fx.host, "new-binary", false));
+	conv_host_proxy_config_changed(fx.host);
+	char bound[64] = {0};
+	conv_host_proxy_get_binary(fx.host, bound, sizeof(bound));
+	CHECK(std::string(bound) == "new-binary");
+	REQUIRE(wait_until([&] { return fx.sup().last_exit == CONV_HOST_EXIT_UPDATE; }, 10000));
+	CHECK(fx.sup().restarts == 0u);
+	for (int i = 0; i < 20; i++) {
+		CHECK(fx.submit(sid, 0x72)); // the stream keeps its handle
+		sleep_ms(50);
+	}
+	CHECK(fx.sup().spawns == 1u);
+	CHECK(read_lines(log).size() == 1u);
+
+	// Released: the next spawn is the NEW binary, and the stream that was
+	// converting converts again on it.
+	g_maint_held = false;
+	REQUIRE(fx.convert(sid, 0x73, &r, 20000));
+	check_views(r, 0x73);
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	CHECK(fx.sup().spawns == 2u);
+	CHECK(fx.sup().restarts == 0u);
+	CHECK(fx.row_state() == XRT_CONV_STATE_READY);
+	CHECK(fx.stats(sid).rebinds == 0u); // same provider, same stream
+	{
+		const auto lines = read_lines(log);
+		REQUIRE(lines.size() == 2u);
+		CHECK(lines[1] == "new-binary");
+	}
+
+	// The same path, another file (a package manager renamed a new binary over
+	// it): the host running the old file is closed and respawned too.
+	CHECK(conv_host_proxy_rebind(fx.host, "new-binary", true));
+	conv_host_proxy_config_changed(fx.host);
+	REQUIRE(wait_until([&] { return fx.sup().spawns == 3u; }, 20000));
+	REQUIRE(fx.convert(sid, 0x74, &r, 20000));
+	check_views(r, 0x74);
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	CHECK(fx.sup().restarts == 0u);
+	{
+		const auto lines = read_lines(log);
+		REQUIRE(lines.size() == 3u);
+		CHECK(lines[2] == "new-binary");
+	}
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	std::remove(log.c_str());
+}
+
 TEST_CASE("proxy: with a warm describe cache nothing spawns until a warm / create", "[conv_proxy]")
 {
 	std::vector<uint8_t> cache;

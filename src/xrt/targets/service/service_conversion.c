@@ -30,6 +30,7 @@
 #include "target_conv_status.h"
 #include "target_conversion_plugin_loader.h"
 
+#include "os/os_process.h"
 #include "os/os_threading.h"
 #include "util/u_camera_consent.h"
 #include "util/u_file_logging.h"
@@ -98,6 +99,23 @@ static struct
 	uint64_t adapter_luid;
 
 	char cache_path[600];
+
+	//! Parallel to entries: the row is gone from the registry / manifests (an
+	//! uninstall while the service runs). Watch thread only.
+	bool entry_gone[XRT_CONV_LOADER_MAX_ENTRIES];
+
+	/*! Registration changes seen while the provider's maintenance mutex was
+	 *  held (discovery spec §3.8.1): the ids wait here, and the wait thread
+	 *  pokes the component watch when a mutex is released. An installer writes
+	 *  nothing after it releases the mutex, so no registry wake would come. */
+	struct os_mutex maint_mtx; //!< guards maint_ids / maint_count / maint_stop
+	struct os_cond maint_cond;
+	struct os_thread maint_thread;
+	bool maint_inited;
+	bool maint_started;
+	bool maint_stop;
+	char maint_ids[XRT_CONV_LOADER_MAX_ENTRIES][64];
+	uint32_t maint_count;
 } g;
 
 
@@ -865,6 +883,184 @@ cache_save(void)
 	free(buf);
 }
 
+/*
+ *
+ * Registration changes under a running service (discovery spec §3.8.1).
+ *
+ */
+
+//! Is an installer holding `Global\DisplayXR-ConvMaintenance-<id>`? POSIX: never.
+static bool
+maintenance_held(const char *id)
+{
+#ifdef XRT_OS_WINDOWS
+	char name[160];
+	(void)snprintf(name, sizeof(name), "Global\\DisplayXR-ConvMaintenance-%s", id);
+	return os_named_mutex_held(name);
+#else
+	(void)id;
+	return false;
+#endif
+}
+
+#define MAINT_POLL_NS (1000ull * 1000000ull)
+
+//! Waits for the maintenance mutexes of the deferred ids; pokes the watch on a release.
+static void *
+maint_wait_main(void *ptr)
+{
+	(void)ptr;
+	os_mutex_lock(&g.maint_mtx);
+	while (!g.maint_stop) {
+		if (g.maint_count == 0) {
+			os_cond_wait(&g.maint_cond, &g.maint_mtx);
+			continue;
+		}
+		char ids[XRT_CONV_LOADER_MAX_ENTRIES][64];
+		const uint32_t n = g.maint_count;
+		memcpy(ids, g.maint_ids, sizeof(ids));
+		os_mutex_unlock(&g.maint_mtx);
+		bool released[XRT_CONV_LOADER_MAX_ENTRIES] = {0};
+		bool any = false;
+		for (uint32_t i = 0; i < n; i++) {
+			released[i] = !maintenance_held(ids[i]);
+			any = any || released[i];
+		}
+		os_mutex_lock(&g.maint_mtx);
+		if (any) {
+			// Drop the released ids; a rescan that still finds one held re-adds it.
+			uint32_t kept = 0;
+			for (uint32_t i = 0; i < g.maint_count; i++) {
+				bool drop = false;
+				for (uint32_t j = 0; j < n; j++) {
+					drop = drop || (released[j] && strcmp(ids[j], g.maint_ids[i]) == 0);
+				}
+				if (!drop) {
+					if (kept != i) {
+						memcpy(g.maint_ids[kept], g.maint_ids[i], sizeof(g.maint_ids[0]));
+					}
+					kept++;
+				}
+			}
+			g.maint_count = kept;
+			os_mutex_unlock(&g.maint_mtx);
+			(void)service_component_watch_poke(TARGET_COMPONENT_CLASS_CONVERSION,
+			                                   SERVICE_COMPONENT_WATCH_POKED);
+			os_mutex_lock(&g.maint_mtx);
+			continue;
+		}
+		(void)os_cond_wait_timeout_ns(&g.maint_cond, &g.maint_mtx, MAINT_POLL_NS);
+	}
+	os_mutex_unlock(&g.maint_mtx);
+	return NULL;
+}
+
+//! Provider @p id's registration changed under a held maintenance mutex: act on its release (watch thread).
+static void
+maint_defer(const char *id)
+{
+	if (!g.maint_inited) {
+		return; // no wait thread: the next registry change or `conv reselect` applies it
+	}
+	bool added = false;
+	os_mutex_lock(&g.maint_mtx);
+	bool have = false;
+	for (uint32_t i = 0; i < g.maint_count; i++) {
+		have = have || strcmp(g.maint_ids[i], id) == 0;
+	}
+	if (!have && g.maint_count < XRT_CONV_LOADER_MAX_ENTRIES) {
+		(void)snprintf(g.maint_ids[g.maint_count++], sizeof(g.maint_ids[0]), "%s", id);
+		added = true;
+	}
+	os_cond_signal(&g.maint_cond);
+	os_mutex_unlock(&g.maint_mtx);
+	if (!g.maint_started) {
+		// Started at the first deferral (watch thread only), joined at stop.
+		g.maint_started = os_thread_start(&g.maint_thread, maint_wait_main, NULL) == 0;
+	}
+	if (added) {
+		U_LOG_W(
+		    "[conv] provider %s: its registration changed while an update holds its maintenance mutex; "
+		    "the service follows it when the mutex is released",
+		    id);
+	}
+}
+
+/*!
+ * Row @p k's registration changed (`Binary` and / or `Version`), or the row is
+ * back after a removal: re-read the whole row (watch thread, no lock held).
+ *
+ * A provider the service does not have mapped (satellite-hosted, or never
+ * loaded) is rebound: the held row is replaced by @p e, the core's registry
+ * takes the new binary key / ProbeOrder / Supersedes, and its satellite proxy
+ * spawns the new binary from now on (a host still running the old one is
+ * closed for update). The provenance of the new binary is then classified
+ * where it always is: by the host process's load gate at the next spawn, and
+ * by the status reader from the binary the snapshot now reports.
+ *
+ * A provider loaded IN the service keeps its mapped binary until the service
+ * restarts (spec §4.1): only the row's Version / Binary are recorded, as
+ * before, and the log says a restart is needed.
+ */
+static void
+rebind_entry(int k, const struct xrt_conversion_plugin_entry *e, struct conv_host *sat, bool was_gone)
+{
+	os_mutex_lock(&g.mtx);
+	const bool mapped = g.entries[k].status == XRT_CONV_LOAD_NEGOTIATED;
+	const bool binary_changed = strcmp(g.entries[k].binary_path, e->binary_path) != 0;
+	if (mapped) {
+		memcpy(g.entries[k].version, e->version, sizeof(e->version));
+		memcpy(g.entries[k].binary_path, e->binary_path, sizeof(e->binary_path));
+	} else {
+		// The whole row. `enabled` stays the value last applied: the
+		// enable / disable reconciliation in rescan compares against it.
+		const bool applied_enabled = g.entries[k].enabled;
+		g.entries[k] = *e;
+		g.entries[k].enabled = applied_enabled;
+		if (sat != NULL) {
+			(void)snprintf(g.entries[k].reason, sizeof(g.entries[k].reason), "hosted in %s", CONV_HOST_EXE);
+		}
+	}
+	g.entry_gone[k] = false;
+	os_mutex_unlock(&g.mtx);
+
+	if (mapped) {
+		if (binary_changed) {
+			U_LOG_W(
+			    "[conv] provider %s: its registration now names %s, but it is loaded in the service: "
+			    "the mapped binary serves until the service restarts",
+			    e->id, e->binary_path);
+		}
+	} else {
+		struct conv_provider_desc d;
+		memset(&d, 0, sizeof(d));
+		d.id = e->id;
+		d.probe_order = e->probe_order;
+		d.supersedes = e->supersedes;
+		d.binary_path = e->binary_path;
+		struct stat sb;
+		if (e->binary_path[0] != '\0' && stat(e->binary_path, &sb) == 0) {
+			d.binary_size = (uint64_t)sb.st_size;
+			d.binary_mtime = (uint64_t)sb.st_mtime;
+		}
+		const bool key_changed = conv_core_rebind_provider(g.core, &d);
+#ifdef CONV_HAVE_HOST_PROXY
+		if (sat != NULL) {
+			(void)conv_host_proxy_rebind(sat, e->binary_path, key_changed);
+		}
+#else
+		(void)sat;
+#endif
+		if (key_changed || was_gone) {
+			U_LOG_W("[conv] provider %s: registration %s (version %s, binary %s); no service restart",
+			        e->id, was_gone ? "back" : "rebound", e->version, e->binary_path);
+		}
+	}
+	if (was_gone) {
+		conv_core_set_provider_registered(g.core, e->id, true);
+	}
+}
+
 /*!
  * #2029: re-read the §3.1 policy and hand it to the running core:
  * PreferredProvider / AllowResearchOnly (the next selection), and the
@@ -903,19 +1099,33 @@ rescan(void)
 		const bool known_loaded = k >= 0 && g.entries[k].status == XRT_CONV_LOAD_NEGOTIATED;
 		// Roadmap §3.6 respawn rule (i): the provider's own row changed (an
 		// installer writes `Version` last) -- not just any key under the root.
-		const bool reregistered = k >= 0 && (strcmp(g.entries[k].version, e->version) != 0 ||
-		                                     strcmp(g.entries[k].binary_path, e->binary_path) != 0);
+		struct conv_registration_change ch = {0};
+		ch.known = k >= 0;
+		ch.gone = k >= 0 && g.entry_gone[k];
+		ch.present = true;
+		ch.row_changed = k >= 0 && (strcmp(g.entries[k].version, e->version) != 0 ||
+		                            strcmp(g.entries[k].binary_path, e->binary_path) != 0);
 		struct conv_host *sat = NULL;
 		for (uint32_t j = 0; k >= 0 && j < g.sat_count; j++) {
 			if (strcmp(g.sat_ids[j], e->id) == 0) {
 				sat = g.sat_hosts[j];
 			}
 		}
-		if (reregistered) {
-			memcpy(g.entries[k].version, e->version, sizeof(e->version));
-			memcpy(g.entries[k].binary_path, e->binary_path, sizeof(e->binary_path));
-		}
 		os_mutex_unlock(&g.mtx);
+		// Spec §3.8.1: a changed row is acted on only with its maintenance
+		// mutex free -- mid-install, `Binary` may name a file that is not
+		// there yet. Nothing of the held row is updated until then, so the
+		// change is seen again at the release (maint_wait_main's poke).
+		ch.maintenance_held = (!ch.known || ch.gone || ch.row_changed) && maintenance_held(e->id);
+		const enum conv_registration_action action = conv_registration_action(&ch);
+		if (action == CONV_REGISTRATION_DEFER) {
+			maint_defer(e->id);
+			continue;
+		}
+		const bool reregistered = action == CONV_REGISTRATION_REBIND || action == CONV_REGISTRATION_RESTORE;
+		if (reregistered) {
+			rebind_entry(k, e, sat, action == CONV_REGISTRATION_RESTORE);
+		}
 #ifdef CONV_HAVE_HOST_PROXY
 		if (sat != NULL) {
 			bool clear_gate = reregistered;
@@ -945,7 +1155,11 @@ rescan(void)
 		(void)sat;
 #endif
 		if (k >= 0) {
-			if (known_enabled != e->enabled) {
+			// Spec §3.8.1: a re-registered row the service never managed to
+			// load (untrusted, an ABI reject, a failed negotiate) is loaded
+			// again from its new binary, like a row enabled after start.
+			const bool reload = reregistered && e->enabled && !known_loaded && sat == NULL;
+			if (known_enabled != e->enabled || reload) {
 				// A satellite-hosted provider is never NEGOTIATED in the
 				// service (its host process negotiates), so "loaded" for it
 				// means "its proxy is registered with the core". Without this
@@ -972,7 +1186,9 @@ rescan(void)
 				    g.core, e->id,
 				    e->enabled && (known_loaded || hosted || e->status == XRT_CONV_LOAD_NEGOTIATED));
 				U_LOG_W("[conv] provider %s %s by a registry change (no restart)", e->id,
-				        e->enabled ? "enabled" : "disabled");
+				        known_enabled == e->enabled ? "loaded again"
+				        : e->enabled                ? "enabled"
+				                                    : "disabled");
 			}
 			conv_core_provider_changed(g.core, e->id);
 			continue;
@@ -988,9 +1204,11 @@ rescan(void)
 		g.entries[g.entry_count++] = *e;
 		os_mutex_unlock(&g.mtx);
 	}
-	// A row gone from the registry: the in-service provider stays loaded
-	// (spec §4.1: leaked until restart) but is no longer selectable.
-	os_mutex_lock(&g.mtx);
+	// A row gone from the registry / manifests (an uninstall). The core cannot
+	// remove a provider -- an in-service one stays loaded (spec §4.1: leaked
+	// until restart), a satellite proxy stays with its slot -- so it is marked
+	// gone: no capability rows, never selected, not listed (spec §3.8.1).
+	// g.entries is only rewritten on this (watch) thread.
 	for (int k = 0; k < g.entry_count; k++) {
 		bool present = false;
 		for (int i = 0; i < n; i++) {
@@ -999,14 +1217,30 @@ rescan(void)
 				break;
 			}
 		}
-		if (!present && g.entries[k].enabled) {
-			g.entries[k].enabled = false;
-			os_mutex_unlock(&g.mtx);
-			conv_core_set_provider_enabled(g.core, g.entries[k].id, false);
-			os_mutex_lock(&g.mtx);
+		struct conv_registration_change ch = {0};
+		ch.known = true;
+		ch.gone = g.entry_gone[k];
+		ch.present = present;
+		ch.maintenance_held = !present && !ch.gone && maintenance_held(g.entries[k].id);
+		const enum conv_registration_action action = conv_registration_action(&ch);
+		if (action == CONV_REGISTRATION_DEFER) {
+			maint_defer(g.entries[k].id);
+			continue;
 		}
+		if (action != CONV_REGISTRATION_REMOVE) {
+			continue;
+		}
+		os_mutex_lock(&g.mtx);
+		g.entry_gone[k] = true;
+		g.entries[k].enabled = false;
+		os_mutex_unlock(&g.mtx);
+		conv_core_set_provider_enabled(g.core, g.entries[k].id, false);
+		conv_core_set_provider_registered(g.core, g.entries[k].id, false);
+		U_LOG_W(
+		    "[conv] provider %s: its registration is gone (uninstalled): no longer listed or selected; "
+		    "no service restart",
+		    g.entries[k].id);
 	}
-	os_mutex_unlock(&g.mtx);
 	free(fresh);
 	// The built-in adapter has no registry row; its per-user Enabled is a
 	// policy override like any other (dp_lift_enabled_by_policy).
@@ -1167,6 +1401,18 @@ service_conversion_start(void)
 		return;
 	}
 	g.started = true;
+	g.maint_inited = false;
+	if (os_mutex_init(&g.maint_mtx) == 0) {
+		if (os_cond_init(&g.maint_cond) == 0 && os_thread_init(&g.maint_thread) == 0) {
+			g.maint_inited = true;
+		} else {
+			os_mutex_destroy(&g.maint_mtx);
+		}
+	}
+	g.maint_started = false;
+	g.maint_stop = false;
+	g.maint_count = 0;
+	memset(g.entry_gone, 0, sizeof(g.entry_gone));
 	init_host();
 	target_conv_policy_read(&g.policy);
 
@@ -1279,6 +1525,22 @@ service_conversion_stop(void)
 	// main.c stops the watch thread before this; clearing the subscription
 	// keeps a late poke from reaching a core that is going away.
 	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_CONVERSION, NULL, NULL);
+	if (g.maint_inited) {
+		// The watch thread (the only caller of maint_defer) is already stopped.
+		os_mutex_lock(&g.maint_mtx);
+		g.maint_stop = true;
+		os_cond_signal(&g.maint_cond);
+		os_mutex_unlock(&g.maint_mtx);
+		if (g.maint_started) {
+			os_thread_join(&g.maint_thread);
+		}
+		os_thread_destroy(&g.maint_thread);
+		os_cond_destroy(&g.maint_cond);
+		os_mutex_destroy(&g.maint_mtx);
+		g.maint_inited = false;
+		g.maint_started = false;
+		g.maint_count = 0;
+	}
 	cache_save();
 	ipc_server_conv_destroy(&g.sc);
 	// Providers die through their hosts; their binaries stay mapped for the
