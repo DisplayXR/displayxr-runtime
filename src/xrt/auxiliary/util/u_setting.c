@@ -1209,11 +1209,13 @@ u_setting_user_stamp(void)
 		return 0;
 	}
 #ifdef XRT_OS_WINDOWS
-	struct __stat64 st;
-	if (_stat64(path, &st) != 0) {
+	WIN32_FILE_ATTRIBUTE_DATA fa;
+	if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
 		return 0;
 	}
-	return ((uint64_t)st.st_mtime * 1000003ull) ^ (uint64_t)st.st_size ^ 1ull;
+	const uint64_t t = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+	const uint64_t sz = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+	return t ^ (sz << 1) ^ 1ull;
 #else
 	struct stat st;
 	if (stat(path, &st) != 0) {
