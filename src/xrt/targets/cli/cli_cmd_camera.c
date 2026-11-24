@@ -8,7 +8,16 @@
  *   camera calib <id> [--raw|--rectified] [--json]
  *   camera probe [<id>] [--raw|--rectified] [--format gray8|nv12|bgra8] [--fps F]
  *                [--frames N] [--seconds S] [--out DIR]
- *                [--max-disparity N] [--max-dy N] [--min-ncc C]
+ *                [--max-disparity N] [--max-dy N] [--min-ncc C] [--mode WxH]
+ *
+ * Spec v8 (modes, controls, stills):
+ *   camera modes [<id>] [--json]                  capture modes + control capabilities
+ *   camera set [<id>] <control> <value> ... [--seconds S] [--mode WxH]
+ *                controls: focus-mode auto|once|manual|locked, focus <dioptres>,
+ *                point <x>,<y> (left eye, normalised), ev <EV>; starts a stream,
+ *                takes the controls, prints the per-frame capture state
+ *   camera still [<id>] [--size WxH] [--raw] [--format gray8|nv12|bgra8]
+ *                [--mode WxH] [--out DIR]           one still, end to end
  *
  * R3 consent / privacy (ADR-043 §7) — the store is edited LOCALLY (no service
  * needed), the control ops go over IPC as a DIAG client:
@@ -874,8 +883,13 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv, bool apps_o
 	struct row_params rp = {.max_d = 0, .max_dy = 24, .min_ncc = 0.90f};
 	char rows_txt[64] = "";
 	bool have_rows = false;
+	unsigned mode_w = 0, mode_h = 0; // spec v8 --mode WxH (per eye); 0 = the default mode
 	for (int i = 3; i < argc; i++) {
-		if (strcmp(argv[i], "--raw") == 0) {
+		if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+			if (sscanf(argv[++i], "%ux%u", &mode_w, &mode_h) != 2) {
+				mode_w = mode_h = 0;
+			}
+		} else if (strcmp(argv[i], "--raw") == 0) {
 			output = XRT_STEREO_CAMERA_OUTPUT_RAW;
 		} else if (strcmp(argv[i], "--rectified") == 0) {
 			output = XRT_STEREO_CAMERA_OUTPUT_RECTIFIED;
@@ -948,6 +962,8 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv, bool apps_o
 	    .format = format,
 	    .transport = XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY,
 	    .max_frame_rate = fps,
+	    .eye_width = mode_w,
+	    .eye_height = mode_h,
 	};
 	uint64_t sid = 0;
 	xrt_result_t xret = ipc_client_stereo_camera_stream_create(ipc_c, &req, &sid);
@@ -1168,8 +1184,10 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv, bool apps_o
 			struct xrt_stereo_camera_calibration rc;
 			double fb = 0.0; // f * B, px * m
 			if (last.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED &&
-			    ipc_client_stereo_camera_get_calibration(ipc_c, id, XRT_STEREO_CAMERA_OUTPUT_RECTIFIED,
-			                                             &rc) == XRT_SUCCESS) {
+			    // v8: the numbers of the frames THIS stream gets (its mode's size).
+			    ipc_client_stereo_camera_get_calibration_mode(ipc_c, id, XRT_STEREO_CAMERA_OUTPUT_RECTIFIED,
+			                                                  last.width / 2, last.height,
+			                                                  &rc) == XRT_SUCCESS) {
 				fb = rc.eye[0].fx * rc.baseline_mm / 1000.0;
 			}
 			const char *out_name = last.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW";
@@ -1892,6 +1910,492 @@ cmd_uvc_decode_bench(int argc, const char **argv)
 	return 0;
 }
 
+/*
+ *
+ * Spec v8: modes, controls, stills.
+ *
+ */
+
+//! Camera @p id (0 = the first camera) into @p out; false (message printed) when none.
+static bool
+v8_pick_camera(struct ipc_connection *ipc_c, uint64_t id, const char *what, struct xrt_stereo_camera_properties *out)
+{
+	uint32_t n = 0;
+	if (ipc_client_stereo_camera_count(ipc_c, &n) == XRT_SUCCESS) {
+		for (uint32_t i = 0; i < n; i++) {
+			if (ipc_client_stereo_camera_get_properties(ipc_c, i, out) == XRT_SUCCESS &&
+			    !source_is_app(out->source) && (id == 0 || out->camera_id == id)) {
+				return true;
+			}
+		}
+	}
+	if (id != 0) {
+		printf("camera %s: no camera %llu.\n", what, (unsigned long long)id);
+	} else {
+		printf("camera %s: the service exposes no stereo camera%s\n", what,
+		       cam_sharing_is_off() ? result_hint(XRT_ERROR_STEREO_CAMERA_DISABLED) : ".");
+	}
+	return false;
+}
+
+static void
+v8_mode_flags_str(uint32_t f, char *out, size_t cap)
+{
+	snprintf(out, cap, "%s%s%s", (f & XRT_STEREO_CAMERA_MODE_DEFAULT) ? "DEFAULT " : "",
+	         (f & XRT_STEREO_CAMERA_MODE_STREAM) ? "STREAM " : "",
+	         (f & XRT_STEREO_CAMERA_MODE_STILL) ? "STILL" : "");
+}
+
+static const char *
+v8_focus_state_str(uint32_t s)
+{
+	switch (s) {
+	case XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_SEARCHING: return "SEARCHING";
+	case XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_LOCKED: return "LOCKED";
+	case XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_FIXED: return "FIXED";
+	case XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_FAILED: return "FAILED";
+	default: return "UNKNOWN";
+	}
+}
+
+static void
+v8_print_result(const char *prefix, const struct xrt_stereo_camera_capture_result *r)
+{
+	printf("%s", prefix);
+	if (r->valid_fields == 0) {
+		printf("no capture state reported\n");
+		return;
+	}
+	if (r->valid_fields & XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_DISTANCE) {
+		printf("focus %.3f D (%.3f m)  ", r->focus_distance_diopters,
+		       r->focus_distance_diopters > 0.0f ? 1.0f / r->focus_distance_diopters : INFINITY);
+	}
+	if (r->valid_fields & XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_STATE) {
+		printf("%s  ", v8_focus_state_str(r->focus_state));
+	}
+	if (r->valid_fields & XRT_PLUGIN_STEREO_CAMERA_RESULT_EXPOSURE_TIME) {
+		printf("exposure %.3f ms  ", (double)r->exposure_time_ns * 1e-6);
+	}
+	if (r->valid_fields & XRT_PLUGIN_STEREO_CAMERA_RESULT_SENSITIVITY) {
+		printf("ISO %u  ", r->sensitivity_iso);
+	}
+	if (r->valid_fields & XRT_PLUGIN_STEREO_CAMERA_RESULT_EYE_TIMES) {
+		printf("eye skew %+.3f ms", (double)(r->eye_time_ns[1] - r->eye_time_ns[0]) * 1e-6);
+	}
+	printf("\n");
+}
+
+//! `camera modes [<id>] [--json]`: modes + control capabilities of each camera.
+static int
+cmd_modes(struct ipc_connection *ipc_c, int argc, const char **argv, bool json)
+{
+	uint64_t want = 0;
+	for (int i = 3; i < argc; i++) {
+		if (argv[i][0] != '-') {
+			want = strtoull(argv[i], NULL, 10);
+		}
+	}
+	uint32_t n = 0;
+	xrt_result_t xret = ipc_client_stereo_camera_count(ipc_c, &n);
+	if (xret != XRT_SUCCESS) {
+		printf("stereo_camera_count failed: %d%s\n", (int)xret, result_hint(xret));
+		return 2;
+	}
+	if (json) {
+		printf("{\"cameras\": [");
+	}
+	uint32_t shown = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		struct xrt_stereo_camera_properties p;
+		if (ipc_client_stereo_camera_get_properties(ipc_c, i, &p) != XRT_SUCCESS || source_is_app(p.source) ||
+		    (want != 0 && p.camera_id != want)) {
+			continue;
+		}
+		struct xrt_stereo_camera_mode_list ml;
+		struct xrt_stereo_camera_control_caps caps;
+		xret = ipc_client_stereo_camera_get_modes(ipc_c, p.camera_id, &ml);
+		if (xret != XRT_SUCCESS) {
+			printf("stereo_camera_get_modes(%llu) failed: %d%s\n", (unsigned long long)p.camera_id,
+			       (int)xret, result_hint(xret));
+			return 2;
+		}
+		if (ipc_client_stereo_camera_get_control_caps(ipc_c, p.camera_id, &caps) != XRT_SUCCESS) {
+			memset(&caps, 0, sizeof(caps));
+		}
+		if (json) {
+			printf("%s{\"id\": %llu, \"modes\": [", shown ? ", " : "", (unsigned long long)p.camera_id);
+			for (uint32_t k = 0; k < ml.count; k++) {
+				printf(
+				    "%s{\"eyeWidth\": %u, \"eyeHeight\": %u, \"maxFrameRate\": %.2f, \"default\": %s, "
+				    "\"stream\": %s, \"still\": %s}",
+				    k ? ", " : "", ml.modes[k].eye_width, ml.modes[k].eye_height,
+				    ml.modes[k].max_frame_rate,
+				    (ml.modes[k].flags & XRT_STEREO_CAMERA_MODE_DEFAULT) ? "true" : "false",
+				    (ml.modes[k].flags & XRT_STEREO_CAMERA_MODE_STREAM) ? "true" : "false",
+				    (ml.modes[k].flags & XRT_STEREO_CAMERA_MODE_STILL) ? "true" : "false");
+			}
+			printf(
+			    "], \"controls\": {\"supported\": %u, \"focusModes\": %u, \"minFocusDiopters\": %.3f, "
+			    "\"focusCalibration\": %u, \"evMin\": %.3f, \"evMax\": %.3f, \"evStep\": %.4f}}",
+			    caps.supported_controls, caps.supported_focus_modes, caps.min_focus_distance_diopters,
+			    caps.focus_distance_calibration, caps.exposure_compensation_min_ev,
+			    caps.exposure_compensation_max_ev, caps.exposure_compensation_step_ev);
+		} else {
+			printf("camera %llu \"%s\": %u mode(s)\n", (unsigned long long)p.camera_id, p.display_name,
+			       ml.count);
+			for (uint32_t k = 0; k < ml.count; k++) {
+				char fl[48];
+				v8_mode_flags_str(ml.modes[k].flags, fl, sizeof(fl));
+				printf("  %4ux%-4u per eye  %6.1f Hz  %s\n", ml.modes[k].eye_width,
+				       ml.modes[k].eye_height, ml.modes[k].max_frame_rate, fl);
+			}
+			if (caps.supported_controls == 0) {
+				printf("  controls: none\n");
+			} else {
+				printf(
+				    "  controls:%s%s%s%s\n",
+				    (caps.supported_controls & XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_MODE)
+				        ? " focus-mode"
+				        : "",
+				    (caps.supported_controls & XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE)
+				        ? " focus"
+				        : "",
+				    (caps.supported_controls & XRT_PLUGIN_STEREO_CAMERA_CONTROL_METERING_POINT)
+				        ? " point"
+				        : "",
+				    (caps.supported_controls & XRT_PLUGIN_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION)
+				        ? " ev"
+				        : "");
+				printf("  focus: modes 0x%x, nearest %.3f D (%s), EV %+.2f .. %+.2f step %.3f\n",
+				       caps.supported_focus_modes, caps.min_focus_distance_diopters,
+				       caps.focus_distance_calibration == 2   ? "calibrated"
+				       : caps.focus_distance_calibration == 1 ? "approximate"
+				                                              : "uncalibrated",
+				       caps.exposure_compensation_min_ev, caps.exposure_compensation_max_ev,
+				       caps.exposure_compensation_step_ev);
+			}
+		}
+		shown++;
+	}
+	if (json) {
+		printf("]}\n");
+	} else if (shown == 0) {
+		printf("camera modes: no camera%s\n", want != 0 ? " with that id" : "");
+		return 3;
+	}
+	return 0;
+}
+
+//! Create + start a GRAY8 stream on @p p (RECTIFIED when it can be) at mode @p mw x @p mh.
+static xrt_result_t
+v8_start_stream(struct ipc_connection *ipc_c,
+                const struct xrt_stereo_camera_properties *p,
+                uint32_t mw,
+                uint32_t mh,
+                uint64_t *out_sid)
+{
+	struct xrt_stereo_camera_stream_request req = {
+	    .camera_id = p->camera_id,
+	    .output = (p->flags & XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE) ? XRT_STEREO_CAMERA_OUTPUT_RECTIFIED
+	                                                                : XRT_STEREO_CAMERA_OUTPUT_RAW,
+	    .format = XRT_STEREO_CAMERA_FORMAT_GRAY8,
+	    .transport = XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY,
+	    .max_frame_rate = 0.0f,
+	    .eye_width = mw,
+	    .eye_height = mh,
+	};
+	xrt_result_t xret = ipc_client_stereo_camera_stream_create(ipc_c, &req, out_sid);
+	if (xret != XRT_SUCCESS) {
+		printf("stream create failed: %d%s\n", (int)xret, result_hint(xret));
+		return xret;
+	}
+	xret = ipc_client_stereo_camera_stream_start(ipc_c, *out_sid);
+	if (xret != XRT_SUCCESS) {
+		printf("stream start failed: %d%s\n", (int)xret, result_hint(xret));
+	}
+	return xret;
+}
+
+//! Acquire until a frame arrives (<= @p timeout_ms); true with its capture state.
+static bool
+v8_next_frame(struct ipc_connection *ipc_c,
+              uint64_t sid,
+              int timeout_ms,
+              struct xrt_stereo_camera_frame_info *fi,
+              struct xrt_stereo_camera_capture_result *res)
+{
+	for (int t = 0; t < timeout_ms; t += 10) {
+		bool ready = false;
+		if (ipc_client_stereo_camera_acquire_ex(ipc_c, sid, &ready, fi, NULL, res) != XRT_SUCCESS) {
+			return false;
+		}
+		if (ready) {
+			return true;
+		}
+		os_nanosleep(10 * 1000 * 1000);
+	}
+	return false;
+}
+
+/*!
+ * `camera set [<id>] <control> <value> ... [--seconds S] [--mode WxH]`:
+ * starts a stream (controls need one), takes the camera's controls, and prints
+ * the per-frame capture state for S seconds — the lens following the control.
+ */
+static int
+cmd_set(struct ipc_connection *ipc_c, int argc, const char **argv)
+{
+	uint64_t id = 0;
+	float seconds = 2.0f;
+	unsigned mw = 0, mh = 0;
+	struct xrt_stereo_camera_controls c;
+	memset(&c, 0, sizeof(c));
+	for (int i = 3; i < argc; i++) {
+		const char *a = argv[i];
+		const char *v = i + 1 < argc ? argv[i + 1] : NULL;
+		if (strcmp(a, "--seconds") == 0 && v != NULL) {
+			seconds = (float)atof(v);
+			i++;
+		} else if (strcmp(a, "--mode") == 0 && v != NULL) {
+			if (sscanf(v, "%ux%u", &mw, &mh) != 2) {
+				mw = mh = 0;
+			}
+			i++;
+		} else if (strcmp(a, "focus-mode") == 0 && v != NULL) {
+			c.valid_controls |= XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_MODE;
+			c.focus_mode = strcmp(v, "once") == 0     ? XRT_PLUGIN_STEREO_CAMERA_FOCUS_AUTO_ONCE
+			               : strcmp(v, "manual") == 0 ? XRT_PLUGIN_STEREO_CAMERA_FOCUS_MANUAL
+			               : strcmp(v, "locked") == 0 ? XRT_PLUGIN_STEREO_CAMERA_FOCUS_LOCKED
+			                                          : XRT_PLUGIN_STEREO_CAMERA_FOCUS_CONTINUOUS_AUTO;
+			i++;
+		} else if (strcmp(a, "focus") == 0 && v != NULL) {
+			c.valid_controls |= XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE;
+			c.focus_distance_diopters = (float)atof(v);
+			i++;
+		} else if (strcmp(a, "point") == 0 && v != NULL) {
+			c.valid_controls |= XRT_PLUGIN_STEREO_CAMERA_CONTROL_METERING_POINT;
+			if (sscanf(v, "%f,%f", &c.metering_x, &c.metering_y) != 2) {
+				printf("camera set: point takes x,y (normalised in the left eye)\n");
+				return 1;
+			}
+			i++;
+		} else if (strcmp(a, "ev") == 0 && v != NULL) {
+			c.valid_controls |= XRT_PLUGIN_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION;
+			c.exposure_compensation_ev = (float)atof(v);
+			i++;
+		} else if (a[0] != '-' && c.valid_controls == 0) {
+			id = strtoull(a, NULL, 10);
+		}
+	}
+	if (c.valid_controls == 0) {
+		printf(
+		    "camera set: nothing to set (focus-mode auto|once|manual|locked, focus <D>, point <x>,<y>, ev "
+		    "<EV>)\n");
+		return 1;
+	}
+	struct xrt_stereo_camera_properties p;
+	if (!v8_pick_camera(ipc_c, id, "set", &p)) {
+		return 3;
+	}
+	uint64_t sid = 0;
+	xrt_result_t xret = v8_start_stream(ipc_c, &p, mw, mh, &sid);
+	if (xret != XRT_SUCCESS) {
+		return refusal_exit_code(xret);
+	}
+	struct xrt_stereo_camera_frame_info fi;
+	struct xrt_stereo_camera_capture_result res;
+	if (v8_next_frame(ipc_c, sid, 3000, &fi, &res)) {
+		v8_print_result("before:  ", &res);
+	}
+	xret = ipc_client_stereo_camera_set_controls(ipc_c, sid, &c);
+	if (xret != XRT_SUCCESS) {
+		printf("set controls failed: %d%s%s\n", (int)xret, result_hint(xret),
+		       xret == XRT_ERROR_STEREO_CAMERA_CONTROL_HELD ? " (another stream holds this camera's controls)"
+		       : xret == XRT_ERROR_FEATURE_NOT_SUPPORTED    ? " (the camera has no such control)"
+		                                                    : "");
+		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+		return xret == XRT_ERROR_STEREO_CAMERA_CONTROL_HELD ? 9 : refusal_exit_code(xret);
+	}
+	printf("controls 0x%x set on camera %llu (stream %llu); capture state for %.1f s:\n", c.valid_controls,
+	       (unsigned long long)p.camera_id, (unsigned long long)sid, seconds);
+	const int64_t end = os_monotonic_get_ns() + (int64_t)(seconds * 1e9);
+	int64_t next_print = 0;
+	while (os_monotonic_get_ns() < end) {
+		if (!v8_next_frame(ipc_c, sid, 500, &fi, &res)) {
+			continue;
+		}
+		const int64_t now = os_monotonic_get_ns();
+		if (now >= next_print) {
+			char pre[48];
+			snprintf(pre, sizeof(pre), "  #%-6llu ", (unsigned long long)fi.frame_index);
+			v8_print_result(pre, &res);
+			next_print = now + 250 * 1000 * 1000;
+		}
+	}
+	// Destroying the stream gives the controls back: the camera returns to its defaults.
+	ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+	return 0;
+}
+
+/*!
+ * `camera still [<id>] [--size WxH] [--raw] [--format gray8|nv12|bgra8]
+ * [--mode WxH] [--out DIR]`: one still through the whole path — request,
+ * ready event, read-only section, capture state, calibration.
+ */
+static int
+cmd_still(struct ipc_connection *ipc_c, int argc, const char **argv)
+{
+	uint64_t id = 0;
+	unsigned sw = 0, sh = 0, mw = 0, mh = 0;
+	uint32_t output = XRT_STEREO_CAMERA_OUTPUT_RECTIFIED;
+	uint32_t format = XRT_STEREO_CAMERA_FORMAT_GRAY8;
+	const char *out_dir = NULL;
+	for (int i = 3; i < argc; i++) {
+		if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
+			if (sscanf(argv[++i], "%ux%u", &sw, &sh) != 2) {
+				sw = sh = 0;
+			}
+		} else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+			if (sscanf(argv[++i], "%ux%u", &mw, &mh) != 2) {
+				mw = mh = 0;
+			}
+		} else if (strcmp(argv[i], "--raw") == 0) {
+			output = XRT_STEREO_CAMERA_OUTPUT_RAW;
+		} else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+			const char *f = argv[++i];
+			format = strcmp(f, "nv12") == 0    ? XRT_STEREO_CAMERA_FORMAT_NV12
+			         : strcmp(f, "bgra8") == 0 ? XRT_STEREO_CAMERA_FORMAT_BGRA8
+			                                   : XRT_STEREO_CAMERA_FORMAT_GRAY8;
+		} else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+			out_dir = argv[++i];
+		} else if (argv[i][0] != '-') {
+			id = strtoull(argv[i], NULL, 10);
+		}
+	}
+	struct xrt_stereo_camera_properties p;
+	if (!v8_pick_camera(ipc_c, id, "still", &p)) {
+		return 3;
+	}
+	uint64_t sid = 0;
+	xrt_result_t xret = v8_start_stream(ipc_c, &p, mw, mh, &sid);
+	if (xret != XRT_SUCCESS) {
+		return refusal_exit_code(xret);
+	}
+	struct xrt_stereo_camera_frame_info fi;
+	struct xrt_stereo_camera_capture_result res;
+	if (!v8_next_frame(ipc_c, sid, 5000, &fi, &res)) {
+		printf("camera still: no frame within 5 s (the source is not running)\n");
+		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+		return 7;
+	}
+	struct xrt_stereo_camera_still_request rq = {
+	    .eye_width = sw, .eye_height = sh, .output = output, .format = format};
+	uint64_t rid = 0;
+	const int64_t t0 = os_monotonic_get_ns();
+	xret = ipc_client_stereo_camera_request_still(ipc_c, sid, &rq, &rid);
+	if (xret != XRT_SUCCESS) {
+		printf("still request failed: %d%s%s\n", (int)xret, result_hint(xret),
+		       xret == XRT_ERROR_FEATURE_NOT_SUPPORTED ? " (this camera takes no stills)" : "");
+		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+		return refusal_exit_code(xret);
+	}
+	// Completion is an event; frames keep flowing (or pause briefly) meanwhile.
+	bool ready = false, failed = false;
+	int32_t why = 0;
+	uint32_t frames_during = 0;
+	for (int t = 0; t < 15000 && !ready && !failed; t += 10) {
+		bool has = false;
+		struct xrt_stereo_camera_event ev;
+		while (ipc_client_stereo_camera_poll_event(ipc_c, &has, &ev) == XRT_SUCCESS && has) {
+			if (ev.stream_id == sid && ev.request_id == rid) {
+				ready |= ev.kind == XRT_STEREO_CAMERA_EVENT_STILL_READY;
+				failed |= ev.kind == XRT_STEREO_CAMERA_EVENT_STILL_FAILED;
+				why = ev.result;
+			}
+		}
+		bool fr = false;
+		if (ipc_client_stereo_camera_acquire_ex(ipc_c, sid, &fr, &fi, NULL, NULL) == XRT_SUCCESS && fr) {
+			frames_during++;
+		}
+		os_nanosleep(10 * 1000 * 1000);
+	}
+	const double ms = (double)(os_monotonic_get_ns() - t0) * 1e-6;
+	if (!ready) {
+		printf("still %llu %s after %.0f ms (%d%s)\n", (unsigned long long)rid,
+		       failed ? "FAILED" : "never came", ms, (int)why, result_hint((xrt_result_t)why));
+		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+		return 7;
+	}
+	struct xrt_stereo_camera_still_info info;
+	xrt_shmem_handle_t section = XRT_SHMEM_HANDLE_INVALID;
+	xret = ipc_client_stereo_camera_acquire_still(ipc_c, sid, rid, &info, &section);
+	if (xret != XRT_SUCCESS) {
+		printf("still acquire failed: %d%s\n", (int)xret, result_hint(xret));
+		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+		return 2;
+	}
+	printf("still %llu ready in %.0f ms (%u stream frame(s) meanwhile): %ux%u SBS %s, %s, %llu B section\n",
+	       (unsigned long long)rid, ms, frames_during, info.width, info.height, format_str(info.format),
+	       info.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW",
+	       (unsigned long long)info.section_size);
+	v8_print_result("  capture: ", &info.result);
+	const struct xrt_stereo_camera_calibration *k = &info.calibration;
+	printf("  calibration (%s): %ux%u per eye, fx %.3f fy %.3f cx %.3f cy %.3f, baseline %.3f mm\n",
+	       k->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW", k->eye[0].width, k->eye[0].height,
+	       k->eye[0].fx, k->eye[0].fy, k->eye[0].cx, k->eye[0].cy, k->baseline_mm);
+	int ret = 0;
+	struct ro_map m;
+	memset(&m, 0, sizeof(m));
+	if (!map_readonly(&m, section, info.section_size)) {
+		printf("  could not map the still's section\n");
+		ret = 2;
+	} else if (info.format != XRT_STEREO_CAMERA_FORMAT_BGRA8) {
+		// The still's rows and depth, measured on its luma with its OWN calibration.
+		struct row_params rp = {
+		    .max_d = probe_max_disparity(&p, info.width / 2), .max_dy = 24, .min_ncc = 0.90f};
+		struct row_alignment ra;
+		measure_rows(m.ptr + info.plane_offset[0], info.row_pitch[0], info.width / 2, info.height, &rp, &ra);
+		const double fb = k->eye[0].fx * k->baseline_mm / 1000.0;
+		printf("  rows: %d block(s), dy (right - left) median %+.3f px SIGNED, |dy| median %.3f px\n",
+		       ra.blocks, ra.dy_signed_median, ra.dy_median);
+		for (int i = 0; i < ra.modes; i++) {
+			printf("  disparity mode %d: %.2f px (%d blocks) -> Z = f*B/d = %.3f m\n", i + 1, ra.mode_dx[i],
+			       ra.mode_count[i], ra.mode_dx[i] > 0.0f ? fb / ra.mode_dx[i] : 0.0);
+		}
+	}
+	if (m.ptr != NULL && out_dir != NULL) {
+		char path[1024];
+		snprintf(path, sizeof(path), "%s/still_%llu.png", out_dir, (unsigned long long)rid);
+		const uint8_t *base = m.ptr + info.plane_offset[0];
+		int ok = 0;
+		if (info.format == XRT_STEREO_CAMERA_FORMAT_BGRA8) {
+			uint8_t *rgba = malloc((size_t)info.width * info.height * 4);
+			if (rgba != NULL) {
+				for (uint32_t y = 0; y < info.height; y++) {
+					const uint8_t *s = base + (size_t)y * info.row_pitch[0];
+					uint8_t *d = rgba + (size_t)y * info.width * 4;
+					for (uint32_t x = 0; x < info.width; x++) {
+						d[4 * x + 0] = s[4 * x + 2];
+						d[4 * x + 1] = s[4 * x + 1];
+						d[4 * x + 2] = s[4 * x + 0];
+						d[4 * x + 3] = 255;
+					}
+				}
+				ok = stbi_write_png(path, (int)info.width, (int)info.height, 4, rgba,
+				                    (int)info.width * 4);
+				free(rgba);
+			}
+		} else { // GRAY8, or NV12's luma
+			ok = stbi_write_png(path, (int)info.width, (int)info.height, 1, base, (int)info.row_pitch[0]);
+		}
+		printf("  %s %s\n", ok ? "wrote" : "could not write", path);
+	}
+	unmap_readonly(&m); // closes our handle too
+	ipc_client_stereo_camera_release_still(ipc_c, sid, rid);
+	ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+	return ret;
+}
+
 static void
 usage(void)
 {
@@ -1900,7 +2404,11 @@ usage(void)
 	    "       probe [<id>] [--raw|--rectified] [--format gray8|nv12|bgra8] [--fps F] [--frames N] "
 	    "[--seconds S] "
 	    "[--out DIR]\n"
-	    "             [--max-disparity N] [--max-dy N (24)] [--min-ncc C (0.90)]\n"
+	    "             [--max-disparity N] [--max-dy N (24)] [--min-ncc C (0.90)] [--mode WxH]\n"
+	    "       modes [<id>] [--json]          spec v8: capture modes + control capabilities\n"
+	    "       set [<id>] focus-mode auto|once|manual|locked | focus <D> | point <x>,<y> | ev <EV> ...\n"
+	    "             [--seconds S] [--mode WxH]   take the controls, print the capture state (exit 9 = held)\n"
+	    "       still [<id>] [--size WxH] [--raw] [--format gray8|nv12|bgra8] [--mode WxH] [--out DIR]\n"
 	    "       list|calib|probe ... --decline-delegation   declare DECLINE_DELEGATION (spec v3)\n"
 	    "       consent                      list the consent store\n"
 	    "       allow|deny|revoke <exe>|--self   stored per-app decision (local)\n"
@@ -1963,7 +2471,8 @@ cli_cmd_camera(int argc, const char **argv)
 		}
 		return cmd_control(XRT_STEREO_CAMERA_CONTROL_SET_LOCKED, onoff, onoff ? "fake-lock on" : "fake-lock off");
 	}
-	if (strcmp(sub, "list") != 0 && strcmp(sub, "calib") != 0 && strcmp(sub, "probe") != 0) {
+	if (strcmp(sub, "list") != 0 && strcmp(sub, "calib") != 0 && strcmp(sub, "probe") != 0 &&
+	    strcmp(sub, "modes") != 0 && strcmp(sub, "set") != 0 && strcmp(sub, "still") != 0) {
 		usage();
 		return 1;
 	}
@@ -1988,6 +2497,12 @@ cli_cmd_camera(int argc, const char **argv)
 		ret = cmd_calib(&ipc_c, strtoull(argv[3], NULL, 10), output, json);
 	} else if (strcmp(sub, "probe") == 0) {
 		ret = cmd_probe(&ipc_c, argc, argv, false);
+	} else if (strcmp(sub, "modes") == 0) {
+		ret = cmd_modes(&ipc_c, argc, argv, json);
+	} else if (strcmp(sub, "set") == 0) {
+		ret = cmd_set(&ipc_c, argc, argv);
+	} else if (strcmp(sub, "still") == 0) {
+		ret = cmd_still(&ipc_c, argc, argv);
 	} else {
 		usage();
 		ret = 1;

@@ -529,6 +529,16 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 
     /* ADR-054 N6 Part 2: views may follow a viewer-tracking provider when sim does not track. */
     .get_viewer_policy = sim_display_plugin_get_viewer_policy,
+
+    /* XR_DXR_stereo_camera v8 (§9b): the fake's modes, controls and stills. */
+    .stereo_camera_enumerate_modes = sim_display_stereo_camera_enumerate_modes,
+    .stereo_camera_set_mode = sim_display_stereo_camera_set_mode,
+    .stereo_camera_get_control_caps = sim_display_stereo_camera_get_control_caps,
+    .stereo_camera_set_controls = sim_display_stereo_camera_set_controls,
+    .stereo_camera_get_capture_result = sim_display_stereo_camera_get_capture_result,
+    .stereo_camera_request_still = sim_display_stereo_camera_request_still,
+    .stereo_camera_poll_still = sim_display_stereo_camera_poll_still,
+    .stereo_camera_release_still = sim_display_stereo_camera_release_still,
 };
 
 

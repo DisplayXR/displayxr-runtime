@@ -64,6 +64,48 @@ sim_display_stereo_camera_release_frame(struct xrt_plugin_stereo_camera *cam);
 void
 sim_display_stereo_camera_close(struct xrt_plugin_stereo_camera *cam);
 
+/*
+ * Spec v8 (§9b): three modes (default, half, double — the default and double
+ * also still sizes), a fake lens whose focus distance follows the controls
+ * with a 150 ms lag and shows in the per-frame capture state, and stills
+ * rendered at the still size after a 200 ms capture latency during which the
+ * frames pause.
+ */
+
+uint32_t
+sim_display_stereo_camera_enumerate_modes(struct xrt_plugin_instance *inst,
+                                          uint32_t index,
+                                          uint32_t capacity,
+                                          struct xrt_plugin_stereo_camera_mode *out);
+
+xrt_result_t
+sim_display_stereo_camera_set_mode(struct xrt_plugin_stereo_camera *cam, uint32_t mode_index);
+
+xrt_result_t
+sim_display_stereo_camera_get_control_caps(struct xrt_plugin_instance *inst,
+                                           uint32_t index,
+                                           struct xrt_plugin_stereo_camera_control_caps *out);
+
+xrt_result_t
+sim_display_stereo_camera_set_controls(struct xrt_plugin_stereo_camera *cam,
+                                       const struct xrt_plugin_stereo_camera_controls *controls);
+
+xrt_result_t
+sim_display_stereo_camera_get_capture_result(struct xrt_plugin_stereo_camera *cam,
+                                             struct xrt_plugin_stereo_camera_capture_result *out);
+
+xrt_result_t
+sim_display_stereo_camera_request_still(struct xrt_plugin_stereo_camera *cam,
+                                        const struct xrt_plugin_stereo_camera_still_request *req);
+
+uint32_t
+sim_display_stereo_camera_poll_still(struct xrt_plugin_stereo_camera *cam,
+                                     struct xrt_plugin_stereo_camera_still *out,
+                                     struct xrt_plugin_stereo_camera_capture_result *out_result);
+
+void
+sim_display_stereo_camera_release_still(struct xrt_plugin_stereo_camera *cam);
+
 #ifdef __cplusplus
 }
 #endif
