@@ -27,6 +27,7 @@ public sealed class DisplaysPage : Page
     private readonly Dictionary<string, string> _launchNotes = new();
     private readonly HashSet<string> _details = new(); // the display cards whose Details are open
     private string? _dpKey; // the screen whose selector ran the last per-screen action
+    private string? _modeKey; // the screen whose 3D mode picker ran the last action
     private int _openDropDowns;
     // The choice just made, shown until the re-read dp list reflects it (the
     // re-read loads every plug-in, ~10 s): without it the combo would snap back.
@@ -69,6 +70,8 @@ public sealed class DisplaysPage : Page
         sb.Append('|').Append(string.Join(";", _launchNotes)).Append('|').Append(Ctx.ActionRunning).Append(Ctx.DpLoading)
           .Append('|').Append(string.Join(",", _details)).Append(_calibration is null);
         foreach (var x in s.Screens) sb.Append(x.Key).Append(x.Claim.Forced).Append(x.Claim.PreferredPlugin).Append(x.Claim.Apply);
+        foreach (var x in s.Screens) sb.Append(StatusText.Mode3DKey(x.Mode3D)).Append(';');
+        if (Ctx.LastActionArea == "screen-mode") sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed);
         if (Ctx.Dp is { } dp)
         {
             foreach (var p in dp.Plugins) sb.Append(p.Id).Append(',');
@@ -184,6 +187,72 @@ public sealed class DisplaysPage : Page
         return col;
     }
 
+    /// <summary>
+    /// The per-display 3D mode picker: the 3D modes the display's driver offers, by the driver's own
+    /// labels, the one in use selected. Absent when there is nothing to choose (the feed says so, or lists
+    /// fewer than two modes). A choice runs `dp mode set &lt;name&gt; --screen &lt;key&gt;`; "Reset to
+    /// default" runs `dp mode reset --screen &lt;key&gt;`; the status feed shows the result. A mode the
+    /// display cannot show is not listed: the line under the picker names it and says why.
+    /// </summary>
+    private Control? Mode3DRow(Screen s)
+    {
+        if (!StatusText.Mode3DPickerShown(s) || s.Mode3D is not { } mode || s.Key is null) return null;
+        string key = s.Key;
+        var items = StatusText.Mode3DItems(mode);
+        int selected = StatusText.Mode3DSelected(mode);
+        var combo = new ComboBox
+        {
+            ItemsSource = items.Select(c => c.Label).ToList(),
+            SelectedIndex = selected,
+            MinWidth = 200,
+            IsEnabled = !Ctx.ActionRunning,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        combo.Classes.Add("field");
+        Avalonia.Automation.AutomationProperties.SetName(combo, $"3D mode for {StatusText.ScreenName(s)}");
+        combo.DropDownOpened += (_, _) => _openDropDowns++;
+        combo.DropDownClosed += (_, _) =>
+        {
+            _openDropDowns = System.Math.Max(0, _openDropDowns - 1);
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => Update());
+        };
+        combo.SelectionChanged += (_, _) =>
+        {
+            int i = combo.SelectedIndex;
+            if (i < 0 || i == selected || i >= items.Count || Ctx.ActionRunning) return;
+            _modeKey = key;
+            _ = Ctx.RunActionsAsync("screen-mode", StatusText.Mode3DVerb(key, items[i]));
+        };
+        var label = U.Text("3D mode", "label");
+        label.VerticalAlignment = VerticalAlignment.Center;
+        var row = U.Flow(12, 4, label, combo);
+        if (StatusText.Mode3DSourceText(mode) is { } source)
+        {
+            var src = U.Text(source, "meta");
+            src.VerticalAlignment = VerticalAlignment.Center;
+            U.AddFlow(row, src, 12, 4);
+        }
+        if (StatusText.Mode3DCanReset(mode))
+        {
+            var reset = U.Button("Reset to default", () =>
+            {
+                _modeKey = key;
+                _ = Ctx.RunActionsAsync("screen-mode", StatusText.Mode3DResetVerb(key));
+            }, "quiet", "sm");
+            reset.IsEnabled = !Ctx.ActionRunning;
+            reset.VerticalAlignment = VerticalAlignment.Center;
+            Avalonia.Automation.AutomationProperties.SetName(reset, $"Reset the 3D mode of {StatusText.ScreenName(s)} to its default");
+            U.AddFlow(row, reset, 12, 4);
+        }
+        var col = U.VStack(2, row);
+        col.Margin = new Thickness(0, 6, 0, 0);
+        foreach (var note in StatusText.Mode3DNotes(mode)) col.Children.Add(U.Wrapped(note, "soft"));
+        col.Children.Add(U.Wrapped(StatusText.Mode3DExplanation, "desc"));
+        if (Ctx.LastActionArea == "screen-mode" && _modeKey == key && Ctx.LastAction is { } last && Ctx.LastActionFailed)
+            col.Children.Add(U.Wrapped(last, "soft"));
+        return col;
+    }
+
     private Control ScreenCard(StatusSnapshot snap, Screen s)
     {
         var level = StatusText.ScreenLevel(s, snap);
@@ -256,10 +325,14 @@ public sealed class DisplaysPage : Page
         // More than one driver could drive this display, or more than one 3D display: the choice is on the face.
         bool choiceOnFace = StatusText.DriverChoiceOnFace(s, snap, Ctx.Dp);
         var dpRow = DpRow(s);
+        // The 3D mode picker is always on the face: under the driver selector when that is on the face too.
+        var modeRow = Mode3DRow(s);
+        if (modeRow is not null && !(choiceOnFace && dpRow is not null)) body.Children.Add(modeRow);
         if (choiceOnFace && dpRow is not null)
         {
             body.Children.Add(dpRow);
             body.Children.Add(U.Wrapped(DriverExplanation, "desc"));
+            if (modeRow is not null) body.Children.Add(modeRow);
         }
         // ADR-066 Part B: viewer tracking per display, on the face (greyed out with the reason when not offered).
         if (TrackingRow(s) is { } trackingRow) body.Children.Add(trackingRow);

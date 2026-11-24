@@ -147,16 +147,47 @@ public sealed record ViewerTracking(string Setting, string SettingSource, string
 
 public sealed record ScreenMode(int Index, string Name, int Views, bool Is3D);
 
+/// <summary>
+/// One 3D mode a screen's display driver offers (<c>screens[i].mode_3d.choices[j]</c>). <see cref="Name"/>
+/// is what <c>dp mode set</c> takes, <see cref="Label"/> the driver's own words (shown as given).
+/// <see cref="Applies"/> is "now" / "restart_app" / "not_supported"; <see cref="Reason"/> says why when it
+/// is not "now".
+/// </summary>
+public sealed record Mode3DChoice(string Name, string Label, int Views, bool Tracked, bool Passthrough,
+                                  string Applies, string? Reason)
+{
+    public bool NotSupported => Applies == "not_supported";
+    public bool NeedsRestart => Applies == "restart_app";
+}
+
+/// <summary>
+/// A screen's 3D mode (<c>screens[i].mode_3d</c>): which of its driver's 3D modes is in use
+/// (<see cref="Active"/>), what is stored for this screen (<see cref="Setting"/>, null = nothing), and
+/// where the mode in use comes from (<see cref="Source"/>: "driver_default" / "runtime_default" /
+/// "user" / "machine"). The whole record is null when the feed says <c>null</c> (the driver offers one
+/// 3D mode: nothing to choose) or predates it.
+/// </summary>
+public sealed record Mode3D(string? Active, string? Setting, string Source, IReadOnlyList<Mode3DChoice> Choices)
+{
+    public Mode3DChoice? Find(string? name) => name is null ? null : Choices.FirstOrDefault(c => c.Name == name);
+}
+
 public sealed record ScreenDp(long ClientId, string Api, string Kind, string Backend);
 
 public sealed record VendorCell(bool Present, bool Ready, bool Verified, bool Calibrated, string Tracker, string Lens,
                                 string Model, string Serial, StatusWarning? WorstWarning, string? DashboardCommand);
 
-public sealed record Screen(
+public sealed partial record Screen(
     string Id, string? Key, int Index, string DeviceName, string FriendlyName, EdidInfo Edid, DesktopInfo Desktop, NativeMode Native,
     PhysicalMm PhysicalMm, Roles Roles, Claim Claim, ScreenLayout Layout, EyeTracking EyeTracking, ScreenMode? Mode,
     IReadOnlyList<ScreenDp> Dps, VendorCell Vendor, IReadOnlyList<StatusWarning> Warnings,
     ViewerTracking? ViewerTracking = null);
+
+public sealed partial record Screen
+{
+    /// <summary>The screen's 3D mode and the modes its driver offers; null when there is nothing to choose.</summary>
+    public Mode3D? Mode3D { get; init; }
+}
 
 public sealed record ClientFlags(bool Active, bool Visible, bool Focused, bool Overlay);
 
@@ -252,7 +283,8 @@ public static class StatusSnapshotParser
                            (ulong)Math.Max(0, gen.Long("conversion"))),
             new RuntimeInfo(rt.Str("version"), rt.Str("git_tag"), rt.Int("plugin_abi"), rt.StrOrNull("active_openxr_runtime")),
             root.Arr("plugins").Where(p => p.ValueKind == JsonValueKind.Object).Select(ReadPlugin).ToArray(),
-            root.Arr("screens").Where(s => s.ValueKind == JsonValueKind.Object).Select(ReadScreen).ToArray(),
+            root.Arr("screens").Where(s => s.ValueKind == JsonValueKind.Object)
+                .Select(s => ReadScreen(s) with { Mode3D = ReadMode3D(s.Obj("mode_3d")) }).ToArray(),
             root.Arr("clients").Where(c => c.ValueKind == JsonValueKind.Object).Select(ReadClient).ToArray(),
             new Workspace(ws.Bool("enabled"), ws.StrOrNull("controller")),
             ReadWarnings(root),
@@ -296,6 +328,20 @@ public static class StatusSnapshotParser
         p.Str("id"), p.Str("name"), p.Str("vendor"), p.Str("version"), p.Str("load"),
         p.Str("platform_state", "UNKNOWN"), p.Str("hint"), p.Bool("fallback"), p.Int("probe_order"))
     { Remedy = PlatformRemedy.Read(p), Enabled = p.Bool("enabled", true) };
+
+    /// <summary>
+    /// A screen's <c>mode_3d</c>: null for a JSON <c>null</c> or a missing key. A choice without a name
+    /// cannot be set and is dropped; one without a label shows its name; a missing <c>applies</c> reads "now".
+    /// </summary>
+    private static Mode3D? ReadMode3D(JsonElement? m3)
+    {
+        if (m3 is not { } o) return null;
+        var choices = o.Arr("choices").Where(c => c.ValueKind == JsonValueKind.Object && c.Str("name").Length > 0)
+            .Select(c => new Mode3DChoice(c.Str("name"), c.Str("label", c.Str("name")), c.Int("views"), c.Bool("tracked"),
+                                          c.Bool("passthrough"), c.Str("applies", "now"), c.StrOrNull("reason")))
+            .ToArray();
+        return new Mode3D(o.StrOrNull("active"), o.StrOrNull("setting"), o.Str("source", "runtime_default"), choices);
+    }
 
     private static PixelRect ReadRect(JsonElement? e) =>
         new(e.Long("left"), e.Long("top"), e.Long("width"), e.Long("height"));

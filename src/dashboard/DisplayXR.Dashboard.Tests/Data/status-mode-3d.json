@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "source": "service",
+  "plugins": [
+    { "id": "sim-display", "name": "DisplayXR Sim Display", "load": "ACTIVE", "fallback": true, "probe_order": 200 },
+    { "id": "leia-sr", "name": "DisplayXR Leia SR", "load": "ACTIVE", "fallback": false, "probe_order": 50 }
+  ],
+  "screens": [
+    { "id": "0x1", "key": "SIM-0001-A", "friendly_name": "Default state",
+      "claim": { "plugin_id": "sim-display", "confidence": "FALLBACK" },
+      "mode_3d": { "active": "same_as_2d", "setting": null, "source": "driver_default", "choices": [
+        { "name": "same_as_2d", "label": "Same as 2D", "views": 1, "tracked": false, "passthrough": true, "applies": "now", "reason": null },
+        { "name": "anaglyph", "label": "Anaglyph", "views": 2, "tracked": false, "passthrough": false, "applies": "now", "reason": null },
+        { "name": "quad", "label": "Quad", "views": 4, "tracked": false, "passthrough": false, "applies": "restart_app",
+          "reason": "declared only at start-up: restart the app to apply" } ] } },
+    { "id": "0x2", "key": "SIM-0002-B", "friendly_name": "Chosen by the user",
+      "claim": { "plugin_id": "sim-display", "confidence": "FALLBACK" },
+      "mode_3d": { "active": "anaglyph", "setting": "anaglyph", "source": "user", "choices": [
+        { "name": "same_as_2d", "label": "Same as 2D", "views": 1, "tracked": false, "passthrough": true, "applies": "now", "reason": null },
+        { "name": "anaglyph", "label": "Anaglyph", "views": 2, "tracked": false, "passthrough": false, "applies": "now", "reason": null } ] } },
+    { "id": "0x3", "key": "LEI-0003-C", "friendly_name": "One 3D mode: no picker",
+      "claim": { "plugin_id": "leia-sr", "confidence": "VERIFIED" },
+      "mode_3d": null },
+    { "id": "0x4", "key": "LEI-0004-D", "friendly_name": "One choice: no picker",
+      "claim": { "plugin_id": "leia-sr", "confidence": "VERIFIED" },
+      "mode_3d": { "active": "lenticular", "setting": null, "source": "driver_default", "choices": [
+        { "name": "lenticular", "label": "Lenticular", "views": 2, "tracked": true, "passthrough": false, "applies": "now", "reason": null } ] } },
+    { "id": "0x5", "key": "SIM-0005-E", "friendly_name": "Set for everyone, one mode not supported",
+      "claim": { "plugin_id": "sim-display", "confidence": "FALLBACK" },
+      "mode_3d": { "active": "sbs", "setting": "sbs", "source": "machine", "choices": [
+        { "name": "same_as_2d", "label": "Same as 2D", "views": 1, "tracked": false, "passthrough": true, "applies": "now", "reason": null },
+        { "name": "interlaced", "label": "Interlaced", "views": 2, "tracked": false, "passthrough": false, "applies": "not_supported",
+          "reason": "this display is rotated" },
+        { "name": "sbs", "label": "Side by side", "views": 2, "tracked": false, "passthrough": false, "applies": "now", "reason": null } ] } },
+    { "id": "0x6", "key": "SIM-0006-F", "friendly_name": "A stored choice that is not in use",
+      "claim": { "plugin_id": "sim-display", "confidence": "FALLBACK" },
+      "mode_3d": { "active": "anaglyph", "setting": "quad", "source": "user", "choices": [
+        { "name": "anaglyph", "label": "Anaglyph", "views": 2, "tracked": false, "passthrough": false, "applies": "now", "reason": null },
+        { "name": "quad", "label": "Quad", "views": 4, "tracked": false, "passthrough": false, "applies": "restart_app",
+          "reason": "declared only at start-up: restart the app to apply" } ] } },
+    { "id": "0x7", "key": "SIM-0007-G", "friendly_name": "The mode in use needs a restart",
+      "claim": { "plugin_id": "sim-display", "confidence": "FALLBACK" },
+      "mode_3d": { "active": "quad", "setting": "quad", "source": "user", "choices": [
+        { "name": "anaglyph", "label": "Anaglyph", "views": 2, "applies": "now", "reason": null },
+        { "name": "quad", "label": "Quad", "views": 4, "applies": "restart_app",
+          "reason": "declared only at start-up: restart the app to apply" } ] } },
+    { "id": "0x8", "key": "SIM-0008-H", "friendly_name": "Stored, no mode table yet",
+      "claim": { "plugin_id": null, "confidence": "NONE" },
+      "mode_3d": { "active": null, "setting": "anaglyph", "source": "user", "choices": [] } },
+    { "id": "0x9", "key": "OLD-0009-I", "friendly_name": "A feed that predates the key" },
+    { "id": "0xa", "friendly_name": "No key, two modes",
+      "mode_3d": { "active": "a", "source": "driver_default", "choices": [ { "name": "a" }, { "name": "b", "label": "B" }, { "label": "no name" }, 7 ] } }
+  ]
+}

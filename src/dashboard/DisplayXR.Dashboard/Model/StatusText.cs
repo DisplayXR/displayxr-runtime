@@ -561,6 +561,94 @@ public static class StatusText
         var other => other,
     };
 
+    // ── Per-screen 3D mode ────────────────────────────────────────────────
+
+    /// <summary>What the 3D mode picker does, in plain words.</summary>
+    public const string Mode3DExplanation =
+        "How this display shows a 3D app. A change applies right away, also to apps that are already running.";
+
+    /// <summary>
+    /// Whether a display card shows the 3D mode picker: only when the feed reports the screen's 3D modes
+    /// and there are at least two (one mode, or a feed that says <c>null</c>, is nothing to choose).
+    /// </summary>
+    public static bool Mode3DPickerShown(Screen s) => s.Key is not null && s.Mode3D is { Choices.Count: >= 2 };
+
+    /// <summary>
+    /// The entries the picker lists, in the driver's order and by the driver's labels. A mode this display
+    /// cannot show is left out (<see cref="Mode3DNotes"/> names it and says why), unless it is the one in use.
+    /// </summary>
+    public static IReadOnlyList<Mode3DChoice> Mode3DItems(Mode3D m) =>
+        m.Choices.Where(c => !c.NotSupported || c.Name == m.Active).ToList();
+
+    /// <summary>The picker's selected entry: the mode in use, else the stored one, else none (-1).</summary>
+    public static int Mode3DSelected(Mode3D m)
+    {
+        var items = Mode3DItems(m);
+        foreach (var name in new[] { m.Active, m.Setting })
+            for (int i = 0; name is not null && i < items.Count; i++)
+                if (items[i].Name == name) return i;
+        return -1;
+    }
+
+    /// <summary>The CLI verb a picker choice runs (per user, as every per-screen choice here).</summary>
+    public static CliArgs Mode3DVerb(string key, Mode3DChoice choice) => new("dp", "mode", "set", choice.Name, "--screen", key);
+
+    /// <summary>The CLI verb "Reset to default" runs: clears this user's choice for the screen.</summary>
+    public static CliArgs Mode3DResetVerb(string key) => new("dp", "mode", "reset", "--screen", key);
+
+    /// <summary>
+    /// Whether "Reset to default" is offered: only for this user's own choice. A choice made for everyone
+    /// on the PC is not cleared by the per-user verb, so no button is offered for it.
+    /// </summary>
+    public static bool Mode3DCanReset(Mode3D m) => m.Source == "user";
+
+    /// <summary>Next to the picker: who chose the mode in use; null when it is a default.</summary>
+    public static string? Mode3DSourceText(Mode3D m) => m.Source switch
+    {
+        "user" => "Chosen by you",
+        "machine" => "Chosen for everyone on this PC. Choosing a mode here is for you only, and yours is used.",
+        _ => null,
+    };
+
+    /// <summary>
+    /// The lines under the picker, each with the driver's own reason: the selected mode needs an app
+    /// restart; a stored choice is not the mode in use; the modes this display cannot show.
+    /// </summary>
+    public static IReadOnlyList<string> Mode3DNotes(Mode3D m)
+    {
+        var notes = new List<string>();
+        int sel = Mode3DSelected(m);
+        var selected = sel >= 0 ? Mode3DItems(m)[sel] : null;
+        if (selected is { NeedsRestart: true })
+            notes.Add(Sentence(selected.Reason is { Length: > 0 } r ? r : "restart the app to apply"));
+        if (m.Find(m.Setting) is { } stored && stored.Name != selected?.Name && stored.Applies != "now")
+            notes.Add(stored.Reason is { Length: > 0 } why
+                ? $"{stored.Label} is chosen but not in use: {why}."
+                : $"{stored.Label} is chosen but not in use.");
+        var missing = m.Choices.Where(c => c.NotSupported && c.Name != m.Active)
+            .Select(c => c.Reason is { Length: > 0 } r ? $"{c.Label} ({r})" : c.Label).ToList();
+        if (missing.Count > 0) notes.Add($"Not available on this display: {string.Join("; ", missing)}.");
+        return notes;
+    }
+
+    /// <summary>Whether a display driver drives a display that shows the 3D mode picker.</summary>
+    public static bool DriverHasMode3DPicker(StatusSnapshot? snap, string driverId) =>
+        snap is not null && snap.Screens.Any(s => Mode3DPickerShown(s) &&
+                                                 string.Equals(s.Claim.PluginId, driverId, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>What a display card's rebuild key reads of a screen's 3D mode.</summary>
+    public static string Mode3DKey(Mode3D? m) => m is null
+        ? "-"
+        : $"{m.Active}/{m.Setting}/{m.Source}/{string.Join(",", m.Choices.Select(c => $"{c.Name}:{c.Label}:{c.Applies}:{c.Reason}"))}";
+
+    private static string Sentence(string text)
+    {
+        string t = text.Trim();
+        if (t.Length == 0) return t;
+        t = char.ToUpperInvariant(t[0]) + t[1..];
+        return t[^1] is '.' or '!' or '?' ? t : t + ".";
+    }
+
     public static string WarningLine(StatusWarning w) => w.Text.Length > 0 ? $"{w.Code}: {w.Text}" : w.Code;
 
     public static int Claimed(StatusSnapshot s) => s.Screens.Count(x => x.Claim.IsClaimed);
