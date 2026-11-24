@@ -148,8 +148,8 @@ public class ComponentsTests
         Assert.Equal(PlainState.Ready, PlainStates.ModelPack("installed"));
         Assert.Equal(PlainState.Standby, PlainStates.ModelPack("downloading"));
 
-        Assert.Equal(new[] { "In use", "Ready", "Standby", "Turned off", "Needs attention" },
-            new[] { PlainState.InUse, PlainState.Ready, PlainState.Standby, PlainState.TurnedOff, PlainState.NeedsAttention }
+        Assert.Equal(new[] { "In use", "Ready", "Standby", "Turned off", "Off", "Needs attention" },
+            new[] { PlainState.InUse, PlainState.Ready, PlainState.Standby, PlainState.TurnedOff, PlainState.Off, PlainState.NeedsAttention }
                 .Select(x => PlainStates.Chip(x)!.Value.Text));
         Assert.Null(PlainStates.Chip(PlainState.None));
     }
@@ -188,7 +188,9 @@ public class ComponentsTests
         Assert.Equal(2, input.Items.Count); // the summary row + the rig role
         Assert.Equal("2 installed · no device connected", input.ConnectedLine);
         var conv = Section(all, "conversion");
-        Assert.Equal("neurd-directml", Assert.Single(conv.Items).Name); // backend verbatim
+        // The row is named in plain words; the backend id (the plug-in's own word) is a line of Details.
+        Assert.Equal("Converter", Assert.Single(conv.Items).Name);
+        Assert.Contains(("Backend", "neurd-directml"), conv.Items[0].DetailFacts);
         Assert.Equal(1, conv.Count);
         Assert.Contains("modes 0x3 · state 1 · 32 streams · up to 8 views", conv.Items[0].Lines);
     }
