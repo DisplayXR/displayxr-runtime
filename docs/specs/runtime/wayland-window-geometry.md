@@ -615,6 +615,27 @@ seen, which is what it had before.
   the other monitor is resampled: the per-segment 1:1 policy applies (a
   resample-tolerant DP weaves it, a lenticular weave gets flat 2D).
 
+  **What the in-process compositor does today, without that change: views
+  only.** The payload's logical origins (`content_logical_*`, `mon_logical_*`)
+  plus the screen list's X11 rect, device mode and scale are enough to place
+  every screen in the window's own pixel frame — the same projection the
+  service weave engine applies to a present-owner
+  (`comp_weave_screens_project`, LOGICAL rule). The vk_native compositor does
+  that (`comp_weave_screens_project_monitor_relative`) and accepts the result
+  only when exactly one projected screen lands where the payload says the
+  window's monitor is, at that monitor's device size (±1 px); otherwise it
+  logs one WARN and keeps the old behaviour. With a placement, the segment
+  manager cuts the table and runs its DP lifecycle, and a window **wholly on
+  one other screen** publishes that one-segment table, so `xrLocateViews`
+  frames it for that screen: that screen's DP's eyes (a sim-display segment
+  DP reports the nominal viewer) and its size, instead of the 3D panel's
+  tracked eyes and a panel-centred frustum (ADR-047). The FRAME is
+  unchanged: no per-segment weave, the #1595 1:1 hold, the #1654 off-panel
+  bands, no present origin and no drop-time snap off the panel. A window
+  straddling two screens publishes nothing yet (its one woven picture would
+  not match per-segment views); that, and weaving per segment, still wait
+  for the extension change above.
+
 ## 6. Capture exclusion — `org.displayxr.CaptureExclusion1` (extension version 2)
 
 ### 6.1 Why it exists
