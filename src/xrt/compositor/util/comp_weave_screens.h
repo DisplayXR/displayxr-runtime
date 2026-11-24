@@ -176,6 +176,26 @@ const char *
 comp_weave_monitor_match_str(enum comp_weave_monitor_match r);
 
 /*!
+ * Re-express a monitor-relative window (@ref comp_weave_monitor_window, in the
+ * device px of the window's OWN monitor) in the px of the window's BUFFER.
+ *
+ * A Wayland client sizes its buffer for the compositor's preferred surface
+ * scale — the highest scale among the outputs the surface touches — so a
+ * window whose monitor is a 1.6667 screen carries a 2.0 buffer as soon as it
+ * touches a 2.0 screen. Segments are cut out of the buffer, so the frame the
+ * screens are projected into must be the buffer's: every monitor-px field is
+ * multiplied by buffer / content, and the factor with them.
+ *
+ * Unchanged when the buffer is unknown (0), already the content size, or not
+ * a uniform scale of it (a buffer mid-resize: more than 1 px apart between the
+ * axes) — the monitor frame is then the best frame there is.
+ *
+ * @return true when the window was rescaled.
+ */
+bool
+comp_weave_monitor_window_to_buffer(struct comp_weave_monitor_window *mw, uint32_t buffer_w, uint32_t buffer_h);
+
+/*!
  * Native Wayland, in-process (ADR-047 on #1596's monitor-relative geometry):
  * place @p in's screens and the window in the window's own pixel frame with
  * @ref comp_weave_screens_project (LOGICAL rule), the window anchored the way

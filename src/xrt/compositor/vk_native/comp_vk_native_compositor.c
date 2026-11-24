@@ -6836,7 +6836,21 @@ vk_wl_seg_place(struct comp_vk_native_compositor *c)
 	struct comp_seg_rect win = {0};
 	uint32_t mon = UINT32_MAX;
 	if (comp_vk_native_wl_geom_get_window_rect(c->wl_geom, &wr)) {
-		const struct comp_weave_monitor_window mw = {
+		// The frame the segments are cut in is the BUFFER's, not the window's
+		// monitor's. The geometry service speaks the device px of the window's
+		// own monitor, but the app sizes its buffer for the compositor's
+		// preferred surface scale, which is the HIGHEST scale among the
+		// outputs the surface touches: a 1152x648-logical window whose monitor
+		// is a 1.6667 laptop is 1920x1080 there, and the moment it touches a
+		// 2.0 panel its buffer is 2304x1296 — 1:1 on the panel, resampled on
+		// the laptop. Cutting that buffer with the monitor-px rect put the
+		// seam 1.2x too far left and drew a 1920x1080 canvas in the corner of
+		// a 2304x1296 target. So rescale the service's rect by buffer/content.
+		uint32_t buf_w = 0, buf_h = 0;
+		if (c->target != NULL) {
+			comp_vk_native_target_get_dimensions(c->target, &buf_w, &buf_h);
+		}
+		struct comp_weave_monitor_window mw = {
 		    .left_px = wr.left_px,
 		    .top_px = wr.top_px,
 		    .w = wr.width_px,
@@ -6849,6 +6863,7 @@ vk_wl_seg_place(struct comp_vk_native_compositor *c)
 		    .mon_logical_y = wr.mon_logical_y,
 		    .scale = wr.scale,
 		};
+		comp_weave_monitor_window_to_buffer(&mw, buf_w, buf_h);
 		r = comp_weave_screens_project_monitor_relative(c->seg_screens, &mw, c->seg_wl_next, &win, &mon);
 	}
 	// Lifecycle only: the window changed monitor, or the placement started or
