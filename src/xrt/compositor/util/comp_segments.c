@@ -63,10 +63,7 @@ comp_segments_compute(const struct comp_seg_rect *window_desktop,
 	}
 
 	// The canvas inside the window, window px. Zero = the whole window.
-	struct comp_seg_rect cv = {0, 0, window_desktop->w, window_desktop->h};
-	if (canvas != NULL && canvas->w > 0 && canvas->h > 0) {
-		cv = *canvas;
-	}
+	const struct comp_seg_rect cv = comp_segments_resolve_canvas(canvas, window_desktop->w, window_desktop->h);
 
 	// The canvas on the desktop, as the slice math's half-open rect.
 	const struct u_md_rect canvas_desktop = {
@@ -260,6 +257,16 @@ comp_segments_decide(bool have_dp, bool dp_tolerates_resample, enum comp_seg_1to
 		return COMP_SEG_RENDER_FLAT_2D;
 	}
 	return COMP_SEG_RENDER_WEAVE;
+}
+
+struct comp_seg_rect
+comp_segments_resolve_canvas(const struct comp_seg_rect *canvas, uint32_t window_w, uint32_t window_h)
+{
+	if (canvas != NULL && canvas->w > 0 && canvas->h > 0) {
+		return *canvas;
+	}
+	const struct comp_seg_rect whole = {0, 0, window_w, window_h};
+	return whole;
 }
 
 enum comp_seg_surface_hold

@@ -373,6 +373,18 @@ comp_segments_window_is_split(const struct comp_seg_rect *window_desktop,
                               uint32_t screen_count);
 
 /*!
+ * The canvas a table was cut from, resolved: @p canvas when it has an extent,
+ * else the whole window (0,0,@p window_w,@p window_h) — the "zero = the whole
+ * window" convention @ref comp_segments_compute applies. What a published
+ * table (xrt_segment_metrics::canvas) must carry: the per-segment view routing
+ * maps each segment into the tile against it (@ref comp_segments_tile_rect),
+ * and a zero canvas maps nothing, so the frame would go unrouted and the first
+ * segment's views would stretch over the whole window.
+ */
+struct comp_seg_rect
+comp_segments_resolve_canvas(const struct comp_seg_rect *canvas, uint32_t window_w, uint32_t window_h);
+
+/*!
  * The refuse-rather-than-resample policy for one segment.
  *
  * - No DP for the segment → flat 2D.

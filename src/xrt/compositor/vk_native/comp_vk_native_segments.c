@@ -1829,7 +1829,12 @@ comp_vk_native_segments_get_metrics(const struct comp_vk_native_segments *segs,
 		}
 	}
 	out->count = t->count;
-	out->canvas = (struct xrt_rect){{canvas->x, canvas->y}, {(int)canvas->w, (int)canvas->h}};
+	// The canvas the table was cut from — never the zero "whole window"
+	// sentinel, which the routing could not map (a native-Wayland window that
+	// has never been on the panel has no cached client size, so its weave
+	// canvas is that sentinel).
+	const struct comp_seg_rect cv = comp_segments_resolve_canvas(canvas, window_desktop->w, window_desktop->h);
+	out->canvas = (struct xrt_rect){{cv.x, cv.y}, {(int)cv.w, (int)cv.h}};
 	out->window_screen_left = window_desktop->x;
 	out->window_screen_top = window_desktop->y;
 	out->window_pixel_width = window_desktop->w;
