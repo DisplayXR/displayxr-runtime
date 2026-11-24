@@ -25,6 +25,8 @@
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_rendering_modes.h"
+#include "xrt/xrt_display_status.h"
+#include "util/u_setting.h"
 #include "util/u_system.h"
 #include "util/u_time.h"
 #include "util/u_tiling.h"
@@ -417,7 +419,8 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 	// FALSE). One-shot WARN per apply, not fatal.
 	{
 		bool any_tracked = false;
-		for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+		const uint32_t n_modes = u_device_rendering_modes_envelope_count(head);
+		for (uint32_t mi = 0; mi < n_modes; mi++) {
 			if (head->rendering_modes[mi].mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) {
 				any_tracked = true;
 				break;
@@ -451,6 +454,12 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 	// the table the runtime actually serves.
 	(void)u_device_reenforce_two_rendering_modes(head, plugin->id);
 
+	// ADR-066 C1.4: everything below is computed over the ENVELOPE - the full
+	// declared list the device keeps behind its two slots - so a live config
+	// switch that remaps slot 1 finds its entry already tiled and the worst-
+	// case atlas already large enough.
+	const uint32_t env_count = u_device_rendering_modes_envelope_count(head);
+
 	// Compute tiling once we have native pixel dims. The per-mode
 	// fields are filled for the current orientation, but the
 	// system-wide atlas is the worst case ACROSS orientations for
@@ -458,13 +467,13 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 	// on Android the app's render swapchain is never recreated on a
 	// device flip, so it must be allocated large enough for either.
 	if (pdi->display_pixel_width > 0 && pdi->display_pixel_height > 0) {
-		for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+		for (uint32_t mi = 0; mi < env_count; mi++) {
 			u_tiling_compute_mode(&head->rendering_modes[mi], pdi->display_pixel_width,
 			                      pdi->display_pixel_height);
 		}
-		u_tiling_compute_system_atlas_oriented(head->rendering_modes, head->rendering_mode_count,
-		                                       pdi->display_pixel_width, pdi->display_pixel_height,
-		                                       &info->atlas_width_pixels, &info->atlas_height_pixels);
+		u_tiling_compute_system_atlas_oriented(head->rendering_modes, env_count, pdi->display_pixel_width,
+		                                       pdi->display_pixel_height, &info->atlas_width_pixels,
+		                                       &info->atlas_height_pixels);
 	}
 
 	// Recommended view scale: prefer iface-supplied (Leia SR
@@ -481,7 +490,7 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 		info->recommended_view_scale_y = pdi->recommended_view_scale_y;
 	} else {
 		float min_scale_x = 1.0f, min_scale_y = 1.0f;
-		for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+		for (uint32_t mi = 0; mi < env_count; mi++) {
 			if (head->rendering_modes[mi].view_scale_x > 0.0f &&
 			    head->rendering_modes[mi].view_scale_x < min_scale_x)
 				min_scale_x = head->rendering_modes[mi].view_scale_x;
@@ -1316,6 +1325,9 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	}
 }
 
+static bool
+head_screen_mode_choice(struct xrt_device *xdev, char *out_name, size_t cap, uint32_t *out_source);
+
 static xrt_result_t
 t_instance_create_system(struct xrt_instance *xinst,
                          struct xrt_system **out_xsys,
@@ -1356,6 +1368,9 @@ t_instance_create_system(struct xrt_instance *xinst,
 	// (tile layout, V-key toggle), the IPC shared-memory copy, oxr's system
 	// view count (hmd->view_count, recomputed by the trim). A longer table is
 	// trimmed with one WARN naming the driver.
+	// ADR-066 C1: no per-screen 3D-mode resolver until THIS system has
+	// published its screens below (a previous instance's are gone).
+	u_rendering_modes_set_choice_resolver(NULL);
 	if (xsysd->static_roles.head != NULL) {
 		const struct xrt_plugin_iface *tm_plugin = target_plugin_get_active();
 		(void)u_device_enforce_two_rendering_modes(xsysd->static_roles.head,
@@ -1543,6 +1558,15 @@ out:
 			os_mutex_unlock(&g_display_info_mutex);
 		}
 
+		// ADR-066 C1: the head screen's 3D-mode choice steers slot 1 from
+		// here on (the slot refresh polls it); apply it now, before any session
+		// exists, so the first one starts in the chosen entry.
+		u_rendering_modes_set_choice_resolver(head_screen_mode_choice);
+		if (head != NULL) {
+			const struct xrt_plugin_iface *rm_plugin = target_plugin_get_active();
+			(void)u_device_rendering_modes_refresh_config(head, rm_plugin != NULL ? rm_plugin->id : NULL);
+		}
+
 		// #2617: the destroy hook clears the statics above, hotplug or not.
 		(void)syscomp_destroy_hook_install(xsysc);
 
@@ -1591,6 +1615,47 @@ t_instance_get_active_plugin(struct xrt_instance *xinst,
 	*out_iface = iface;
 	*out_inst = iface != NULL ? target_plugin_get_active_instance() : NULL;
 	return iface != NULL;
+}
+
+/*!
+ * ADR-066 C1: the per-screen 3D-mode choice of the head device's screen — the
+ * system-default screen, `screens[0]` of the list below (its DP is the
+ * primary). Reads the store fresh (u_setting); called by the runtime's slot
+ * refresh at most once a second, with none of u_rendering_modes' locks held.
+ */
+static bool
+head_screen_mode_choice(struct xrt_device *xdev, char *out_name, size_t cap, uint32_t *out_source)
+{
+	(void)xdev;
+	if (!g_display_info_mutex_initialized) {
+		return false;
+	}
+	char key[XRT_SCREEN_NAME_MAX] = {0};
+	struct xrt_screen_list *list = calloc(1, sizeof(*list));
+	if (list == NULL) {
+		return false;
+	}
+	os_mutex_lock(&g_display_info_mutex);
+	if (g_screens_info != NULL) {
+		struct target_screens_system sys;
+		target_screens_system_from_info(g_screens_info, &sys);
+		target_screens_build(&g_screens_info->dp_registry, g_screens_info->active_plugin_id, &sys, list);
+		if (list->count > 0) {
+			snprintf(key, sizeof(key), "%s", list->screens[0].key);
+		}
+	}
+	os_mutex_unlock(&g_display_info_mutex);
+	free(list);
+	if (key[0] == '\0') {
+		return false;
+	}
+	enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+	if (u_setting_get_mode_3d_for_screen(key, out_name, cap, &src) == NULL) {
+		return false;
+	}
+	*out_source =
+	    src == U_SETTING_SOURCE_MACHINE ? XRT_STATUS_MODE_3D_SOURCE_MACHINE : XRT_STATUS_MODE_3D_SOURCE_USER;
+	return true;
 }
 
 /*!

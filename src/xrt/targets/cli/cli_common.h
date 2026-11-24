@@ -64,6 +64,14 @@ struct xrt_status_snapshot;
 void
 cli_status_build_headless(struct xrt_status_snapshot *out);
 
+/*!
+ * The status snapshot `status` would print: the running service's over DIAG,
+ * else the headless build. Returns 1 (service), 0 (headless) or -1 (the
+ * service is wedged: nothing built, cli_ipc_connect said why).
+ */
+int
+cli_status_fetch(struct xrt_status_snapshot *out);
+
 int
 cli_cmd_clients(int argc, const char **argv);
 

@@ -86,6 +86,15 @@ uint64_t
 target_status_snapshot_change_key(const struct xrt_dp_factory_registry *reg);
 
 /*!
+ * ADR-066 C1: overlay every screen row's `mode_3d.setting` / `source` with the
+ * stored per-screen 3D-mode choice (u_setting `mode_3d_per_screen`), read in
+ * the rendering process like the display-driver preference. Called by
+ * @ref target_status_snapshot_fill_dp_preference.
+ */
+void
+target_status_snapshot_fill_mode_3d_setting(struct xrt_status_snapshot *out);
+
+/*!
  * Fill @p out's `dp_preference` (the GLOBAL display-driver preference,
  * `target_plugin_get_global_preference`) from the stores and the environment
  * of THIS process. The headless builder calls it; a reader that assembled a

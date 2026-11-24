@@ -243,6 +243,23 @@ cli_status_build_headless(struct xrt_status_snapshot *out)
 	status_build_headless(out);
 }
 
+int
+cli_status_fetch(struct xrt_status_snapshot *out)
+{
+	xrt_result_t why = XRT_SUCCESS;
+	if (status_fetch_service(out, &why)) {
+		return 1;
+	}
+#ifdef CLI_HAVE_IPC
+	if (cli_ipc_service_wedged()) {
+		return -1;
+	}
+#endif
+	memset(out, 0, sizeof(*out));
+	status_build_headless(out);
+	return 0;
+}
+
 //! Say why the service refused: the one cause is a CLI outside the service's directory (#960).
 static void
 note_refused(void)

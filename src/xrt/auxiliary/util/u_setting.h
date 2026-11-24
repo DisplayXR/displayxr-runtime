@@ -217,6 +217,41 @@ enum u_setting_write_result
 enum u_setting_write_result
 u_setting_machine_set_preferred_plugin_for_screen(const char *key, const char *plugin_id);
 
+/*
+ *
+ * Per-screen 3D mode (ADR-066 C1): the name of the declared rendering mode a
+ * screen's 3D slot (run-time mode 1) maps to. What `displayxr-cli dp mode set
+ * <name> --screen <key>` and the Dashboard write. Read fresh on every call
+ * (the runtime polls it once a second; a write applies live):
+ *
+ *   1. per-user file "mode_3d_per_screen": { "<key>": "<name>" }
+ *   2. machine       HKLM\Software\DisplayXR\DisplayProcessors\Mode3D,
+ *                    value "<key>" (REG_SZ, admin; Windows only)
+ *
+ * With neither, the display driver's own default applies (sim-display: its
+ * OUTPUT setting).
+ *
+ */
+
+//! Object name of the per-screen 3D mode in the per-user settings file.
+#define U_SETTING_MODE_3D_JSON_KEY "mode_3d_per_screen"
+
+//! The 3D mode chosen for the screen @p key (user, then machine); NULL when none.
+const char *
+u_setting_get_mode_3d_for_screen(const char *key, char *buf, size_t cap, enum u_setting_source *out_source);
+
+//! Set (or, with @p mode_name NULL/"", remove) the per-user 3D mode of the screen @p key.
+bool
+u_setting_user_set_mode_3d_for_screen(const char *key, const char *mode_name);
+
+//! Remove every per-user per-screen 3D mode. Absent is success.
+bool
+u_setting_user_clear_mode_3d_per_screen(void);
+
+//! Set (or remove) the machine-wide 3D mode of the screen @p key (Windows HKLM; admin). @p key NULL removes every one.
+enum u_setting_write_result
+u_setting_machine_set_mode_3d_for_screen(const char *key, const char *mode_name);
+
 /*!
  * @name Pure helpers behind the chain (unit-tested)
  * @{

@@ -1134,3 +1134,185 @@ u_setting_machine_set_preferred_plugin_for_screen(const char *key, const char *p
 	return U_SETTING_WRITE_UNSUPPORTED;
 #endif
 }
+
+
+/*
+ *
+ * Per-screen 3D mode (ADR-066 C1): which declared rendering mode a screen's
+ * 3D slot maps to. Two tiers, read fresh on every call (the callers poll at
+ * most once a second, and a write must apply live):
+ *
+ *   1. per-user file "mode_3d_per_screen": { "<key>": "<mode name>" }
+ *   2. machine       HKLM\Software\DisplayXR\DisplayProcessors\Mode3D,
+ *                    value "<key>" (REG_SZ, admin; Windows only)
+ *
+ */
+
+#ifdef XRT_OS_WINDOWS
+#define MODE_3D_MACHINE_KEY_PATH L"Software\\DisplayXR\\DisplayProcessors\\Mode3D"
+
+static bool
+mode_3d_machine_get(const char *key, char *buf, size_t cap)
+{
+	wchar_t wkey[U_SETTING_SCREEN_KEY_MAX];
+	if (MultiByteToWideChar(CP_UTF8, 0, key, -1, wkey, (int)(sizeof(wkey) / sizeof(wkey[0]))) <= 0) {
+		return false;
+	}
+	wchar_t wval[SETTING_VALUE_MAX];
+	DWORD bytes = sizeof(wval) - sizeof(wchar_t);
+	DWORD type = 0;
+	if (RegGetValueW(HKEY_LOCAL_MACHINE, MODE_3D_MACHINE_KEY_PATH, wkey, RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+	                 &type, wval, &bytes) != ERROR_SUCCESS) {
+		return false;
+	}
+	wval[(sizeof(wval) / sizeof(wval[0])) - 1] = L'\0';
+	return WideCharToMultiByte(CP_UTF8, 0, wval, -1, buf, (int)cap, NULL, NULL) > 0 && buf[0] != '\0';
+}
+#endif
+
+const char *
+u_setting_get_mode_3d_for_screen(const char *key, char *buf, size_t cap, enum u_setting_source *out_source)
+{
+	if (out_source != NULL) {
+		*out_source = U_SETTING_SOURCE_DEFAULT;
+	}
+	if (!screen_key_valid(key) || buf == NULL || cap == 0) {
+		return NULL;
+	}
+	cJSON *root = user_load_json();
+	const cJSON *obj = (root != NULL) ? cJSON_GetObjectItemCaseSensitive(root, U_SETTING_MODE_3D_JSON_KEY) : NULL;
+	const bool user = cJSON_IsObject(obj) && screen_object_lookup(obj, key, buf, cap);
+	cJSON_Delete(root);
+	if (user) {
+		if (out_source != NULL) {
+			*out_source = U_SETTING_SOURCE_USER;
+		}
+		return buf;
+	}
+#ifdef XRT_OS_WINDOWS
+	if (mode_3d_machine_get(key, buf, cap)) {
+		if (out_source != NULL) {
+			*out_source = U_SETTING_SOURCE_MACHINE;
+		}
+		return buf;
+	}
+#endif
+	buf[0] = '\0';
+	return NULL;
+}
+
+bool
+u_setting_user_set_mode_3d_for_screen(const char *key, const char *mode_name)
+{
+	if (!screen_key_valid(key) || (mode_name != NULL && strlen(mode_name) >= SETTING_VALUE_MAX)) {
+		return false;
+	}
+	cJSON *root = user_load_json();
+	if (root == NULL) {
+		return false;
+	}
+	cJSON *obj = cJSON_GetObjectItemCaseSensitive(root, U_SETTING_MODE_3D_JSON_KEY);
+	if (obj != NULL && !cJSON_IsObject(obj)) {
+		cJSON_DeleteItemFromObjectCaseSensitive(root, U_SETTING_MODE_3D_JSON_KEY);
+		obj = NULL;
+	}
+	const bool set = mode_name != NULL && mode_name[0] != '\0';
+	if (obj == NULL && set) {
+		obj = cJSON_AddObjectToObject(root, U_SETTING_MODE_3D_JSON_KEY);
+	}
+	if (obj != NULL) {
+		cJSON *it = obj->child;
+		while (it != NULL) {
+			cJSON *next = it->next;
+			if (it->string != NULL && str_ieq(it->string, key)) {
+				cJSON_Delete(cJSON_DetachItemViaPointer(obj, it));
+			}
+			it = next;
+		}
+		if (set) {
+			cJSON_AddStringToObject(obj, key, mode_name);
+		} else if (obj->child == NULL) {
+			cJSON_DeleteItemFromObjectCaseSensitive(root, U_SETTING_MODE_3D_JSON_KEY);
+		}
+	}
+	const bool ok = user_save_json(root);
+	cJSON_Delete(root);
+	return ok;
+}
+
+bool
+u_setting_user_clear_mode_3d_per_screen(void)
+{
+	cJSON *root = user_load_json();
+	if (root == NULL) {
+		return false;
+	}
+	if (cJSON_GetObjectItemCaseSensitive(root, U_SETTING_MODE_3D_JSON_KEY) == NULL) {
+		cJSON_Delete(root);
+		return true;
+	}
+	cJSON_DeleteItemFromObjectCaseSensitive(root, U_SETTING_MODE_3D_JSON_KEY);
+	const bool ok = user_save_json(root);
+	cJSON_Delete(root);
+	return ok;
+}
+
+enum u_setting_write_result
+u_setting_machine_set_mode_3d_for_screen(const char *key, const char *mode_name)
+{
+#ifdef XRT_OS_WINDOWS
+	if (key == NULL) {
+		const LSTATUS rc = RegDeleteKeyExW(HKEY_LOCAL_MACHINE, MODE_3D_MACHINE_KEY_PATH, KEY_WOW64_64KEY, 0);
+		if (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND) {
+			return U_SETTING_WRITE_OK;
+		}
+		return rc == ERROR_ACCESS_DENIED ? U_SETTING_WRITE_DENIED : U_SETTING_WRITE_FAILED;
+	}
+	if (!screen_key_valid(key) || (mode_name != NULL && strlen(mode_name) >= SETTING_VALUE_MAX)) {
+		return U_SETTING_WRITE_FAILED;
+	}
+	wchar_t wkey[U_SETTING_SCREEN_KEY_MAX];
+	if (MultiByteToWideChar(CP_UTF8, 0, key, -1, wkey, (int)(sizeof(wkey) / sizeof(wkey[0]))) <= 0) {
+		return U_SETTING_WRITE_FAILED;
+	}
+	const bool set = mode_name != NULL && mode_name[0] != '\0';
+	HKEY hk = NULL;
+	LSTATUS rc;
+	if (set) {
+		rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, MODE_3D_MACHINE_KEY_PATH, 0, NULL, 0,
+		                     KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &hk, NULL);
+	} else {
+		rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, MODE_3D_MACHINE_KEY_PATH, 0, KEY_SET_VALUE | KEY_WOW64_64KEY,
+		                   &hk);
+		if (rc == ERROR_FILE_NOT_FOUND) {
+			return U_SETTING_WRITE_OK;
+		}
+	}
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? U_SETTING_WRITE_DENIED : U_SETTING_WRITE_FAILED;
+	}
+	if (set) {
+		wchar_t wval[SETTING_VALUE_MAX];
+		if (MultiByteToWideChar(CP_UTF8, 0, mode_name, -1, wval, (int)(sizeof(wval) / sizeof(wval[0]))) <= 0) {
+			RegCloseKey(hk);
+			return U_SETTING_WRITE_FAILED;
+		}
+		rc = RegSetValueExW(hk, wkey, 0, REG_SZ, (const BYTE *)wval,
+		                    (DWORD)((wcslen(wval) + 1) * sizeof(wchar_t)));
+	} else {
+		rc = RegDeleteValueW(hk, wkey);
+		if (rc == ERROR_FILE_NOT_FOUND) {
+			rc = ERROR_SUCCESS;
+		}
+	}
+	RegCloseKey(hk);
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? U_SETTING_WRITE_DENIED : U_SETTING_WRITE_FAILED;
+	}
+	return U_SETTING_WRITE_OK;
+#else
+	(void)key;
+	(void)mode_name;
+	return U_SETTING_WRITE_UNSUPPORTED;
+#endif
+}

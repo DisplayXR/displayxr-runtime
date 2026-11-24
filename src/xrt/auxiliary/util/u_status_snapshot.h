@@ -288,6 +288,18 @@ u_status_conv_to_cjson(const struct xrt_status_snapshot *snap);
 bool
 u_status_generation_equal(const struct xrt_status_generation *a, const struct xrt_status_generation *b);
 
+//! ADR-066 C1: "runtime_default" / "driver_default" / "user" / "machine".
+const char *
+u_status_mode_3d_source_str(uint32_t source);
+
+//! ADR-066 C1: "now" / "restart_app" / "not_supported".
+const char *
+u_status_mode_3d_applies_str(uint32_t applies);
+
+//! ADR-066 C1: a screen's `mode_3d` object (null when nothing is known). Caller owns the tree.
+cJSON *
+u_status_mode_3d_to_cjson(const struct xrt_status_mode_3d *m3);
+
 /*!
  * @name Stable enum spellings (as serialised)
  * @{

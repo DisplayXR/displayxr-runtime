@@ -193,6 +193,67 @@ u_status_apply_str(enum xrt_status_apply a)
 }
 
 const char *
+u_status_mode_3d_source_str(uint32_t source)
+{
+	switch (source) {
+	case XRT_STATUS_MODE_3D_SOURCE_DRIVER_DEFAULT: return "driver_default";
+	case XRT_STATUS_MODE_3D_SOURCE_USER: return "user";
+	case XRT_STATUS_MODE_3D_SOURCE_MACHINE: return "machine";
+	case XRT_STATUS_MODE_3D_SOURCE_RUNTIME_DEFAULT:
+	default: return "runtime_default";
+	}
+}
+
+const char *
+u_status_mode_3d_applies_str(uint32_t applies)
+{
+	switch (applies) {
+	case XRT_STATUS_MODE_3D_APPLIES_RESTART_APP: return "restart_app";
+	case XRT_STATUS_MODE_3D_APPLIES_NOT_SUPPORTED: return "not_supported";
+	case XRT_STATUS_MODE_3D_APPLIES_NOW:
+	default: return "now";
+	}
+}
+
+cJSON *
+u_status_mode_3d_to_cjson(const struct xrt_status_mode_3d *m3)
+{
+	if (m3 == NULL || (!m3->valid && m3->setting[0] == '\0')) {
+		return cJSON_CreateNull();
+	}
+	cJSON *mo = cJSON_CreateObject();
+	if (m3->valid && m3->active[0] != '\0') {
+		cJSON_AddStringToObject(mo, "active", m3->active);
+	} else {
+		cJSON_AddNullToObject(mo, "active");
+	}
+	if (m3->setting[0] != '\0') {
+		cJSON_AddStringToObject(mo, "setting", m3->setting);
+	} else {
+		cJSON_AddNullToObject(mo, "setting");
+	}
+	cJSON_AddStringToObject(mo, "source", u_status_mode_3d_source_str(m3->source));
+	cJSON *ch = cJSON_AddArrayToObject(mo, "choices");
+	for (uint32_t i = 0; m3->valid && i < m3->choice_count && i < XRT_STATUS_MAX_MODE_3D_CHOICES; i++) {
+		const struct xrt_status_mode_3d_choice *c = &m3->choices[i];
+		cJSON *co = cJSON_CreateObject();
+		cJSON_AddStringToObject(co, "name", c->name);
+		cJSON_AddStringToObject(co, "label", c->label);
+		cJSON_AddNumberToObject(co, "views", (double)c->views);
+		cJSON_AddBoolToObject(co, "tracked", c->tracked);
+		cJSON_AddBoolToObject(co, "passthrough", c->passthrough);
+		cJSON_AddStringToObject(co, "applies", u_status_mode_3d_applies_str(c->applies));
+		if (c->reason[0] != '\0') {
+			cJSON_AddStringToObject(co, "reason", c->reason);
+		} else {
+			cJSON_AddNullToObject(co, "reason");
+		}
+		cJSON_AddItemToArray(ch, co);
+	}
+	return mo;
+}
+
+const char *
 u_status_platform_state_str(uint32_t state)
 {
 	switch (state) {
@@ -1098,6 +1159,9 @@ screen_to_cjson(const struct xrt_status_screen *s)
 	} else {
 		cJSON_AddNullToObject(o, "mode");
 	}
+
+	// ADR-066 C1: the screen's "3D mode" (null when nothing is known about it).
+	cJSON_AddItemToObject(o, "mode_3d", u_status_mode_3d_to_cjson(&s->mode_3d));
 
 	cJSON *dps = cJSON_AddArrayToObject(o, "dps");
 	for (uint32_t i = 0; i < s->dp_count && i < XRT_STATUS_MAX_SCREEN_DPS; i++) {

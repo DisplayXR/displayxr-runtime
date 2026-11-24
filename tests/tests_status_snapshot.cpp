@@ -793,8 +793,9 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 	CHECK(str(p0, "platform_state") == "READY");
 
 	const cJSON *sc = cJSON_GetArrayItem(cJSON_GetObjectItem(d.root, "screens"), 0);
-	CHECK(keys(sc) == V{"id", "index", "device_name", "friendly_name", "key", "edid", "desktop", "native", "physical_mm",
-	                    "roles", "claim", "layout", "eye_tracking", "mode", "dps", "vendor", "warnings"});
+	CHECK(keys(sc) == V{"id", "index", "device_name", "friendly_name", "key", "edid", "desktop", "native",
+	                    "physical_mm", "roles", "claim", "layout", "eye_tracking", "mode", "mode_3d", "dps",
+	                    "vendor", "warnings"});
 	CHECK(str(sc, "id") == "0x8c413a2f61152ce7");
 	CHECK(keys(cJSON_GetObjectItem(sc, "edid")) == V{"manufacturer", "product", "serial"});
 	CHECK(keys(cJSON_GetObjectItem(sc, "desktop")) == V{"left", "top", "width", "height", "scale"});
