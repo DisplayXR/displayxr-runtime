@@ -249,6 +249,25 @@ void
 ipc_server_conv_set_gpu_hook(struct ipc_server_conv *sc, ipc_server_conv_gpu_hook_fn fn, void *ud);
 
 /*!
+ * #2769: the service target's hook for "the display plug-in selection was
+ * re-evaluated" (the display re-probe: a plug-in installed, removed or adopted
+ * after the service started). The target re-checks there whether the active
+ * display driver offers lift, which decides whether the built-in `dp-lift`
+ * row is listed. Called on the re-probe thread, no lock held.
+ */
+typedef void (*ipc_server_conv_display_plugins_hook_fn)(void *ud);
+
+//! Register the hook above (set before ipc_server_main).
+void
+ipc_server_conv_set_display_plugins_hook(struct ipc_server_conv *sc,
+                                         ipc_server_conv_display_plugins_hook_fn fn,
+                                         void *ud);
+
+//! The display re-probe ran (ipc_server_process.c): calls the hook above. NULL-safe.
+void
+ipc_server_conv_display_plugins_reprobed(struct ipc_server_conv *sc);
+
+/*!
  * Install (or, with NULL, remove) the GPU side: conv_core_set_gpu, the
  * service hook (allocator + `dp-lift`), then ipc_server_conv_set_io — the
  * route engages last. Removal runs in the reverse order and destroys every

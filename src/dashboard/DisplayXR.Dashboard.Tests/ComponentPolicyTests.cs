@@ -103,6 +103,7 @@ public class ComponentPolicyTests
     [Fact]
     public void ConvList_PrefersPerTask()
     {
+        // A display driver that offers lift: the only case with a dp-lift row since #2769.
         var conv = Parse(ComponentClass.Conversion, "conv-list-n3.json");
         Assert.True(conv.Writable);
         var lift = Assert.Single(conv.Rows);

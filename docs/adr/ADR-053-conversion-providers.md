@@ -341,6 +341,22 @@ The satellite channel carries the state (`LICENSE_STATE`) and the activation
 token (`ACTIVATE`). Spec: conversion-provider-discovery.md §4.3a. Not done
 here: trial and expiry detail in the `XR_DXR_lift` candidate enumeration.
 
+## Amendment 3 — the legacy adapter is listed only when the display driver offers lift (2026-11-23)
+
+Decision 1 made the display-processor lift slots a runtime-internal legacy
+adapter (`dp-lift`), and decision 6 has it declare its tasks as installed
+before any module has loaded. As built, the Windows service registered that
+row whenever its graphics side was up, whether or not the display driver had
+lift slots. A PC whose driver carries no converter then listed three installed
+capabilities with nothing behind them.
+
+Decided 2026-11: no display driver carries a 2D-to-3D converter from now on;
+converters ship only as conversion providers. First step (#2769, "hide"): the
+row is registered and listed only when the active display plug-in exports the
+lift-only factory. Nothing is removed. A plug-in that still fills the slots is
+served as before, and the slots still leave only at the next plug-in ABI
+major. Rule and limits: conversion-provider-discovery.md §4.5.
+
 ## Amendments to earlier records
 
 Recorded here so ADR-042 and ADR-049 stay readable as written; each points at the section of

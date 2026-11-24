@@ -81,7 +81,17 @@ static struct
 	struct conv_image_alloc_ops gpu_alloc;
 	uint32_t gpu_alloc_calls; //!< GPU allocator calls in flight (a removal waits for 0)
 
-	//! The legacy DP-lift adapter (#2003), registered once the GPU side attached.
+	/*!
+	 * The legacy DP-lift adapter (#2003). Registered only once the GPU side
+	 * attached AND the active display driver offers lift (#2769, see
+	 * dp_lift_evaluate). dp_lift_mtx serialises that decision and guards the
+	 * backend copy and the two "offer" fields; dp_lift_registered is read
+	 * without it (it only ever goes false -> true within a service lifetime).
+	 */
+	struct os_mutex dp_lift_mtx;
+	struct conv_dp_lift_backend dp_lift_backend; //!< the attached backend (snapshot NULL = none)
+	bool dp_lift_offer_known;                    //!< dp_lift_offered holds an answer (logs on edges only)
+	bool dp_lift_offered;                        //!< the last answer
 	const struct xrt_conversion_plugin_iface *dp_lift_iface;
 	struct xrt_conversion_plugin_instance *dp_lift_inst;
 	bool dp_lift_registered;
@@ -286,36 +296,79 @@ satellites_set_adapter(uint64_t luid)
 	}
 }
 
-//! ipc_server_conv_gpu_hook_fn: the GPU side came (or goes).
+/*!
+ * #2769: list the built-in `dp-lift` row only when the active display driver
+ * offers lift.
+ *
+ * The test is "the active display plug-in exports the lift-only factory"
+ * (xrt_plugin_iface::create_dp_d3d11_lift), read from the backend's snapshot:
+ * two pointer reads, no vendor call. It is the same test the headless status
+ * uses (target_conv_status.c), so `conv list` says the same thing with and
+ * without a service. It deliberately does NOT create a display processor on a
+ * NULL window to look at its lift slots: that is the cost this rule removes
+ * for a driver with no converter. A plug-in that fills the lift slots exports
+ * that factory (the two were introduced together); one that filled the slots
+ * on its ordinary factory only, without the lift-only factory, is not listed.
+ *
+ * The answer can change within a service lifetime: the display re-probe may
+ * adopt another plug-in (one installed after the service started, or the
+ * vendor plug-in taking over from the fallback). So this runs when the GPU
+ * side attaches, on every display re-probe and on a DisplayProcessors
+ * registry change.
+ *  - not offered -> offered: the row is registered then.
+ *  - offered -> not offered: the conversion core has no "remove a provider"
+ *    (streams and the describe cache hold provider indices), so a row that
+ *    was registered stays for this service lifetime and answers ABSENT, as
+ *    before this rule; it is gone at the next service start. Rare: it takes
+ *    swapping the display driver under a running service.
+ *
+ * One WARN per change of the answer, never per call (the fallback re-probe
+ * timer calls this every 10 s). Any thread; takes dp_lift_mtx.
+ */
 static void
-on_gpu(void *ud, const struct ipc_server_conv_gpu *gpu)
+dp_lift_evaluate(const char *why)
 {
-	(void)ud;
 	if (g.core == NULL) {
 		return;
 	}
-	if (gpu == NULL) {
-		// The backend goes away with the system compositor: the adapter answers
-		// "no module" from now on (in-flight calls drain first).
-		if (g.dp_lift_inst != NULL) {
-			conv_provider_legacy_dp_detach(g.dp_lift_inst);
+	os_mutex_lock(&g.dp_lift_mtx);
+	if (g.dp_lift_backend.snapshot == NULL) {
+		os_mutex_unlock(&g.dp_lift_mtx);
+		return; // no D3D11 GPU side (yet): nothing could serve the row
+	}
+	struct conv_dp_lift_snapshot snap;
+	g.dp_lift_backend.snapshot(g.dp_lift_backend.ud, &snap);
+	const bool offered = snap.lift_only_factory;
+	const bool changed = !g.dp_lift_offer_known || offered != g.dp_lift_offered;
+	g.dp_lift_offer_known = true;
+	g.dp_lift_offered = offered;
+
+	if (!offered) {
+		if (changed && g.dp_lift_registered) {
+			U_LOG_W(
+			    "[conv] dp-lift: the active display driver no longer offers lift (%s); the row stays "
+			    "listed until the service restarts and answers absent",
+			    why);
+		} else if (changed) {
+			U_LOG_W(
+			    "[conv] dp-lift not listed: the active display driver offers no lift (no lift-only "
+			    "factory; %s). Conversion comes from conversion providers only",
+			    why);
 		}
-		service_conversion_set_gpu_alloc(NULL);
-		return;
-	}
-	service_conversion_set_gpu_alloc(&gpu->alloc);
-	if (gpu->adapter_luid != 0) {
-		satellites_set_adapter(gpu->adapter_luid);
-	}
-	if (gpu->dp_lift.snapshot == NULL) {
+		os_mutex_unlock(&g.dp_lift_mtx);
 		return;
 	}
 	if (g.dp_lift_registered) {
-		conv_provider_legacy_dp_attach(g.dp_lift_inst, &gpu->dp_lift);
-		conv_core_provider_changed(g.core, CONV_DP_LIFT_ID);
+		os_mutex_unlock(&g.dp_lift_mtx);
+		if (changed) {
+			// Offered again after it went away: retry the row at once.
+			U_LOG_W("[conv] dp-lift: the active display driver offers lift (%s): retrying the row", why);
+			conv_core_provider_changed(g.core, CONV_DP_LIFT_ID);
+		}
 		return;
 	}
-	if (!conv_provider_legacy_dp_create(&gpu->dp_lift, &g.dp_lift_iface, &g.dp_lift_inst)) {
+	if (!conv_provider_legacy_dp_create(&g.dp_lift_backend, &g.dp_lift_iface, &g.dp_lift_inst)) {
+		os_mutex_unlock(&g.dp_lift_mtx);
 		return;
 	}
 	struct conv_provider_desc d;
@@ -330,9 +383,61 @@ on_gpu(void *ud, const struct ipc_server_conv_gpu *gpu)
 	d.inst = g.dp_lift_inst;
 	if (conv_core_add_provider(g.core, &d) >= 0) {
 		g.dp_lift_registered = true;
-		U_LOG_W("[conv] dp-lift registered: the display plug-in's lift slots, ProbeOrder %u, in-service%s",
-		        CONV_DP_LIFT_PROBE_ORDER, d.enabled ? "" : " (disabled by policy)");
+		U_LOG_W(
+		    "[conv] dp-lift registered: the display plug-in's lift slots (lift-only factory present; %s), "
+		    "ProbeOrder %u, in-service%s",
+		    why, CONV_DP_LIFT_PROBE_ORDER, d.enabled ? "" : " (disabled by policy)");
 	}
+	os_mutex_unlock(&g.dp_lift_mtx);
+}
+
+//! ipc_server_conv_display_plugins_hook_fn: the display re-probe ran (#2769).
+static void
+on_display_plugins_reprobed(void *ud)
+{
+	(void)ud;
+	dp_lift_evaluate("display re-probe");
+}
+
+//! ipc_server_conv_gpu_hook_fn: the GPU side came (or goes).
+static void
+on_gpu(void *ud, const struct ipc_server_conv_gpu *gpu)
+{
+	(void)ud;
+	if (g.core == NULL) {
+		return;
+	}
+	if (gpu == NULL) {
+		// The backend goes away with the system compositor: the adapter answers
+		// "no module" from now on (in-flight calls drain first).
+		if (g.dp_lift_inst != NULL) {
+			conv_provider_legacy_dp_detach(g.dp_lift_inst);
+		}
+		os_mutex_lock(&g.dp_lift_mtx);
+		memset(&g.dp_lift_backend, 0, sizeof(g.dp_lift_backend));
+		g.dp_lift_offer_known = false;
+		os_mutex_unlock(&g.dp_lift_mtx);
+		service_conversion_set_gpu_alloc(NULL);
+		return;
+	}
+	service_conversion_set_gpu_alloc(&gpu->alloc);
+	if (gpu->adapter_luid != 0) {
+		satellites_set_adapter(gpu->adapter_luid);
+	}
+	if (gpu->dp_lift.snapshot == NULL) {
+		return;
+	}
+	os_mutex_lock(&g.dp_lift_mtx);
+	g.dp_lift_backend = gpu->dp_lift;
+	os_mutex_unlock(&g.dp_lift_mtx);
+	if (g.dp_lift_registered) {
+		// A re-created service system: the row exists, hand it the new backend.
+		conv_provider_legacy_dp_attach(g.dp_lift_inst, &gpu->dp_lift);
+		conv_core_provider_changed(g.core, CONV_DP_LIFT_ID);
+		dp_lift_evaluate("GPU side re-attached"); // logs only if the answer changed
+		return;
+	}
+	dp_lift_evaluate("GPU side attached");
 }
 
 
@@ -1162,7 +1267,8 @@ service_conversion_start(void)
 		    ks);
 		return;
 	}
-	if (os_mutex_init(&g.mtx) != 0 || os_mutex_init(&g.alloc_mtx) != 0 || os_cond_init(&g.alloc_cond) != 0) {
+	if (os_mutex_init(&g.mtx) != 0 || os_mutex_init(&g.alloc_mtx) != 0 || os_cond_init(&g.alloc_cond) != 0 ||
+	    os_mutex_init(&g.dp_lift_mtx) != 0) {
 		U_LOG_E("[conv] could not create the conversion core's service locks");
 		return;
 	}
@@ -1242,6 +1348,7 @@ service_conversion_start(void)
 
 	if (ipc_server_conv_create(g.core, &g.sc) == XRT_SUCCESS) {
 		ipc_server_conv_set_gpu_hook(g.sc, on_gpu, NULL);
+		ipc_server_conv_set_display_plugins_hook(g.sc, on_display_plugins_reprobed, NULL);
 		ipc_server_set_conv(g.sc);
 #ifndef XRT_OS_WINDOWS
 		// No D3D11 device here to install a GPU glue: the CPU glue engages
@@ -1298,6 +1405,10 @@ service_conversion_stop(void)
 	g.dp_lift_iface = NULL;
 	g.dp_lift_inst = NULL; // destroyed by its host with the core
 	g.dp_lift_registered = false;
+	memset(&g.dp_lift_backend, 0, sizeof(g.dp_lift_backend));
+	g.dp_lift_offer_known = false;
+	g.dp_lift_offered = false;
+	os_mutex_destroy(&g.dp_lift_mtx);
 	os_cond_destroy(&g.alloc_cond);
 	os_mutex_destroy(&g.alloc_mtx);
 	os_mutex_destroy(&g.mtx);
@@ -1307,7 +1418,14 @@ service_conversion_stop(void)
 void
 service_conversion_display_plugins_changed(void)
 {
-	if (!g.started || g.core == NULL || !g.dp_lift_registered) {
+	if (!g.started || g.core == NULL) {
+		return;
+	}
+	if (!g.dp_lift_registered) {
+		// #2769: not listed so far. A plug-in that offers lift may have been
+		// installed; the display re-probe this change also triggers checks
+		// again once the plug-in is actually adopted.
+		dp_lift_evaluate("display plug-in registration changed");
 		return;
 	}
 	U_LOG_I("[conv] display plug-in registration changed: retrying dp-lift");

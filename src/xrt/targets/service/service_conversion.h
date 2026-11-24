@@ -71,7 +71,9 @@ service_conversion_set_gpu_alloc(const struct conv_image_alloc_ops *ops);
 
 /*! #2029: the display-plug-in registration changed (the tray's
  *  DisplayProcessors watch): a vendor plug-in or its conversion module was
- *  installed, removed or re-registered. Retries the dp-lift rows at once (a
+ *  installed, removed or re-registered. When the dp-lift row is not listed
+ *  (#2769: the active display driver offers no lift) it checks that again.
+ *  Otherwise retries the dp-lift rows at once (a
  *  FAILED "no module" re-warms per PrewarmOn), as a ConversionProviders change
  *  does -- a vendor installer touches only DisplayProcessors. Any thread. */
 void

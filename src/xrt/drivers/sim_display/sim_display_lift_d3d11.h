@@ -6,7 +6,9 @@
  *         (SIM_DISPLAY_FAKE_LIFT=1; XR_DXR_lift, ADR-042).
  *
  * sim_display ships no conversion module, so by default its lift slots stay
- * NULL and the runtime reports supportedModes 0. With SIM_DISPLAY_FAKE_LIFT=1
+ * NULL, its plug-in exports no lift-only factory (#2769: the runtime then
+ * lists no dp-lift row) and the runtime reports supportedModes 0. With the
+ * setting LIFT on (legacy SIM_DISPLAY_FAKE_LIFT=1)
  * the D3D11 DP installs this fake so the whole path — lift thread, mailbox,
  * ring, IPC, weave-rect lifting, blob transport — can run hardware-free:
  *
