@@ -26,10 +26,11 @@
 #error "XRT_DP_D3D12_HAS_SNAP_WINDOW_RECT must be defined by the header that carries the slot"
 #endif
 
+// ADR-047 Amendment 10 appended set_output_entry after it on both.
 static_assert(offsetof(xrt_display_processor_gl, snap_window_rect) + sizeof(void *) ==
-              sizeof(xrt_display_processor_gl));
+              offsetof(xrt_display_processor_gl, set_output_entry));
 static_assert(offsetof(xrt_display_processor_d3d12, snap_window_rect) + sizeof(void *) ==
-              sizeof(xrt_display_processor_d3d12));
+              offsetof(xrt_display_processor_d3d12, set_output_entry));
 
 static int g_snap_calls = 0;
 

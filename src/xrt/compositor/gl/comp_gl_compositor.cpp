@@ -46,6 +46,7 @@
 #include "comp_gl_segments.h"
 #include "util/comp_segments_gl.h"
 #include "util/comp_segments_route.h"
+#include "util/comp_segments_view_size.h"
 #ifdef XRT_GL_HUB
 // #2317 P3: the GL shim onto the D3D11 hub (DXR_HUB=1). The atlas renders into
 // a D3D11 deposit on the GL context's adapter; the hub weaves and presents it.
@@ -3746,6 +3747,20 @@ static GLuint
 gl_flatten_backdrop_2d(struct comp_gl_compositor *c, uint32_t dst_w, uint32_t dst_h, uint32_t *out_w,
                        uint32_t *out_h);
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * ADR-047 Amendment 10: does this session follow the window's screen for its
+ * view size and 3D mode? Not for a legacy app (its size is the compromise:
+ * the head device's table stands and every segment keeps the session grid).
+ */
+static bool
+gl_view_size_on(const struct comp_gl_compositor *c)
+{
+	return c->segments != NULL && !c->legacy_app_tile_scaling && c->xdev != NULL && c->xdev->hmd != NULL;
+}
+
+#endif
+
 /*!
  * Crop the valid content region from the (potentially oversized) atlas texture
  * and pass it to the display processor. If the atlas exactly matches the
@@ -3891,6 +3906,11 @@ gl_crop_and_process_dp(
 		sf.content = &c->repaint.seg_content;
 		sf.transparent_background = c->transparent_background;
 		sf.primary_dp = c->display_processor;
+		// ADR-047 Amendment 10: each non-primary segment in its own screen's
+		// entry for the app's slot.
+		sf.screen_entries = gl_view_size_on(c);
+		sf.active_slot =
+		    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0;
 		comp_gl_segments_record(c->segments, &sf);
 		return;
 	}
@@ -5748,6 +5768,22 @@ gl_segments_tick(struct comp_gl_compositor *c, bool eligible, uint32_t present_w
 	if (seg_split) {
 		const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
 		(void)comp_gl_segments_get_metrics(c->segments, &win, &canvas, c->display_processor != NULL, &m);
+	}
+	/*
+	 * ADR-047 Amendment 10: the view size follows the window's screen. Runs
+	 * on every tick with a placed window - also the ones that do not split
+	 * (zero-copy on the session screen, a frame the split skips) - so the
+	 * size follows the window back. Legacy apps never see the table (their
+	 * size is the compromise).
+	 */
+	if (have_win && gl_view_size_on(c) && comp_gl_segments_enabled(c->segments)) {
+		const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
+		const uint32_t cap_w = c->seg_sys_info != NULL ? c->seg_sys_info->atlas_width_pixels : 0;
+		const uint32_t cap_h = c->seg_sys_info != NULL ? c->seg_sys_info->atlas_height_pixels : 0;
+		(void)comp_gl_segments_update_view_size(c->segments, &win, &canvas, c->xdev->rendering_modes,
+		                                        c->xdev->rendering_mode_count, c->mode_fill_views, cap_w,
+		                                        cap_h);
+		(void)comp_gl_segments_get_effective_table(c->segments, &m.table);
 	}
 	os_mutex_lock(&c->seg_pub_mutex);
 	(void)comp_segments_publish(&c->seg_pub, &m);
@@ -8100,12 +8136,47 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	 * thread between the two cannot give the frame two different modes.
 	 */
 	const struct xrt_rendering_mode *frame_mode = NULL;
+	uint32_t frame_slot = 0;
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		frame_slot = idx;
 		if (idx < c->xdev->rendering_mode_count) {
 			frame_mode = &c->xdev->rendering_modes[idx];
 		}
 	}
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * ADR-047 Amendment 10: the view size follows the window's screen. When
+	 * the window is on (or across) other screens, the atlas is laid out and
+	 * sized from the table its app was told (the effective table, published
+	 * by the last weave) - the session's tiles and view scale are the head
+	 * screen's only while the window is on it. The lens state stays the
+	 * app's (its slot's): only the geometry is overlaid.
+	 */
+	struct xrt_rendering_mode frame_mode_eff;
+#ifdef XRT_GL_HUB
+	if (c->hub.split != NULL) {
+		comp_hub_d3d11_set_view_size_policy(c->hub.split, !c->legacy_app_tile_scaling, c->mode_fill_views);
+	}
+#endif
+	if (frame_mode != NULL && !c->legacy_app_tile_scaling) {
+		struct xrt_effective_mode_table eff;
+		bool have_eff = false;
+#ifdef XRT_GL_HUB
+		if (c->hub.active && c->hub.split != NULL) {
+			have_eff = comp_hub_d3d11_get_effective_table(c->hub.split, &eff);
+		} else
+#endif
+		    if (c->segments != NULL) {
+			have_eff = comp_gl_segments_get_effective_table(c->segments, &eff);
+		}
+		if (have_eff && comp_segments_view_size_overlay_mode(frame_mode, &eff, frame_slot, &frame_mode_eff)) {
+			frame_mode = &frame_mode_eff;
+		}
+	}
+#else
+	(void)frame_slot;
+#endif
 
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
 	// from the frame's active mode (MUST be before zero-copy check and blit)
@@ -9802,6 +9873,37 @@ comp_gl_compositor_set_sys_info(struct xrt_compositor *xc, const struct xrt_syst
 		c->view_width = info->legacy_view_width_pixels;
 		c->view_height = info->legacy_view_height_pixels;
 	}
+
+	/*
+	 * ADR-047 Amendment 10: the atlas is the instance's worst case — the
+	 * per-dimension union over every claimed screen's modes — not only the
+	 * head device's, so a window on another screen (whose effective table may
+	 * need a larger atlas) fits too. Grown once here, on the app thread with
+	 * the session's context current (right after create, which made it).
+	 * Not under the hub: there the atlas is the deposit's texture, sized at
+	 * create from the head device's modes (a known gap: a screen whose
+	 * modes need more than that is not grown for under the GL hub).
+	 */
+	bool hub_atlas = false;
+#ifdef XRT_GL_HUB
+	hub_atlas = c->hub.active;
+#endif
+	if (!hub_atlas && !info->legacy_app_tile_scaling && c->atlas_texture != 0 &&
+	    (info->atlas_width_pixels > c->atlas_tex_width || info->atlas_height_pixels > c->atlas_tex_height)) {
+		const uint32_t w =
+		    info->atlas_width_pixels > c->atlas_tex_width ? info->atlas_width_pixels : c->atlas_tex_width;
+		const uint32_t h =
+		    info->atlas_height_pixels > c->atlas_tex_height ? info->atlas_height_pixels : c->atlas_tex_height;
+		glBindTexture(GL_TEXTURE_2D, c->atlas_texture);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		U_LOG_W(
+		    "GL atlas %ux%u -> %ux%u: the instance's worst case over every claimed screen (ADR-047 Amendment "
+		    "10)",
+		    c->atlas_tex_width, c->atlas_tex_height, w, h);
+		c->atlas_tex_width = w;
+		c->atlas_tex_height = h;
+	}
 }
 
 /*
@@ -10317,7 +10419,9 @@ comp_gl_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_seg
 		os_mutex_lock(&c->dp_swap_mutex);
 		const bool hub_on = c->hub.active;
 		if (hub_on) {
-			hub_ok = comp_hub_d3d11_get_segment_metrics(c->hub.split, out) && out->count > 0;
+			// ADR-047 Amendment 10: a valid effective table is an answer too.
+			(void)comp_hub_d3d11_get_segment_metrics(c->hub.split, out);
+			hub_ok = out->count > 0 || out->table.valid;
 		}
 		os_mutex_unlock(&c->dp_swap_mutex);
 		if (hub_on) {
@@ -10344,7 +10448,9 @@ comp_gl_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_seg
 		}
 	}
 	os_mutex_unlock(&c->seg_pub_mutex);
-	return out->count > 0;
+	// ADR-047 Amendment 10: a valid effective table is an answer too (the
+	// window wholly back on the session screen during the dwell).
+	return out->count > 0 || out->table.valid;
 #else
 	(void)xc;
 	return false;

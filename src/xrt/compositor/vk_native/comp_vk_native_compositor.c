@@ -32,6 +32,7 @@
 #include "util/comp_lazy_transparency.h"
 #include "util/comp_segments.h"
 #include "util/comp_segments_route.h"
+#include "util/comp_segments_view_size.h"
 #include "util/comp_weave_screens.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
@@ -13496,21 +13497,26 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	 * geometry is overlaid.
 	 */
 	struct xrt_rendering_mode frame_mode_eff;
-	if (frame_mode != NULL && c->segments != NULL && !c->legacy_app_tile_scaling) {
+#ifdef XRT_OS_WINDOWS
+	// #918 VK-1: under the split the D3D11 weave segments the window and
+	// computes the effective table (comp_hub_d3d11_set_view_size_policy).
+	if (c->split != NULL) {
+		comp_hub_d3d11_set_view_size_policy(c->split, !c->legacy_app_tile_scaling, c->mode_fill_views);
+		if (frame_mode != NULL && !c->legacy_app_tile_scaling) {
+			const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+			struct xrt_effective_mode_table eff;
+			if (comp_hub_d3d11_get_effective_table(c->split, &eff) &&
+			    comp_segments_view_size_overlay_mode(frame_mode, &eff, idx, &frame_mode_eff)) {
+				frame_mode = &frame_mode_eff;
+			}
+		}
+	} else
+#endif
+	    if (frame_mode != NULL && c->segments != NULL && !c->legacy_app_tile_scaling) {
 		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		struct xrt_effective_mode_table eff;
-		if (idx < 2 && comp_vk_native_segments_get_effective_table(c->segments, &eff)) {
-			frame_mode_eff = *frame_mode;
-			const struct xrt_effective_mode_slot *e = &eff.slot[idx];
-			frame_mode_eff.view_count = e->view_count;
-			frame_mode_eff.tile_columns = e->tile_columns;
-			frame_mode_eff.tile_rows = e->tile_rows;
-			frame_mode_eff.view_scale_x = e->view_scale_x;
-			frame_mode_eff.view_scale_y = e->view_scale_y;
-			frame_mode_eff.view_width_pixels = e->view_width_pixels;
-			frame_mode_eff.view_height_pixels = e->view_height_pixels;
-			frame_mode_eff.atlas_width_pixels = e->tile_columns * e->view_width_pixels;
-			frame_mode_eff.atlas_height_pixels = e->tile_rows * e->view_height_pixels;
+		if (comp_vk_native_segments_get_effective_table(c->segments, &eff) &&
+		    comp_segments_view_size_overlay_mode(frame_mode, &eff, idx, &frame_mode_eff)) {
 			frame_mode = &frame_mode_eff;
 		}
 	}
@@ -19296,7 +19302,9 @@ comp_vk_native_compositor_get_segment_metrics(struct xrt_compositor *xc, struct 
 	// adapter, which segments with its own manager and publishes its own
 	// table (eyes filled per query, like below).
 	if (c->split != NULL) {
-		return comp_hub_d3d11_get_segment_metrics(c->split, out) && out->count > 0;
+		// ADR-047 Amendment 10: a valid effective table is an answer too.
+		(void)comp_hub_d3d11_get_segment_metrics(c->split, out);
+		return out->count > 0 || out->table.valid;
 	}
 #endif
 	os_mutex_lock(&c->seg_pub_mutex);
@@ -19313,7 +19321,11 @@ comp_vk_native_compositor_get_segment_metrics(struct xrt_compositor *xc, struct 
 		}
 	}
 	os_mutex_unlock(&c->seg_pub_mutex);
-	return out->count > 0;
+	// ADR-047 Amendment 10: a valid effective table is an answer too - the
+	// window wholly back on the session screen keeps the covered screens'
+	// table for the dwell, and the app must be told the table the atlas is
+	// laid out from.
+	return out->count > 0 || out->table.valid;
 #else
 	(void)xc;
 	return false;

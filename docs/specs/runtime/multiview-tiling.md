@@ -382,14 +382,15 @@ entry (that screen shows the window flat). The covered set and the majority pass
 `u_screen_modes_dwell` first: a new set must hold 0.5 s; the majority moves only past a 20 %
 margin of the window's on-screen area.
 
-**The compositor follows the table it told the app.** vk_native overlays the effective slot's
-tiles and scale on the frame's mode (`frame_mode_eff`), so the renderer's atlas layout and view
-size are the app's; each **non-primary** segment's DP input is cropped as **its own screen's**
-entry for the app's slot (`comp_segments_view_size_segment_grid`): a one-view entry gets the first
-view in one tile, an entry the atlas cannot fill gets one tile and entry 0 (2D), otherwise the
-entry's own grid filled with the session's first views. The DP is told which entry to draw through
-`xrt_display_processor_vk::set_output_entry` (in its plug-in's per-monitor numbering) before the
-`process_atlas` that hands it that grid. The primary segment keeps the session grid, which is the
+**The compositor follows the table it told the app.** vk_native and the Windows in-process D3D11 /
+D3D12 / GL compositors overlay the effective slot's tiles and scale on the frame's mode
+(`comp_segments_view_size_overlay_mode`), so the renderer's atlas layout and view size are the
+app's; each **non-primary** segment's DP input is cropped as **its own screen's** entry for the
+app's slot (`comp_segments_view_size_segment_grid`): a one-view entry gets the first view in one
+tile, an entry the atlas cannot fill gets one tile and entry 0 (2D), otherwise the entry's own grid
+filled with the session's first views. The DP is told which entry to draw through the
+`set_output_entry` slot of its API's DP vtable (VK, D3D11, D3D12, GL; in its plug-in's per-monitor
+numbering) before the `process_atlas` that hands it that grid. The primary segment keeps the session grid, which is the
 head device's entry.
 
 **Sizing over every screen.** The worst-case atlas and the largest per-view rect are the

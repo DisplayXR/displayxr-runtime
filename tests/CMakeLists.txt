@@ -1625,6 +1625,8 @@ target_link_libraries(tests_comp_rear_budget PRIVATE xrt-interfaces aux_os xrt-e
 target_sources(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
 # ADR-047 Amendment 10: comp_segments_view_size.h (header-only) next to the pure screen-mode rules.
 target_include_directories(tests_u_screen_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# ADR-047 Amendment 10: comp_segments_view_size_update_for_window cuts its own table (comp_segments_compute).
+target_sources(tests_u_screen_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
 target_include_directories(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_link_libraries(tests_comp_segments PRIVATE xrt-interfaces aux_util)
 

@@ -69,6 +69,7 @@
 
 #include "os/os_threading.h"
 #include "util/comp_segments.h"
+#include "util/comp_segments_view_size.h"
 #include "util/comp_texture_target_win32.h" // #1575: the window read under a per-monitor-v2 pin
 #include "util/comp_dp_windowless_d3d11.h" // #2370 client-presents: the windowless DP rule
 #include "util/comp_frame_witness.h"       // #2370 client-presents: no target, so its own witness
@@ -550,6 +551,11 @@ struct comp_hub_d3d11
 	//! app thread's xrLocateViews. Taken before @ref dp_mutex, never after.
 	struct os_mutex seg_mutex;
 	struct xrt_segment_metrics seg_pub; //!< the table the last weave took (count 0 = one view set)
+	//! ADR-047 Amendment 10: compute the effective table and crop each
+	//! non-primary segment as its screen's entry (off for a legacy app), and
+	//! the session's view-set capacity (comp_hub_d3d11_set_view_size_policy).
+	bool vs_on;
+	uint32_t vs_max_views;
 	//! #1883: the partition staged for the next submit, and each submitted
 	//! frame's partition keyed by its bridge sequence (the egress slot lags).
 	struct comp_segments_content seg_content_staged;
@@ -1485,6 +1491,19 @@ split_segments_release(struct comp_hub_d3d11 *s)
 }
 
 /*!
+ * ADR-047 Amendment 10: each non-primary segment is cropped and drawn as its
+ * own screen's entry for the app's slot (off for a legacy app, see
+ * comp_hub_d3d11_set_view_size_policy).
+ */
+static void
+split_seg_frame_entries(const struct comp_hub_d3d11 *s, struct comp_d3d11_segments_frame *sf)
+{
+	sf->screen_entries = s->vs_on;
+	sf->active_slot =
+	    (s->xdev != nullptr && s->xdev->hmd != nullptr) ? s->xdev->hmd->active_rendering_mode_index : 0;
+}
+
+/*!
  * One metric update for the segment manager, run on the weave thread before
  * any per-frame DP input is sent (a window-handle hand-off may swap @ref dp).
  * Builds the manager on the OUTPUT device on first use or after
@@ -1588,6 +1607,18 @@ split_segments_update(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h, 
 			// where the window's part is hidden (#2671).
 			comp_d3d11_segments_set_visibility(s->segments, s->vis);
 			comp_d3d11_segments_set_display_mode(s->segments, split_lens_3d(s));
+			// ADR-047 Amendment 10: the view size follows the window's
+			// screen. On every weave with a placed window, also the ones
+			// that do not split, so the size follows the window back.
+			if (s->vs_on && s->xdev != nullptr) {
+				const uint32_t cap_w =
+				    s->seg_sys_info != nullptr ? s->seg_sys_info->atlas_width_pixels : 0;
+				const uint32_t cap_h =
+				    s->seg_sys_info != nullptr ? s->seg_sys_info->atlas_height_pixels : 0;
+				(void)comp_d3d11_segments_update_view_size(
+				    s->segments, &win, &canvas, s->xdev->rendering_modes, s->xdev->rendering_mode_count,
+				    s->vs_max_views, cap_w, cap_h);
+			}
 		}
 	}
 	// #2247: the primary screen's lens follows coverage too (edges only).
@@ -1600,6 +1631,9 @@ split_segments_update(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h, 
 		const struct comp_seg_rect canvas = {0, 0, win.w < tgt_w ? win.w : tgt_w,
 		                                     win.h < tgt_h ? win.h : tgt_h};
 		(void)comp_d3d11_segments_get_metrics(s->segments, &win, &canvas, s->dp != nullptr, &m);
+	}
+	if (s->vs_on) {
+		(void)comp_d3d11_segments_get_effective_table(s->segments, &m.table);
 	}
 	os_mutex_lock(&s->seg_mutex);
 	m.generation = s->seg_pub.generation;
@@ -1712,7 +1746,35 @@ comp_hub_d3d11_get_segment_metrics(struct comp_hub_d3d11 *s, struct xrt_segment_
 		}
 	}
 	os_mutex_unlock(&s->seg_mutex);
-	return out->count > 0;
+	// ADR-047 Amendment 10: a valid effective table is an answer too (the
+	// window wholly back on the session screen during the dwell).
+	return out->count > 0 || out->table.valid;
+}
+
+extern "C" void
+comp_hub_d3d11_set_view_size_policy(struct comp_hub_d3d11 *s, bool on, uint32_t max_views)
+{
+	if (s == nullptr) {
+		return;
+	}
+	s->vs_on = on;
+	s->vs_max_views = max_views;
+}
+
+extern "C" bool
+comp_hub_d3d11_get_effective_table(struct comp_hub_d3d11 *s, struct xrt_effective_mode_table *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (s == nullptr || !s->mutexes_init) {
+		return false;
+	}
+	os_mutex_lock(&s->seg_mutex);
+	*out = s->seg_pub.table;
+	os_mutex_unlock(&s->seg_mutex);
+	return out->valid;
 }
 
 
@@ -4917,6 +4979,7 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		sf.atlas_encoding = -1;
 		sf.primary_dp = s->dp;
 		sf.outcomp = split_ensure_outcomp(s) ? s->outcomp : nullptr;
+		split_seg_frame_entries(s, &sf); // ADR-047 Amendment 10
 		(void)comp_d3d11_segments_record(s->segments, &sf);
 		comp_d3d11_target_bind(s->target);
 	} else {
@@ -5088,6 +5151,7 @@ split_weave_client(struct comp_hub_d3d11 *s, bool is_repaint)
 		sf.atlas_encoding = -1;
 		sf.primary_dp = s->dp;
 		sf.outcomp = split_ensure_outcomp(s) ? s->outcomp : nullptr;
+		split_seg_frame_entries(s, &sf); // ADR-047 Amendment 10
 		sf.client_presents = true; // the caller presents the texture
 		sf.out_any_flat = &any_flat;
 		(void)comp_d3d11_segments_record(s->segments, &sf);
@@ -5565,6 +5629,7 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		sf.atlas_encoding = -1; // the split declares none to its own DP either
 		sf.primary_dp = s->dp;
 		sf.outcomp = split_ensure_outcomp(s) ? s->outcomp : nullptr;
+		split_seg_frame_entries(s, &sf); // ADR-047 Amendment 10
 		(void)comp_d3d11_segments_record(s->segments, &sf);
 		// Everything after sees the state the single-DP path leaves.
 		comp_d3d11_target_bind(s->target);
@@ -6689,6 +6754,24 @@ comp_hub_d3d11_stage_segment_content(struct comp_hub_d3d11 *split, const struct 
 
 extern "C" bool
 comp_hub_d3d11_get_segment_metrics(struct comp_hub_d3d11 *split, struct xrt_segment_metrics *out)
+{
+	(void)split;
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+	}
+	return false;
+}
+
+extern "C" void
+comp_hub_d3d11_set_view_size_policy(struct comp_hub_d3d11 *split, bool on, uint32_t max_views)
+{
+	(void)split;
+	(void)on;
+	(void)max_views;
+}
+
+extern "C" bool
+comp_hub_d3d11_get_effective_table(struct comp_hub_d3d11 *split, struct xrt_effective_mode_table *out)
 {
 	(void)split;
 	if (out != NULL) {

@@ -30,7 +30,7 @@
 static_assert(offsetof(xrt_display_processor_d3d11, accepts_atlas_encoding) ==
               offsetof(xrt_display_processor_d3d11, get_eye_positions_at) + sizeof(void *));
 static_assert(offsetof(xrt_display_processor_d3d11, accepts_atlas_encoding) + sizeof(void *) ==
-              sizeof(xrt_display_processor_d3d11));
+              offsetof(xrt_display_processor_d3d11, set_output_entry)); // ADR-047 Amendment 10 appended it
 // Vulkan: appended to the variant after get_eye_positions_at, and the embedded
 // base did not grow (a base append would move every variant slot).
 static_assert(offsetof(xrt_display_processor_vk, accepts_atlas_encoding) ==

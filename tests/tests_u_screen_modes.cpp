@@ -432,6 +432,137 @@ TEST_CASE("screen modes: the registry re-reads choices, bumps its generation, an
 	u_screen_modes_clear();
 }
 
+TEST_CASE("screen modes: the frame's mode overlays the effective slot's geometry, keeps the app's lens state")
+{
+	// The head device's 3D mode (a lenticular panel's 2 x 1).
+	xrt_rendering_mode head3d = mode("3D", 2, 0.5f, 1.0f, 2, 1, true, XRT_RENDERING_MODE_FLAG_HAS_TRACKING);
+	head3d.mode_index = 1;
+	head3d.view_width_pixels = 1920;
+	head3d.view_height_pixels = 2160;
+
+	// The window is on a sim screen whose 3D slot is Anaglyph at half scale.
+	xrt_effective_mode_table eff;
+	std::memset(&eff, 0, sizeof(eff));
+	eff.valid = true;
+	eff.slot[1].view_count = 2;
+	eff.slot[1].tile_columns = 2;
+	eff.slot[1].tile_rows = 1;
+	eff.slot[1].view_scale_x = 0.5f;
+	eff.slot[1].view_scale_y = 0.5f;
+	eff.slot[1].view_width_pixels = 1440;
+	eff.slot[1].view_height_pixels = 900;
+	eff.slot[1].hardware_display_3d = false;
+	std::snprintf(eff.slot[1].mode_name, sizeof(eff.slot[1].mode_name), "%s", "Anaglyph");
+
+	xrt_rendering_mode out;
+	REQUIRE(comp_segments_view_size_overlay_mode(&head3d, &eff, 1, &out));
+	CHECK(out.view_count == 2);
+	CHECK(out.tile_columns == 2);
+	CHECK(out.tile_rows == 1);
+	CHECK(out.view_scale_y == 0.5f);
+	CHECK(out.view_width_pixels == 1440);
+	CHECK(out.view_height_pixels == 900);
+	CHECK(out.atlas_width_pixels == 2880);
+	CHECK(out.atlas_height_pixels == 900);
+	// The lens state and identity stay the app's slot's (the head device's).
+	CHECK(out.hardware_display_3d);
+	CHECK(out.mode_index == 1);
+	CHECK(out.mode_flags == XRT_RENDERING_MODE_FLAG_HAS_TRACKING);
+	CHECK(std::string(out.mode_name) == "3D");
+
+	// Invalid table, or a slot past the two: the frame keeps its mode.
+	xrt_rendering_mode untouched = head3d;
+	CHECK_FALSE(comp_segments_view_size_overlay_mode(&head3d, &eff, 2, &untouched));
+	eff.valid = false;
+	CHECK_FALSE(comp_segments_view_size_overlay_mode(&head3d, &eff, 1, &untouched));
+	CHECK(untouched.view_width_pixels == 1920);
+	CHECK_FALSE(comp_segments_view_size_overlay_mode(nullptr, &eff, 1, &untouched));
+}
+
+TEST_CASE("screen modes: a segment's crop takes the session's first views into its own grid")
+{
+	uint32_t sc = 0, sr = 0, dc = 0, dr = 0;
+	// The session grid (no entry of its own): identity.
+	comp_segments_segment_grid same = comp_segments_view_size_segment_grid(nullptr, 2, 2);
+	for (uint32_t v = 0; v < same.views; v++) {
+		comp_segments_view_size_tile_map(&same, 2, v, &sc, &sr, &dc, &dr);
+		CHECK(sc == dc);
+		CHECK(sr == dr);
+	}
+	// A 4 x 1 session atlas cut into a 2 x 2 screen entry: view 2 moves
+	// from (2, 0) to (0, 1).
+	xrt_rendering_mode quad = mode("Quad", 4, 0.5f, 0.5f, 2, 2, true);
+	comp_segments_segment_grid g = comp_segments_view_size_segment_grid(&quad, 4, 1);
+	REQUIRE(g.views == 4);
+	comp_segments_view_size_tile_map(&g, 4, 2, &sc, &sr, &dc, &dr);
+	CHECK(sc == 2);
+	CHECK(sr == 0);
+	CHECK(dc == 0);
+	CHECK(dr == 1);
+	// A one-view entry (Same as 2D) takes the first view only.
+	xrt_rendering_mode same2d =
+	    mode("Same as 2D", 1, 1.0f, 1.0f, 1, 1, false, XRT_RENDERING_MODE_FLAG_3D_PASSTHROUGH);
+	same2d.mode_index = 1;
+	g = comp_segments_view_size_segment_grid(&same2d, 2, 1);
+	REQUIRE(g.views == 1);
+	CHECK(g.entry == 1);
+	comp_segments_view_size_tile_map(&g, 2, 0, &sc, &sr, &dc, &dr);
+	CHECK(sc == 0);
+	CHECK(dc == 0);
+}
+
+TEST_CASE("screen modes: a manager follows the window from its desktop rect (the D3D11 / D3D12 / GL glue)")
+{
+	u_screen_modes_clear();
+	// Screen 1: the session's panel (primary) at 0,0; screen 7: a sim monitor to its right.
+	u_screen_mode_table tables[2] = {panel_table(1, 3840, 2160), sim_table(7, 2880, 1800)};
+	u_screen_modes_publish(tables, 2);
+
+	comp_segments_screen screens[2];
+	std::memset(screens, 0, sizeof(screens));
+	screens[0].id = 1;
+	screens[0].is_primary = true;
+	screens[0].desktop = {0, 0, 3840, 2160};
+	screens[1].id = 7;
+	screens[1].desktop = {3840, 0, 2880, 1800};
+	xrt_rendering_mode head[2] = {mode("2D", 1, 1.0f, 1.0f, 1, 1, false), mode("3D", 2, 0.5f, 1.0f, 2, 1, true)};
+
+	comp_segments_view_size vs;
+	comp_segments_view_size_init(&vs);
+	const uint64_t ms = 1000ull * 1000ull;
+	const comp_seg_rect on_panel = {100, 100, 1280, 720};
+	const comp_seg_rect canvas = {0, 0, 1280, 720};
+	CHECK_FALSE(
+	    comp_segments_view_size_update_for_window(&vs, &on_panel, &canvas, screens, 2, head, 2, 2, 7680, 2160, 0));
+	CHECK_FALSE(vs.eff.valid); // the head's table stands
+
+	// Wholly on the sim monitor: its table, after the 0.5 s dwell.
+	const comp_seg_rect on_sim = {4000, 100, 1280, 720};
+	CHECK_FALSE(comp_segments_view_size_update_for_window(&vs, &on_sim, &canvas, screens, 2, head, 2, 2, 7680, 2160,
+	                                                      100 * ms));
+	CHECK(comp_segments_view_size_update_for_window(&vs, &on_sim, &canvas, screens, 2, head, 2, 2, 7680, 2160,
+	                                                700 * ms));
+	REQUIRE(vs.eff.valid);
+	CHECK(vs.eff.majority_screen_id == 7);
+	CHECK(std::string(vs.eff.slot[1].mode_name) == "Same as 2D");
+	CHECK(vs.eff.slot[1].view_count == 1);
+	// Its segment DP is told entry 1 (Same as 2D) for slot 1.
+	const comp_segments_segment_grid g =
+	    comp_segments_view_size_segment_grid(comp_segments_view_size_entry(&vs, 1, 1), 2, 1);
+	CHECK(g.entry == 1);
+	CHECK(g.views == 1);
+
+	// Back on the panel: the covered screens' table holds for the dwell, then
+	// the head's table stands again.
+	CHECK_FALSE(comp_segments_view_size_update_for_window(&vs, &on_panel, &canvas, screens, 2, head, 2, 2, 7680,
+	                                                      2160, 800 * ms));
+	CHECK(vs.eff.valid);
+	CHECK(comp_segments_view_size_update_for_window(&vs, &on_panel, &canvas, screens, 2, head, 2, 2, 7680, 2160,
+	                                                1400 * ms));
+	CHECK_FALSE(vs.eff.valid);
+	u_screen_modes_clear();
+}
+
 #ifndef _WIN32
 #include "util/u_setting.h"
 #include <cstdlib>

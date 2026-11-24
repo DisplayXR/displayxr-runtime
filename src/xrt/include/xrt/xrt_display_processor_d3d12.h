@@ -604,6 +604,31 @@ struct xrt_display_processor_d3d12
 	                         int32_t target_y,
 	                         int32_t *out_x,
 	                         int32_t *out_y);
+
+	/*!
+	 * Which declared rendering-mode entry this DP draws (ADR-047 Amendment
+	 * 10): @p mode_index is an index of the list the owning plug-in answered
+	 * through `xrt_plugin_iface::get_rendering_modes_for_monitor` for this
+	 * DP's screen, in that list's own order (0 = the flat 2D entry). The
+	 * runtime calls it on a segment DP made by a `create_dp_d3d12_for_screen`
+	 * factory whenever that screen's entry for the app's current slot
+	 * changes (the app moved between 2D and 3D, or the user picked another
+	 * per-screen 3D mode), before the next `process_atlas`, which then hands
+	 * the DP an atlas laid out as that entry's `tile_columns` x `tile_rows`.
+	 * A DP with this slot set draws that entry whatever the process-wide
+	 * state of its plug-in says, so two screens of one plug-in can show two
+	 * different 3D modes at once. The D3D12 twin of
+	 * xrt_display_processor_vk::set_output_entry.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹
+	 * the DP draws what it always drew for the atlas it is handed. Appended
+	 * after @ref snap_window_rect per ADR-020 (append-only within a major; no version
+	 * bump), announced by XRT_DP_D3D12_HAS_OUTPUT_ENTRY.
+	 *
+	 * @param xdp         Pointer to self.
+	 * @param mode_index  The entry to draw, in the plug-in's per-monitor numbering.
+	 */
+	void (*set_output_entry)(struct xrt_display_processor_d3d12 *xdp, uint32_t mode_index);
 };
 
 
@@ -678,7 +703,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, get_background_pr
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, set_present_origin)     == XRT_DP_D3D12_BASE_OFF + 24 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, get_eye_positions_at)   == XRT_DP_D3D12_BASE_OFF + 25 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, snap_window_rect)       == XRT_DP_D3D12_BASE_OFF + 26 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d12)                                == XRT_DP_D3D12_BASE_OFF + 27 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, set_output_entry)       == XRT_DP_D3D12_BASE_OFF + 27 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d12)                                == XRT_DP_D3D12_BASE_OFF + 28 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the get_background_preview slot, so a
@@ -722,6 +748,14 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d12)                    
  * runtime can #ifdef-guard its implementation. Purely additive (ADR-020).
  */
 #define XRT_DP_D3D12_HAS_SNAP_WINDOW_RECT 1
+
+/*!
+ * Defined when this header carries the set_output_entry slot (ADR-047
+ * Amendment 10, a screen's own rendering-mode entry), so a plug-in built
+ * against an older runtime can #ifdef-guard its implementation. Purely
+ * additive (ADR-020).
+ */
+#define XRT_DP_D3D12_HAS_OUTPUT_ENTRY 1
 
 // clang-format on
 
@@ -1291,6 +1325,24 @@ xrt_display_processor_d3d12_phases_from_present_origin(struct xrt_display_proces
 		return false;
 	}
 	return (caps.flags & XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN) != 0;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d12::set_output_entry
+ *
+ * Returns false if not supported (NULL DP, absent slot or NULL): the DP then
+ * draws what it always drew for the atlas it is handed.
+ *
+ * @public @memberof xrt_display_processor_d3d12
+ */
+static inline bool
+xrt_display_processor_d3d12_set_output_entry(struct xrt_display_processor_d3d12 *xdp, uint32_t mode_index)
+{
+	if (xdp == NULL || !XRT_DP_HAS_SLOT(xdp, set_output_entry) || xdp->set_output_entry == NULL) {
+		return false;
+	}
+	xdp->set_output_entry(xdp, mode_index);
+	return true;
 }
 
 #ifdef __cplusplus

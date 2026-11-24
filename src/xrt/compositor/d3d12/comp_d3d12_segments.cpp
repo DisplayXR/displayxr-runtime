@@ -29,6 +29,7 @@
 #include "comp_d3d12_segments.h"
 
 #include "comp_d3d12_renderer.h"
+#include "util/comp_segments_view_size.h"
 #include "d3d/d3d_dxgi_formats.h"
 #include "os/os_threading.h"
 #include "os/os_time.h"
@@ -75,6 +76,9 @@ struct seg_screen_state
 	//! #2671: the window's part on this screen was hidden at the last set_display_mode.
 	bool vis_hidden;
 	bool tolerates_resample;
+	//! ADR-047 Amendment 10: the entry last told to @ref dp through
+	//! set_output_entry, plus one (0 = never told).
+	int32_t entry_sent_plus1;
 	struct seg_crop crop;
 	//! #2218 (#4): the zone mask cropped to this segment, and whether this DP
 	//! currently holds a publish; zone_caps 0 = unqueried, 1 = supported, 2 = no.
@@ -114,6 +118,15 @@ struct comp_d3d12_segments
 
 	bool mode_3d;
 	uint32_t mode_index;
+
+	/*!
+	 * ADR-047 Amendment 10: the view size follows the window's screen — the
+	 * covered screens after the dwell, each screen's own table, and the
+	 * effective table the app is told. Written on the weave thread
+	 * (update_view_size), read by the app thread under @ref dp_mutex
+	 * (get_effective_table).
+	 */
+	struct comp_segments_view_size vs;
 
 	//! #2218 (#4): a private one-shot list for the per-segment mask crops. The
 	//! zone-mask sync runs AFTER the weave's fence wait, when the weave list is
@@ -242,6 +255,7 @@ dp_release(struct comp_d3d12_segments *segs, uint32_t i)
 	st->mode_sent = -1;
 	st->uncovered = false;
 	st->tolerates_resample = false;
+	st->entry_sent_plus1 = 0;
 	crop_destroy(&st->crop);
 	// #2218 (#4): the DP is gone, and with it its publish.
 	crop_destroy(&st->mask_crop);
@@ -352,6 +366,7 @@ comp_d3d12_segments_create(void *d3d12_device, void *d3d12_queue)
 	os_mutex_init(&segs->dp_mutex);
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
 	comp_segments_cover_dwell_init(&segs->cover, 0);
+	comp_segments_view_size_init(&segs->vs);
 	segs->mode_index = UINT32_MAX;
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		segs->st[i].transparent_latched = -1;
@@ -405,6 +420,9 @@ comp_d3d12_segments_set_screens(struct comp_d3d12_segments *segs,
 	}
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
 	comp_segments_cover_dwell_init(&segs->cover, 0);
+	os_mutex_lock(&segs->dp_mutex);
+	comp_segments_view_size_init(&segs->vs); // new screens: re-read every table
+	os_mutex_unlock(&segs->dp_mutex);
 	segs->enabled = false;
 	segs->screen_count = 0;
 	segs->have_logged_table = false;
@@ -858,9 +876,18 @@ comp_d3d12_segments_record(struct comp_d3d12_segments *segs, const struct comp_d
 	bool weave[COMP_SEGMENTS_MAX] = {};
 	struct comp_seg_rect tile[COMP_SEGMENTS_MAX] = {};
 	bool have_tile[COMP_SEGMENTS_MAX] = {};
+	// ADR-047 Amendment 10: each non-primary segment's DP input is laid out
+	// as ITS screen's entry for the app's slot (the primary keeps the
+	// session grid, which is the head device's entry).
+	struct comp_segments_segment_grid grid[COMP_SEGMENTS_MAX];
 
 	for (uint32_t k = 0; k < t->count; k++) {
 		const struct comp_segment *g = &t->seg[k];
+		grid[k] = comp_segments_view_size_segment_grid(
+		    (f->screen_entries && !g->is_primary)
+		        ? comp_segments_view_size_entry(&segs->vs, g->screen_index, f->active_slot)
+		        : nullptr,
+		    f->tile_columns, f->tile_rows);
 		// #1883: where THIS segment's views were painted — for a routed
 		// frame the partition it was located for, not the live seam.
 		have_tile[k] =
@@ -901,8 +928,8 @@ comp_d3d12_segments_record(struct comp_d3d12_segments *segs, const struct comp_d
 			continue;
 		}
 		struct seg_crop *crop = &st_of[k]->crop;
-		const uint32_t cw = tile[k].w * f->tile_columns;
-		const uint32_t ch = tile[k].h * f->tile_rows;
+		const uint32_t cw = tile[k].w * grid[k].cols;
+		const uint32_t ch = tile[k].h * grid[k].rows;
 		if (!crop_ensure(segs->device, crop, cw, ch, src_desc.Format)) {
 			weave[k] = false; // no input image: flat 2D instead
 			continue;
@@ -918,17 +945,20 @@ comp_d3d12_segments_record(struct comp_d3d12_segments *segs, const struct comp_d
 		D3D12_TEXTURE_COPY_LOCATION src_loc = {};
 		src_loc.pResource = src;
 		src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-		for (uint32_t row = 0; row < f->tile_rows; row++) {
-			for (uint32_t col = 0; col < f->tile_columns; col++) {
-				D3D12_BOX box = {};
-				box.left = col * f->view_width + (UINT)tile[k].x;
-				box.top = row * f->view_height + (UINT)tile[k].y;
-				box.right = box.left + tile[k].w;
-				box.bottom = box.top + tile[k].h;
-				box.front = 0;
-				box.back = 1;
-				cl->CopyTextureRegion(&dst_loc, col * tile[k].w, row * tile[k].h, 0, &src_loc, &box);
-			}
+		// Segment tile v takes the session's view v: the first grid[k].views
+		// views, laid out in the segment's own grid (ADR-047 Amendment 10;
+		// the session's own grid when the segment has no entry of its own).
+		for (uint32_t v = 0; v < grid[k].views; v++) {
+			uint32_t scol = 0, srow = 0, dcol = 0, drow = 0;
+			comp_segments_view_size_tile_map(&grid[k], f->tile_columns, v, &scol, &srow, &dcol, &drow);
+			D3D12_BOX box = {};
+			box.left = scol * f->view_width + (UINT)tile[k].x;
+			box.top = srow * f->view_height + (UINT)tile[k].y;
+			box.right = box.left + tile[k].w;
+			box.bottom = box.top + tile[k].h;
+			box.front = 0;
+			box.back = 1;
+			cl->CopyTextureRegion(&dst_loc, dcol * tile[k].w, drow * tile[k].h, 0, &src_loc, &box);
 		}
 		transition(cl, crop->texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
 	}
@@ -966,6 +996,19 @@ comp_d3d12_segments_record(struct comp_d3d12_segments *segs, const struct comp_d
 					st->mode_sent = (int)segs->mode_3d;
 					xrt_display_processor_d3d12_request_display_mode(dp, segs->mode_3d);
 				}
+				// ADR-047 Amendment 10: which of its screen's entries to
+				// draw, on change only (the app moved 2D <-> 3D, or the
+				// user picked another 3D mode for this screen).
+				if (grid[k].entry >= 0 && st->entry_sent_plus1 != grid[k].entry + 1) {
+					st->entry_sent_plus1 = grid[k].entry + 1;
+					if (!xrt_display_processor_d3d12_set_output_entry(dp,
+					                                                  (uint32_t)grid[k].entry)) {
+						U_LOG_I(
+						    "segments: screen 0x%016llx's DP has no set_output_entry slot - it "
+						    "draws its default for a %ux%u atlas",
+						    (unsigned long long)g->screen_id, grid[k].cols, grid[k].rows);
+					}
+				}
 				// Phase only where window px ARE device px; a resampled
 				// screen's origin is in the wrong units (and only a
 				// resample-tolerant DP weaves there, which has no phase).
@@ -980,7 +1023,7 @@ comp_d3d12_segments_record(struct comp_d3d12_segments *segs, const struct comp_d
 			set_viewport_scissor(cl, &g->window_rect);
 			xrt_display_processor_d3d12_process_atlas(
 			    dp, cl, st->crop.texture, srv, f->target_rtv, f->target_resource, tile[k].w, tile[k].h,
-			    f->tile_columns, f->tile_rows, f->src_format, f->target_width, f->target_height,
+			    grid[k].cols, grid[k].rows, f->src_format, f->target_width, f->target_height,
 			    g->window_rect.x, g->window_rect.y, g->window_rect.w, g->window_rect.h);
 			any_woven = true;
 		}
@@ -1100,6 +1143,54 @@ comp_d3d12_segments_primary_covered(const struct comp_d3d12_segments *segs)
 		}
 	}
 	return true;
+}
+
+extern "C" bool
+comp_d3d12_segments_update_view_size(struct comp_d3d12_segments *segs,
+                                     const struct comp_seg_rect *window_desktop,
+                                     const struct comp_seg_rect *canvas,
+                                     const struct xrt_rendering_mode *head_modes,
+                                     uint32_t head_count,
+                                     uint32_t max_views,
+                                     uint32_t cap_w,
+                                     uint32_t cap_h)
+{
+	if (segs == nullptr || !segs->enabled || window_desktop == nullptr) {
+		return false;
+	}
+	// Computed on the weave thread's own copy; published under the lock.
+	struct comp_segments_view_size *next = U_TYPED_CALLOC(struct comp_segments_view_size);
+	if (next == nullptr) {
+		return false;
+	}
+	*next = segs->vs;
+	const bool changed = comp_segments_view_size_update_for_window(next, window_desktop, canvas, segs->screens,
+	                                                               segs->screen_count, head_modes, head_count,
+	                                                               max_views, cap_w, cap_h, os_monotonic_get_ns());
+	os_mutex_lock(&segs->dp_mutex);
+	segs->vs = *next;
+	os_mutex_unlock(&segs->dp_mutex);
+	if (changed) {
+		comp_segments_view_size_log_change(&next->eff);
+	}
+	free(next);
+	return changed;
+}
+
+extern "C" bool
+comp_d3d12_segments_get_effective_table(struct comp_d3d12_segments *segs, struct xrt_effective_mode_table *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (segs == nullptr) {
+		return false;
+	}
+	os_mutex_lock(&segs->dp_mutex);
+	*out = segs->vs.eff;
+	os_mutex_unlock(&segs->dp_mutex);
+	return out->valid;
 }
 
 extern "C" bool
