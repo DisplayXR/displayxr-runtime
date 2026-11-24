@@ -98,14 +98,13 @@ COMPONENT_INSTALL_MARKER_LINUX_conversion_open=""
 # here: without it the provider registers and reports ABSENT, and conversion
 # falls through to the open provider.
 #
-# OPT-IN (`--with leia-conversion`), never part of the default install, and
-# NOT RELEASED YET: versions.json has no `leia_conversion` field until the
-# first release's versions-bump dispatch adds it (versions-json-autobump.md,
-# "A component with no release yet"). Until then `--with leia-conversion`
-# warns and skips. The Windows glob is declared ahead of that release on
-# purpose: no bundle build reads this entry by name, so the "declare a glob
-# only after a release carries it" rule (same document) has nothing to trip.
-# The Linux .deb glob stays empty until a release carries one.
+# OPT-IN (`--with leia-conversion`), never part of the default install.
+# Released (first release v0.1.0): versions.json pins `leia_conversion`, so a
+# missing pin is an error, as for any other component.
+# The Linux .deb glob is EMPTY on purpose. The release does attach
+# displayxr-leia-conversion_<ver>_amd64.deb, but that package installs only
+# next to a Leia SR plug-in release that no longer carries the provider itself.
+# Set it to "displayxr-leia-conversion_*_amd64.deb" once `leia_plugin` pins one.
 COMPONENT_REPO_leia_conversion="DisplayXR/displayxr-leia-conversion"
 COMPONENT_PKG_MACOS_leia_conversion=""
 COMPONENT_EXE_WINDOWS_leia_conversion="DisplayXRLeiaConversionSetup-*.exe"
@@ -119,8 +118,14 @@ COMPONENT_INSTALL_MARKER_LINUX_leia_conversion=""
 # its own repo. Registers InputProviders\ultraleap (ProbeOrder 50). It needs the
 # Ultraleap tracking software and a camera, neither of which DisplayXR ships.
 #
-# OPT-IN (`--with ultraleap`) and NOT RELEASED YET, exactly as leia_conversion
-# above. One more constraint: a build is only known-good on the runtime release
+# OPT-IN (`--with ultraleap`) and NOT RELEASED YET: versions.json has no
+# `ultraleap` field until the first release's versions-bump dispatch adds it
+# (versions-json-autobump.md, "A component with no release yet"). Until then
+# `--with ultraleap` warns and skips. The Windows glob is declared ahead of
+# that release on purpose: no bundle build reads this entry by name, so the
+# "declare a glob only after a release carries it" rule (same document) has
+# nothing to trip. The Linux .deb glob stays empty until a release carries one.
+# One more constraint: a build is only known-good on the runtime release
 # it was built at (it returns raw struct xrt_device, ADR-063), and its installer
 # exits 3 on any other runtime, so `--with ultraleap` can fail on a box whose
 # runtime pin has moved on. That is the provider's own gate, not a bug here.
@@ -143,7 +148,7 @@ OPTIN_COMPONENTS="mcp:mcp_tools browser:browser leia-conversion:leia_conversion 
 # and a skip. Remove a name here once its field is in versions.json, so a
 # missing pin becomes an error again (keep in step with FIRST_RELEASE_FIELDS in
 # scripts/apply_versions_bump.py; scripts/tests/test_component_tables.py checks).
-COMPONENTS_AWAITING_FIRST_RELEASE="leia_conversion ultraleap"
+COMPONENTS_AWAITING_FIRST_RELEASE="ultraleap"
 
 # --- mcp_tools ---
 # displayxr-mcp ships a Windows installer (NSIS) and a macOS .pkg

@@ -756,7 +756,7 @@ Rules that follow from "never guessed":
 - No `license` is written for the Shell: none of the four licence classes says "free for
   non-commercial use", and the generator does not guess.
 - A component with no `versions.json` pin has no release yet and is not listed (and costs
-  no network access). `leia_conversion` and `ultraleap` are in that state today
+  no network access). `ultraleap` is in that state today; `leia_conversion` was until v0.1.0
   (versions-json-autobump.md, "A component with no release yet").
 - If the Ultraleap provider's runtime pin cannot be read at its tag, the item is **not
   listed at all**: without the range it would read as "works on any runtime".

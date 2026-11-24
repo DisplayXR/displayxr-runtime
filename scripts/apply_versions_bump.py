@@ -34,13 +34,15 @@ import sys
 
 # field -> the existing field it is inserted after (keeps related pins together).
 # Remove an entry once its field is in versions.json: from then on it is an
-# ordinary field and this table has nothing to say about it.
+# ordinary field and this table has nothing to say about it. `leia_conversion`
+# left this table that way (first release v0.1.0); it stays `ultraleap`'s
+# preferred neighbour, so the two providers sit together in the file.
 FIRST_RELEASE_FIELDS = {
-    "leia_conversion": "conversion_open",
     "ultraleap": "leia_conversion",
 }
 
-# Where a first-release field goes when its preferred neighbour is absent too.
+# Where a first-release field goes when its preferred neighbour is not in the
+# file (another first-release field that has not shipped, or a removed pin).
 FALLBACK_ANCHOR = "conversion_open"
 
 
