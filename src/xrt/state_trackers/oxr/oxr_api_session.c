@@ -1681,6 +1681,9 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	} else {
 		head->hmd->active_rendering_mode_index = modeIndex;
 	}
+	// This request reports its own change (step 5); the poll that reports a
+	// mode the compositor moved (#2801) must not report it a second time.
+	sess->last_rendering_mode_index = effectiveModeIndex;
 	struct xrt_rendering_mode *mode = &head->rendering_modes[effectiveModeIndex];
 	bool hardware_state_changed = (mode->hardware_display_3d != sess->hardware_display_3d);
 	U_LOG_I("HW3D_DBG request mode=%u eff=%u mode_hw3d=%d sess_hw3d=%d changed=%d vk_native=%d xmcc=%d bridge=%d",
