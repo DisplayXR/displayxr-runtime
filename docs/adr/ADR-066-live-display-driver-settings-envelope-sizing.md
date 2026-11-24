@@ -478,7 +478,7 @@ sim_display; the shape #2218's crossing test used).
 **Stage 1 — per-screen rendering everywhere.**
 - **Work:**
   - #2757 (an off-panel in-process Wayland window takes its own screen's segment: eyes + Kooima);
-  - its in-flight follow-up, in-process native Wayland windows woven per screen (today the
+  - #2791, in-process native Wayland windows woven per screen (before it the
     manager runs on Wayland but records nothing per segment and holds segment DPs 2D);
   - the open #2218 items that gate this design: #7 and #1b's IPC half (`CLIENT_TEXTURE` and pinned
     IPC clients woven per screen), #8 / #8b (a verified claim beats the global active plug-in), #10
@@ -497,6 +497,45 @@ sim_display; the shape #2218's crossing test used).
     screens.
   - *Windows:* #2218's two-vendor crossing test, plus a zones app and a `CLIENT_TEXTURE` client
     dragged across.
+
+**Stage 1b — every app kind on two screens (the validation gate for stage 1).**
+
+The multi-screen work to date was validated with the `cube_*` test apps only. The first run of a
+shipping demo across two screens (2026-11-23, #2791) found two defects the test apps hide:
+
+- **Apps that submit one view set.** The demos, through displayxr-common, derive their view count
+  from the rendering mode and chain neither `XrViewActivityStateDXR` nor
+  `XrViewDisplayBindingsDXR`. Routed as per-segment sets, their one set was drawn in every
+  segment. They now keep one view set, cropped per segment (#2791, state tracker, every platform).
+- **A straddling Wayland buffer.** It follows the compositor's preferred scale (the highest among
+  the outputs it touches), not its monitor's; the segments were cut in the wrong pixel space.
+
+So stage 1 is not done until this matrix passes. Each cell is three placements — **wholly on the
+3D panel, wholly on the other screen, straddling** (both majorities) — in 2D and in 3D.
+
+| app kind | Linux Wayland | Linux X11 | Windows | macOS |
+|---|---|---|---|---|
+| `cube_*` test apps (read the activity state) | in-process, forced IPC | in-process, forced IPC | every compositor | Metal, Vulkan |
+| demos on displayxr-common (one view set): modelviewer, mediaplayer, gaussiansplat, avatar, earthview | all | all | all | all |
+| the DisplayXR Browser (present-owner weave, zones) | yes | yes | yes | — |
+| engine plug-ins (Unity, Unreal; fixed stereo) | Unity | Unity | both | Unity |
+| legacy / `PRIMARY_STEREO` apps (`hello_xr`, the conformance suite's interactive tests) | yes | yes | yes | yes |
+| workspace clients under a controller (the Shell) | yes | yes | yes | yes |
+| `_texture` / `CLIENT_TEXTURE` clients | — | — | yes | Metal |
+
+- **The check is capture-based, not an eyeball.** Per cell: the atlas and per-segment DP-input
+  captures (`displayxr_atlas[.seg<k>].png`, or the weave engine's trio), a grab of each output
+  (on GNOME Wayland through the compositor's screen-cast service; the D3D11 service's
+  `workspace_screenshot` on Windows), and the log lines naming the screen and DP of each segment.
+  Pass means: each segment's DP input is its own part of the scene (the scene is continuous across
+  the seam), a part on a screen its DP can show 1:1 is drawn at 1:1, nothing is drawn outside its
+  segment, and the eyes of each part are its own screen's.
+- **A person looks only at what a capture cannot show:** depth quality on the panel, tracking feel,
+  flicker under motion.
+- **Decision this stage forces:** whether displayxr-common learns per-segment view sets (chain the
+  activity state and the bindings: correct perspective and full sharpness on each screen) or stays
+  on the one-set path (the majority screen's perspective, the other part resampled). Until it does,
+  every demo is a one-set app. Open question 10.
 
 **Stage 2 — Part B, the per-screen tracking setting.**
 - **Acceptance:**
@@ -565,3 +604,6 @@ sim_display; the shape #2218's crossing test used).
    cheap per-frame generation check.
 9. **A config pairing a different 2D entry**: should slot 0 be remappable at all, or always the
    declared list's entry 0?
+10. **Does displayxr-common adopt per-segment view sets** (`XrViewActivityStateDXR` +
+    `XrViewDisplayBindingsDXR`), so the demos get each screen's own perspective and sharpness when
+    straddling, or do the demos stay one-set apps? (Stage 1b.)
