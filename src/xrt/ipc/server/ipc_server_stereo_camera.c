@@ -638,6 +638,8 @@ struct scam_camera
 	//! A request the source still holds after we gave up on it (timeout): keep polling, discard.
 	bool still_orphan;
 	//! The still rectifier (camera thread only): maps for the last still size.
+	//! Spec v8: the rate each mode was MEASURED at once it ran (0 = not yet), Hz.
+	float mode_rate[XRT_STEREO_CAMERA_MAX_MODES];
 	bool still_rect_valid;
 	struct u_stereo_rectify_result still_geo;
 	struct u_stereo_rectify_lut still_lut[2];
@@ -3146,6 +3148,12 @@ publish_locked(struct ipc_server_stereo_camera *m,
 	set_state_locked(cam, XRT_STEREO_CAMERA_STATE_AVAILABLE);
 
 	if (u_stereo_camera_rate_meter_push(&cam->rate_meter, f->time_ns > 0 ? f->time_ns : now)) {
+		// Spec v8 §5.5: the measured rate of the mode these frames are (a mode's listed
+		// rate may be 0 = not known yet, or a device table that is wrong).
+		const int32_t mk = cam_find_mode(cam, f->width / 2, f->height, 0);
+		if (mk >= 0 && mk < XRT_STEREO_CAMERA_MAX_MODES) {
+			cam->mode_rate[mk] = cam->rate_meter.rate;
+		}
 		float adv = cam->info.max_frame_rate;
 		bool off = adv <= 0.0f || fabsf(cam->rate_meter.rate - adv) > 0.1f * adv;
 		if (!cam->rate_logged) {
@@ -3573,6 +3581,7 @@ still_produce(struct scam_camera *cam,
 	info->section_size = lay.size;
 	info->capture_time_ns = st->time_ns;
 	info->time_is_exposure = st->time_is_exposure ? 1u : 0u;
+	info->flags = st->flags & XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE; // e.g. a per-lens JPEG
 	info->result.valid_fields = pr->valid_fields & 0x1Fu;
 	info->result.focus_distance_diopters = pr->focus_distance_diopters;
 	info->result.focus_state = pr->focus_state;
@@ -4336,6 +4345,13 @@ candidate_v8_build(struct ipc_server_stereo_camera *m, struct scam_candidate *c)
 				k->supported_controls &=
 				    ~(uint32_t)XRT_PLUGIN_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION;
 			}
+			// What the source holds with no focus control set (a pair whose own AF is
+			// unusable picks a fixed distance); a plug-in that predates the field: unknown.
+			k->default_focus_distance_diopters =
+			    (pc.default_focus == XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_FIXED &&
+			     isfinite(pc.default_focus_distance_diopters) && pc.default_focus_distance_diopters >= 0.0f)
+			        ? pc.default_focus_distance_diopters
+			        : -1.0f;
 			c->have_caps = k->supported_controls != 0;
 			if (!c->have_caps) {
 				memset(k, 0, sizeof(*k));
@@ -7418,9 +7434,12 @@ ipc_handle_stereo_camera_get_modes(volatile struct ipc_client_state *ics,
 		return off ? XRT_ERROR_STEREO_CAMERA_DISABLED : XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 	out_modes->count = cam_modes(cam, out_modes->modes);
-	// The default's rate is the descriptor's (measured once the source ran).
-	if (!cam_is_app(cam) && source_rate_hz(cam) > 0.0f) {
-		out_modes->modes[0].max_frame_rate = source_rate_hz(cam);
+	// Spec v8: a mode the source has run reports its MEASURED rate; one it has not
+	// keeps the listed value, 0 = not known yet.
+	for (uint32_t k = 0; k < out_modes->count && k < XRT_STEREO_CAMERA_MAX_MODES; k++) {
+		if (cam->mode_rate[k] > 0.0f) {
+			out_modes->modes[k].max_frame_rate = cam->mode_rate[k];
+		}
 	}
 	os_mutex_unlock(&m->lock);
 	return XRT_SUCCESS;

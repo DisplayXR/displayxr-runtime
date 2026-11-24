@@ -318,7 +318,8 @@ struct xrt_stereo_camera_control_caps
 	float exposure_compensation_min_ev;
 	float exposure_compensation_max_ev;
 	float exposure_compensation_step_ev;
-	uint32_t reserved;
+	//! Fixed distance held with no focus control set, dioptres; < 0 = not fixed / unknown (was reserved).
+	float default_focus_distance_diopters;
 };
 
 //! XrStereoCameraControlsDXR (a partial update: only valid_controls fields apply).
@@ -367,7 +368,7 @@ struct xrt_stereo_camera_still_info
 	uint64_t section_size;
 	int64_t capture_time_ns;
 	uint32_t time_is_exposure;
-	uint32_t reserved;
+	uint32_t flags; //!< XrStereoCameraStillDXR::sourceFlags bits (was reserved)
 	struct xrt_stereo_camera_capture_result result;
 	//! The calibration of exactly these pixels (for its output).
 	struct xrt_stereo_camera_calibration calibration;

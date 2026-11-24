@@ -533,7 +533,9 @@ typedef struct XrStereoCameraModeDXR {
     void* XR_MAY_ALIAS next;
     //! Per-eye size; a frame of this mode is 2*width x height, side by side.
     XrExtent2Di eyeExtent;
-    //! Highest rate the source runs this mode at, Hz; 0 = not known. A still-only mode: 0.
+    //! Highest rate the source runs this mode at, Hz; 0 = NOT KNOWN YET (a mode the source
+    //! has not run: a device's own tables can be wrong). Once the mode has run, the runtime
+    //! reports the measured rate here and in the stream's stats. A still-only mode: 0.
     float maxFrameRate;
     XrStereoCameraModeFlagsDXR flags;
 } XrStereoCameraModeDXR;
@@ -603,7 +605,17 @@ typedef struct XrStereoCameraControlCapabilitiesDXR {
     float exposureCompensationMinEv;
     float exposureCompensationMaxEv;
     float exposureCompensationStepEv;
+    //! The focus distance the source holds when no focus control is set (a multi-lens
+    //! source whose own autofocus cannot drive a pair picks a fixed one), dioptres; or
+    //! XR_STEREO_CAMERA_FOCUS_DISTANCE_UNKNOWN_DXR when the source focuses by itself or
+    //! does not say. Pre-set it to XR_STEREO_CAMERA_FOCUS_DISTANCE_UNKNOWN_DXR (0 is a
+    //! real value: infinity). Occupies what was tail padding: the struct's size is
+    //! unchanged.
+    float defaultFocusDistanceDiopters;
 } XrStereoCameraControlCapabilitiesDXR;
+
+//! XrStereoCameraControlCapabilitiesDXR::defaultFocusDistanceDiopters when not a fixed distance / not known.
+#define XR_STEREO_CAMERA_FOCUS_DISTANCE_UNKNOWN_DXR (-1.0f)
 
 /*!
  * xrSetStereoCameraControlsDXR: only the fields whose bit is in validControls
@@ -657,7 +669,10 @@ typedef struct XrStereoCameraCaptureResultDXR {
     XrDuration exposureTime;
     //! ISO arithmetic sensitivity.
     uint32_t sensitivityIso;
-    //! Start of exposure of each eye (runtime clock, like captureTime).
+    //! Start of exposure of each eye (runtime clock, like captureTime). Only with
+    //! EYE_CAPTURE_TIMES set, which a source sets only when it stamps each lens itself
+    //! (a HAL that stamps both lenses identically leaves it clear). Equal or missing
+    //! per-eye times are NOT evidence that the two lenses are synchronised.
     XrTime eyeCaptureTime[2];
 } XrStereoCameraCaptureResultDXR;
 
@@ -696,7 +711,15 @@ typedef struct XrStereoCameraStillDXR {
     uint64_t sectionSize;
     XrTime captureTime;
     XrBool32 captureTimeIsExposure;
+    //! XR_STEREO_CAMERA_STILL_SOURCE_*_BIT_DXR. Occupies what was tail padding: the
+    //! struct's size is unchanged; zero-initialise it.
+    uint32_t sourceFlags;
 } XrStereoCameraStillDXR;
+
+//! XrStereoCameraStillDXR::sourceFlags: the pixels went through LOSSY compression (e.g. a
+//! per-lens JPEG the plug-in decoded) before the runtime got them — a RAW still is then
+//! raw in geometry (unrectified, lens distortion intact), not in pixel fidelity.
+#define XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR 0x00000001u
 
 //! The still @c requestId of @c stream is ready: acquire it.
 typedef struct XrEventDataStereoCameraStillReadyDXR {

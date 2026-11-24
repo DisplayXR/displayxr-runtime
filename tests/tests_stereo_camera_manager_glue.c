@@ -1221,7 +1221,8 @@ static const struct xrt_plugin_stereo_camera_mode k_v8_modes[V8_MODES] = {
     {sizeof(struct xrt_plugin_stereo_camera_mode), 640, 480, 15.0f,
      XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM | XRT_PLUGIN_STEREO_CAMERA_MODE_STILL},
     // Spec v8 §5.5: the default's horizontal field of view, a centred 16:9 cut: kept.
-    {sizeof(struct xrt_plugin_stereo_camera_mode), 640, 360, 30.0f, XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM},
+    // Its rate is not known until it runs (0).
+    {sizeof(struct xrt_plugin_stereo_camera_mode), 640, 360, 0.0f, XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM},
     // Relative height 0.25: not a vertical crop / extension the rule allows: dropped.
     {sizeof(struct xrt_plugin_stereo_camera_mode), 640, 120, 30.0f, XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM},
     // A wide 16:9 mode no 4:3 mode covers: 1280x720 + any 4:3 stream has no common mode.
@@ -1353,6 +1354,8 @@ v8_get_control_caps(struct xrt_plugin_instance *inst, uint32_t index, struct xrt
 	out->supported_controls = 0xF;
 	out->supported_focus_modes = 0x1E;
 	out->min_focus_distance_diopters = 5.0f;
+	out->default_focus = XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_FIXED; // a pair: a fixed default distance
+	out->default_focus_distance_diopters = 0.8f;
 	out->focus_distance_calibration = XRT_PLUGIN_STEREO_CAMERA_FOCUS_APPROXIMATE;
 	out->exposure_compensation_min_ev = -2.0f;
 	out->exposure_compensation_max_ev = 2.0f;
@@ -1431,6 +1434,7 @@ v8_poll_still(struct xrt_plugin_stereo_camera *cam,
 	out->time_is_exposure = 1;
 	out_result->valid_fields = XRT_PLUGIN_STEREO_CAMERA_RESULT_SENSITIVITY;
 	out_result->sensitivity_iso = 400;
+	out->flags = XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE; // as a per-lens JPEG would be
 	g_v8.still_pending = false;
 	pthread_mutex_unlock(&g_v8.lock);
 	return g_v8.still != NULL ? XRT_PLUGIN_STEREO_CAMERA_STILL_READY : XRT_PLUGIN_STEREO_CAMERA_STILL_FAILED;

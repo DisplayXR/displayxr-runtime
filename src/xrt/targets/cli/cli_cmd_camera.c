@@ -2025,29 +2025,48 @@ cmd_modes(struct ipc_connection *ipc_c, int argc, const char **argv, bool json)
 		if (json) {
 			printf("%s{\"id\": %llu, \"modes\": [", shown ? ", " : "", (unsigned long long)p.camera_id);
 			for (uint32_t k = 0; k < ml.count; k++) {
+				char rate[32]; // 0 = not known yet (spec v8 §5.5): null, never a number
+				if (ml.modes[k].max_frame_rate > 0.0f) {
+					snprintf(rate, sizeof(rate), "%.2f", ml.modes[k].max_frame_rate);
+				} else {
+					snprintf(rate, sizeof(rate), "null");
+				}
 				printf(
-				    "%s{\"eyeWidth\": %u, \"eyeHeight\": %u, \"maxFrameRate\": %.2f, \"default\": %s, "
+				    "%s{\"eyeWidth\": %u, \"eyeHeight\": %u, \"maxFrameRate\": %s, \"default\": %s, "
 				    "\"stream\": %s, \"still\": %s}",
-				    k ? ", " : "", ml.modes[k].eye_width, ml.modes[k].eye_height,
-				    ml.modes[k].max_frame_rate,
+				    k ? ", " : "", ml.modes[k].eye_width, ml.modes[k].eye_height, rate,
 				    (ml.modes[k].flags & XRT_STEREO_CAMERA_MODE_DEFAULT) ? "true" : "false",
 				    (ml.modes[k].flags & XRT_STEREO_CAMERA_MODE_STREAM) ? "true" : "false",
 				    (ml.modes[k].flags & XRT_STEREO_CAMERA_MODE_STILL) ? "true" : "false");
 			}
+			char dfd[32]; // the fixed default focus, null = the source focuses by itself / unknown
+			if (caps.supported_controls != 0 && caps.default_focus_distance_diopters >= 0.0f) {
+				snprintf(dfd, sizeof(dfd), "%.3f", caps.default_focus_distance_diopters);
+			} else {
+				snprintf(dfd, sizeof(dfd), "null");
+			}
 			printf(
 			    "], \"controls\": {\"supported\": %u, \"focusModes\": %u, \"minFocusDiopters\": %.3f, "
-			    "\"focusCalibration\": %u, \"evMin\": %.3f, \"evMax\": %.3f, \"evStep\": %.4f}}",
+			    "\"focusCalibration\": %u, \"evMin\": %.3f, \"evMax\": %.3f, \"evStep\": %.4f, "
+			    "\"defaultFocusDiopters\": %s}}",
 			    caps.supported_controls, caps.supported_focus_modes, caps.min_focus_distance_diopters,
 			    caps.focus_distance_calibration, caps.exposure_compensation_min_ev,
-			    caps.exposure_compensation_max_ev, caps.exposure_compensation_step_ev);
+			    caps.exposure_compensation_max_ev, caps.exposure_compensation_step_ev, dfd);
 		} else {
 			printf("camera %llu \"%s\": %u mode(s)\n", (unsigned long long)p.camera_id, p.display_name,
 			       ml.count);
 			for (uint32_t k = 0; k < ml.count; k++) {
 				char fl[48];
 				v8_mode_flags_str(ml.modes[k].flags, fl, sizeof(fl));
-				printf("  %4ux%-4u per eye  %6.1f Hz  %s\n", ml.modes[k].eye_width,
-				       ml.modes[k].eye_height, ml.modes[k].max_frame_rate, fl);
+				char rate[32];
+				if (ml.modes[k].max_frame_rate > 0.0f) {
+					snprintf(rate, sizeof(rate), "%6.1f Hz", ml.modes[k].max_frame_rate);
+				} else {
+					snprintf(rate, sizeof(rate),
+					         "rate unknown"); // not run yet: measured once it runs
+				}
+				printf("  %4ux%-4u per eye  %-12s  %s\n", ml.modes[k].eye_width, ml.modes[k].eye_height,
+				       rate, fl);
 			}
 			if (caps.supported_controls == 0) {
 				printf("  controls: none\n");
@@ -2073,6 +2092,12 @@ cmd_modes(struct ipc_connection *ipc_c, int argc, const char **argv, bool json)
 				                                              : "uncalibrated",
 				       caps.exposure_compensation_min_ev, caps.exposure_compensation_max_ev,
 				       caps.exposure_compensation_step_ev);
+				if (caps.default_focus_distance_diopters >= 0.0f) {
+					printf("  default focus (no focus control set): fixed at %.3f D\n",
+					       caps.default_focus_distance_diopters);
+				} else {
+					printf("  default focus (no focus control set): the source's own / unknown\n");
+				}
 			}
 		}
 		shown++;
@@ -2334,10 +2359,13 @@ cmd_still(struct ipc_connection *ipc_c, int argc, const char **argv)
 		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
 		return 2;
 	}
-	printf("still %llu ready in %.0f ms (%u stream frame(s) meanwhile): %ux%u SBS %s, %s, %llu B section\n",
+	printf("still %llu ready in %.0f ms (%u stream frame(s) meanwhile): %ux%u SBS %s, %s, %llu B section%s\n",
 	       (unsigned long long)rid, ms, frames_during, info.width, info.height, format_str(info.format),
 	       info.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW",
-	       (unsigned long long)info.section_size);
+	       (unsigned long long)info.section_size,
+	       (info.flags & XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE) != 0
+	           ? ", LOSSY source (lossy-compressed before decoding, e.g. a per-lens JPEG)"
+	           : "");
 	v8_print_result("  capture: ", &info.result);
 	const struct xrt_stereo_camera_calibration *k = &info.calibration;
 	printf("  calibration (%s): %ux%u per eye, fx %.3f fy %.3f cx %.3f cy %.3f, baseline %.3f mm\n",

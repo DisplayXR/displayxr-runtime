@@ -2228,6 +2228,7 @@ TEST_CASE("spec v8: modes are listed, one horizontal field of view, default firs
 	CHECK(ml.modes[2].flags == (XRT_STEREO_CAMERA_MODE_STREAM | XRT_STEREO_CAMERA_MODE_STILL));
 	CHECK(ml.modes[3].eye_width == 640);
 	CHECK(ml.modes[3].eye_height == 360);
+	CHECK(ml.modes[3].max_frame_rate == 0.0f); // not known until it runs
 	CHECK(ml.modes[4].eye_width == 1280);
 	CHECK(ml.modes[4].eye_height == 720);
 	CHECK(scm_modes(f, 999, &ml) == XRT_ERROR_INPUT_UNSUPPORTED);
@@ -2262,6 +2263,23 @@ TEST_CASE("spec v8: modes are listed, one horizontal field of view, default firs
 	REQUIRE(scm_calibration(f, p.camera_id, XRT_STEREO_CAMERA_OUTPUT_RAW, &c) == XRT_SUCCESS);
 	CHECK(c.eye[0].width == 320);
 	CHECK(c.eye[0].fx == Catch::Approx(200.0f));
+
+	// The fixed default focus distance is exposed with the capabilities.
+	xrt_stereo_camera_control_caps caps;
+	REQUIRE(scm_control_caps(f, p.camera_id, &caps) == XRT_SUCCESS);
+	CHECK(caps.default_focus_distance_diopters == Catch::Approx(0.8f));
+
+	// Once the 0-rate mode has run, its MEASURED rate is listed.
+	xrt_stereo_camera_stream_layout lay;
+	uint64_t s = v8_start(f, p.camera_id, 640, 360, &lay);
+	REQUIRE(s != 0);
+	bool measured = false;
+	for (int i = 0; i < 300 && !measured; i++) {
+		REQUIRE(scm_modes(f, p.camera_id, &ml) == XRT_SUCCESS);
+		measured = ml.modes[3].max_frame_rate > 0.0f;
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	CHECK(measured);
 	scm_destroy(f);
 }
 
@@ -2511,6 +2529,7 @@ TEST_CASE("spec v8: a still is delivered once, in its own section, with its cali
 	CHECK(info.format == XRT_STEREO_CAMERA_FORMAT_GRAY8);
 	CHECK((info.result.valid_fields & XRT_PLUGIN_STEREO_CAMERA_RESULT_SENSITIVITY) != 0);
 	CHECK(info.result.sensitivity_iso == 400);
+	CHECK((info.flags & XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE) != 0); // lossy source, passed through
 	CHECK(info.calibration.eye[0].width == 640);
 	CHECK(info.calibration.eye[0].fx == Catch::Approx(400.0f));
 	const uint8_t *row = px.data() + info.plane_offset[0] + (size_t)240 * info.row_pitch[0];

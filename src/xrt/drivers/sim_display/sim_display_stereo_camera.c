@@ -340,7 +340,9 @@ fake_modes(const struct fake_config *cfg, struct xrt_plugin_stereo_camera_mode o
 	const bool wide = (uint64_t)cfg->eye_w * 3 > (uint64_t)cfg->eye_h * 4;
 	const uint32_t ow = cfg->eye_w, oh = (wide ? cfg->eye_w * 3 / 4 : cfg->eye_w * 9 / 16) & ~1u;
 	if (oh >= 64 && oh != cfg->eye_h) {
-		out[n++] = (struct xrt_plugin_stereo_camera_mode){(uint32_t)sizeof(out[0]), ow, oh, cfg->advertised_fps,
+		// Its rate is NOT KNOWN until it runs (0), like a device whose HAL table is
+		// wrong: the runtime lists the measured rate once the mode has streamed.
+		out[n++] = (struct xrt_plugin_stereo_camera_mode){(uint32_t)sizeof(out[0]), ow, oh, 0.0f,
 		                                                  XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM};
 		if (ow * 2 <= 4096 && oh * 2 <= 4096) {
 			out[n++] = (struct xrt_plugin_stereo_camera_mode){
@@ -559,6 +561,8 @@ sim_display_stereo_camera_get_control_caps(struct xrt_plugin_instance *inst,
 	c.exposure_compensation_min_ev = -2.0f;
 	c.exposure_compensation_max_ev = 2.0f;
 	c.exposure_compensation_step_ev = 1.0f / 3.0f;
+	// With no focus control the fake lens focuses by itself (continuous AF on the scene).
+	c.default_focus = XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_AUTO;
 	memcpy(out, &c, sz < sizeof(c) ? sz : sizeof(c));
 	out->struct_size = sz;
 	return XRT_SUCCESS;

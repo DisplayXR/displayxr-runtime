@@ -283,7 +283,7 @@ std::string take_still(const fns &f, XrStereoCameraStreamDXR stream,
             fmt("still %llu in %.0f ms: %dx%d %s fmt %d, %llu B; capture focus "
                 "%.3f D %s ISO %u (valid 0x%llx); calibration "
                 "%dx%d/eye f %.1f c %.1f,%.1f baseline %.2f mm; rows: %s; "
-                "written to %s",
+                "%s; written to %s",
                 (unsigned long long)st.requestId, latency_ns / 1e6,
                 st.extent.width, st.extent.height,
                 st.output == XR_STEREO_CAMERA_OUTPUT_RECTIFIED_DXR ? "RECTIFIED"
@@ -293,7 +293,11 @@ std::string take_still(const fns &f, XrStereoCameraStreamDXR stream,
                 cr.sensitivityIso, (unsigned long long)cr.validFields,
                 cal.eye[0].imageExtent.width, cal.eye[0].imageExtent.height,
                 cal.eye[0].fx, cal.eye[0].cx, cal.eye[0].cy, cal.baselineMm,
-                align.c_str(), path.c_str());
+                align.c_str(),
+                (st.sourceFlags & XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR)
+                    ? "LOSSY source"
+                    : "lossless source",
+                path.c_str());
         LOGW("%s", s.c_str());
         return s;
 }
@@ -398,6 +402,9 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
         std::vector<XrStereoCameraControlCapabilitiesDXR> caps(
             n, {XR_TYPE_STEREO_CAMERA_CONTROL_CAPABILITIES_DXR});
         for (uint32_t i = 0; i < n; i++) {
+                // 0 would read "fixed at infinity": pre-set the unknown value.
+                caps[i].defaultFocusDistanceDiopters =
+                    XR_STEREO_CAMERA_FOCUS_DISTANCE_UNKNOWN_DXR;
                 cams[i].next = &caps[i];
         }
         if (n > 0) {
@@ -440,16 +447,17 @@ Java_com_displayxr_camera_1probe_1android_MainActivity_nativeRun(
                                 }
                         }
                         const auto &k = caps[i];
-                        LOGW(
-                            "      controls 0x%llx focus modes 0x%llx nearest "
-                            "%.2f D (calibration %d) EV %+.2f..%+.2f step %.3f",
-                            (unsigned long long)k.supportedControls,
-                            (unsigned long long)k.supportedFocusModes,
-                            k.minFocusDistanceDiopters,
-                            (int)k.focusDistanceCalibration,
-                            k.exposureCompensationMinEv,
-                            k.exposureCompensationMaxEv,
-                            k.exposureCompensationStepEv);
+                        LOGW("      controls 0x%llx focus modes 0x%llx nearest "
+                             "%.2f D (calibration %d) EV %+.2f..%+.2f step "
+                             "%.3f, default focus %.3f D (<0 = auto/unknown)",
+                             (unsigned long long)k.supportedControls,
+                             (unsigned long long)k.supportedFocusModes,
+                             k.minFocusDistanceDiopters,
+                             (int)k.focusDistanceCalibration,
+                             k.exposureCompensationMinEv,
+                             k.exposureCompensationMaxEv,
+                             k.exposureCompensationStepEv,
+                             k.defaultFocusDistanceDiopters);
                 }
                 const bool front = (p.flags & XR_STEREO_CAMERA_USER_FACING_BIT_DXR) != 0;
 		if (pick < 0 && ((cam_sel == "front" && front) || (cam_sel == "rear" && !front) ||

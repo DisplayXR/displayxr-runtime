@@ -1131,7 +1131,9 @@ struct xrt_plugin_stereo_camera_mode
 	uint32_t struct_size;
 	uint32_t eye_width;
 	uint32_t eye_height;
-	//! Highest rate of the mode, Hz, if known; 0 = unknown (and a still-only size).
+	//! Highest rate of the mode, Hz, ONLY if known; 0 = not known yet (a mode the
+	//! source has not run — do not copy a HAL table you cannot trust) and a
+	//! still-only size. The runtime measures each mode once it runs.
 	float max_frame_rate;
 	//! XRT_PLUGIN_STEREO_CAMERA_MODE_* bits.
 	uint32_t flags;
@@ -1180,7 +1182,31 @@ struct xrt_plugin_stereo_camera_control_caps
 	float exposure_compensation_min_ev;
 	float exposure_compensation_max_ev;
 	float exposure_compensation_step_ev;
+
+	/*
+	 * Appended (XR_DXR_stereo_camera v8, after the Leia Android source), gated by
+	 * @ref struct_size; announced by XRT_PLUGIN_STEREO_CAMERA_CONTROL_CAPS_HAS_DEFAULT_FOCUS.
+	 * A plug-in that does not write them reads as UNKNOWN.
+	 */
+
+	//! @ref xrt_plugin_stereo_camera_default_focus: what the source does with no focus control set.
+	uint32_t default_focus;
+	//! With XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_FIXED: the distance it holds, dioptres (0 = infinity).
+	float default_focus_distance_diopters;
 };
+
+//! @ref xrt_plugin_stereo_camera_control_caps::default_focus. 0 = UNKNOWN on purpose.
+enum xrt_plugin_stereo_camera_default_focus
+{
+	XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_UNKNOWN = 0,
+	//! The source holds a fixed distance (a multi-lens source whose own AF cannot drive a pair).
+	XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_FIXED = 1,
+	//! The source focuses by itself.
+	XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_AUTO = 2,
+};
+
+//! Defined when xrt_plugin_stereo_camera_control_caps carries default_focus / default_focus_distance_diopters.
+#define XRT_PLUGIN_STEREO_CAMERA_CONTROL_CAPS_HAS_DEFAULT_FOCUS 1
 
 /*!
  * The WHOLE control state the runtime wants (it merges the app's partial
@@ -1207,6 +1233,7 @@ struct xrt_plugin_stereo_camera_controls
 #define XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_STATE (1u << 1)
 #define XRT_PLUGIN_STEREO_CAMERA_RESULT_EXPOSURE_TIME (1u << 2)
 #define XRT_PLUGIN_STEREO_CAMERA_RESULT_SENSITIVITY (1u << 3)
+//! Only when the source stamps EACH lens itself; a HAL that stamps both identically leaves it clear.
 #define XRT_PLUGIN_STEREO_CAMERA_RESULT_EYE_TIMES (1u << 4)
 
 //! Values equal XrStereoCameraFocusStateDXR.
@@ -1274,8 +1301,17 @@ struct xrt_plugin_stereo_camera_still
 	uint32_t pitches[2];
 	int64_t time_ns; //!< os_monotonic_get_ns() domain
 	uint32_t time_is_exposure;
-	uint32_t reserved;
+	//! XRT_PLUGIN_STEREO_CAMERA_STILL_* bits (was `reserved`: same offset, same size).
+	uint32_t flags;
 };
+
+//! @ref xrt_plugin_stereo_camera_still::flags: the pixels were lossy-compressed
+//! before the plug-in decoded them (e.g. one JPEG output per lens, where a second
+//! YUV output would abort the HAL).
+#define XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE (1u << 0)
+
+//! Defined when xrt_plugin_stereo_camera_still carries @ref xrt_plugin_stereo_camera_still::flags.
+#define XRT_PLUGIN_STEREO_CAMERA_STILL_HAS_FLAGS 1
 
 //! Bytes per id of @ref xrt_plugin_iface::get_claimed_cameras (NUL included).
 #define XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX 256

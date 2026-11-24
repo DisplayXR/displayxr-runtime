@@ -43,6 +43,7 @@
 
 #include "xrt/xrt_config_os.h"
 
+#include <stddef.h>
 #include <string.h>
 #if defined(XRT_OS_WINDOWS)
 #include <windows.h>
@@ -108,6 +109,20 @@ _Static_assert(XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_DISTANCE == 0x1 &&
                    XRT_PLUGIN_STEREO_CAMERA_RESULT_SENSITIVITY == 0x8 &&
                    XRT_PLUGIN_STEREO_CAMERA_RESULT_EYE_TIMES == 0x10,
                "capture result flag mirror");
+// The two late v8 fields sit in what was tail padding: neither struct changed size
+// (a client built against the earlier v8 header passes a struct of the same size).
+_Static_assert(offsetof(XrStereoCameraStillDXR, sourceFlags) ==
+                   offsetof(XrStereoCameraStillDXR, captureTimeIsExposure) + sizeof(XrBool32),
+               "sourceFlags right after captureTimeIsExposure");
+_Static_assert(sizeof(XrStereoCameraStillDXR) ==
+                   ((offsetof(XrStereoCameraStillDXR, captureTimeIsExposure) + sizeof(XrBool32) + 7) & ~(size_t)7),
+               "sourceFlags must use the old tail padding, not grow the struct");
+_Static_assert(sizeof(XrStereoCameraControlCapabilitiesDXR) ==
+                   ((offsetof(XrStereoCameraControlCapabilitiesDXR, exposureCompensationStepEv) + sizeof(float) + 7) &
+                    ~(size_t)7),
+               "defaultFocusDistanceDiopters must use the old tail padding, not grow the struct");
+_Static_assert(XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE == XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR,
+               "still flag mirror");
 #define SCAM_PIN8(xr, xrt, v) _Static_assert((xr) == (v) && (xrt) == (v), #xr " != " #xrt)
 SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_MODE_CONTINUOUS_AUTO_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_CONTINUOUS_AUTO, 1);
 SCAM_PIN8(XR_STEREO_CAMERA_FOCUS_MODE_AUTO_ONCE_DXR, XRT_PLUGIN_STEREO_CAMERA_FOCUS_AUTO_ONCE, 2);
@@ -369,6 +384,9 @@ oxr_xrEnumerateStereoCamerasDXR(XrInstance instance,
 			caps->exposureCompensationMinEv = k.exposure_compensation_min_ev;
 			caps->exposureCompensationMaxEv = k.exposure_compensation_max_ev;
 			caps->exposureCompensationStepEv = k.exposure_compensation_step_ev;
+			caps->defaultFocusDistanceDiopters = (xret == XRT_SUCCESS && k.supported_controls != 0)
+			                                         ? k.default_focus_distance_diopters
+			                                         : XR_STEREO_CAMERA_FOCUS_DISTANCE_UNKNOWN_DXR;
 		}
 #ifdef OXR_HAVE_DXR_app_share
 		// ADR-061: an app entry's description, when the app chained it (spec §2:
@@ -866,6 +884,7 @@ oxr_xrAcquireStereoCameraStillDXR(XrStereoCameraStreamDXR stream, uint64_t reque
 	still->sectionSize = info.section_size;
 	still->captureTime = time_state_monotonic_to_ts_ns(s->inst->timekeeping, info.capture_time_ns);
 	still->captureTimeIsExposure = info.time_is_exposure ? XR_TRUE : XR_FALSE;
+	still->sourceFlags = info.flags & XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR;
 	XrStereoCameraCaptureResultDXR *cr =
 	    OXR_GET_OUTPUT_FROM_CHAIN(still, XR_TYPE_STEREO_CAMERA_CAPTURE_RESULT_DXR, XrStereoCameraCaptureResultDXR);
 	if (cr != NULL) {
