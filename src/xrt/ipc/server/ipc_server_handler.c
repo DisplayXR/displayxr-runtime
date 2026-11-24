@@ -142,7 +142,18 @@ ipc_viewer_override_eyes(volatile struct ipc_client_state *ics,
 		return false;
 	}
 	struct xrt_viewer_tracking *vt = (s != NULL && s->xsysd != NULL) ? s->xsysd->viewer_tracking : NULL;
-	const bool spliced = xrt_viewer_tracking_override_eyes(vt, screen_id, target_ns, inout, have_dp);
+	// ADR-066 Part B: a screen set to "3d" follows the provider only in the 3D
+	// slot. The client's own mode does not cross IPC (OUTPUT_MODE), so the
+	// service head's active mode decides, as it does for the view count.
+	enum xrt_viewer_mode vmode = XRT_VIEWER_MODE_UNKNOWN;
+	struct xrt_device *head = (s != NULL && s->xsysd != NULL) ? s->xsysd->static_roles.head : NULL;
+	if (head != NULL && head->hmd != NULL && head->rendering_mode_count > 0 &&
+	    head->hmd->active_rendering_mode_index < head->rendering_mode_count) {
+		vmode = head->rendering_modes[head->hmd->active_rendering_mode_index].hardware_display_3d
+		            ? XRT_VIEWER_MODE_3D
+		            : XRT_VIEWER_MODE_2D;
+	}
+	const bool spliced = xrt_viewer_tracking_override_eyes_mode(vt, screen_id, vmode, target_ns, inout, have_dp);
 	static bool logged = false;
 	if (spliced && !logged) {
 		logged = true;

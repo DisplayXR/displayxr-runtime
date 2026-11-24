@@ -64,6 +64,25 @@ struct xrt_status_snapshot;
 void
 cli_status_build_headless(struct xrt_status_snapshot *out);
 
+/*!
+ * The status snapshot as `status` gets it: from the running service over DIAG
+ * when reachable (returns true), else built headless here (returns false).
+ */
+bool
+cli_status_fetch(struct xrt_status_snapshot *out);
+
+/*!
+ * Resolve a typed screen key against the connected screens (full claim
+ * resolution, as `dp use --screen`): @p out_key the current key, @p out_legacy
+ * its legacy EDID form ("" when the same). False when no connected screen has it.
+ */
+bool
+cli_screen_key_lookup(const char *key, char *out_key, size_t key_cap, char *out_legacy, size_t legacy_cap);
+
+//! Ask a running service to re-probe the displays (DIAG), silently: 0 = done, 1 = refused, 2 = no service.
+int
+cli_poke_service_reprobe_quiet(int *out_xret);
+
 int
 cli_cmd_clients(int argc, const char **argv);
 

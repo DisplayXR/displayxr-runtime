@@ -596,6 +596,37 @@ cmd_reset(bool machine)
  * `system_request_display_reprobe`), so the change applies without waiting
  * for a world event. Says what happened.
  */
+//! The re-probe call alone: 0 = done, 1 = refused (@p out_xret), 2 = no service reachable.
+static int
+poke_service_quiet(int *out_xret)
+{
+#ifdef CLI_HAVE_IPC
+	struct xrt_instance_info ii;
+	memset(&ii, 0, sizeof(ii));
+	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
+	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
+	struct ipc_connection ipc_c;
+	memset(&ipc_c, 0, sizeof(ipc_c));
+	if (cli_ipc_connect(&ipc_c, U_LOGGING_RAW, &ii) == XRT_SUCCESS) {
+		const xrt_result_t xret = ipc_call_system_request_display_reprobe(&ipc_c);
+		ipc_client_connection_fini(&ipc_c);
+		if (out_xret != NULL) {
+			*out_xret = (int)xret;
+		}
+		return xret == XRT_SUCCESS ? 0 : 1;
+	}
+#else
+	(void)out_xret;
+#endif
+	return 2;
+}
+
+int
+cli_poke_service_reprobe_quiet(int *out_xret)
+{
+	return poke_service_quiet(out_xret);
+}
+
 static void
 poke_service(void)
 {
@@ -861,4 +892,10 @@ cli_cmd_dp(int argc, const char **argv)
 	}
 	P("error: unknown 'dp' subcommand '%s'.\n\n", verb);
 	return print_usage();
+}
+
+bool
+cli_screen_key_lookup(const char *key, char *out_key, size_t key_cap, char *out_legacy, size_t legacy_cap)
+{
+	return screen_key_lookup(key, out_key, key_cap, out_legacy, legacy_cap);
 }

@@ -135,6 +135,16 @@ public sealed record ScreenLayout(double WidthM, double HeightM, NominalViewer V
 public sealed record EyeTracking(IReadOnlyList<string> Supported, string? Default, string State,
                                  string? ViewerSource = null, string? ViewerReason = null, string? ViewerPolicy = null);
 
+/// <summary>
+/// ADR-066 Part B: a screen's per-screen viewer-tracking setting (<c>screens[i].viewer_tracking</c>).
+/// <see cref="Setting"/> is what is stored ("off" / "3d" / "always" / "default"), <see cref="Effective"/>
+/// what it resolved to, <see cref="Available"/> whether it is offered here (else <see cref="Reason"/>
+/// says why); <see cref="Detail"/> what the provider tracks from when it is.
+/// </summary>
+public sealed record ViewerTracking(string Setting, string SettingSource, string Effective, bool Tracked2D,
+                                    bool Tracked3D, string? CurrentMode, bool? Active, string? Provider,
+                                    bool Available, string? Reason, string? Detail);
+
 public sealed record ScreenMode(int Index, string Name, int Views, bool Is3D);
 
 public sealed record ScreenDp(long ClientId, string Api, string Kind, string Backend);
@@ -145,7 +155,8 @@ public sealed record VendorCell(bool Present, bool Ready, bool Verified, bool Ca
 public sealed record Screen(
     string Id, string? Key, int Index, string DeviceName, string FriendlyName, EdidInfo Edid, DesktopInfo Desktop, NativeMode Native,
     PhysicalMm PhysicalMm, Roles Roles, Claim Claim, ScreenLayout Layout, EyeTracking EyeTracking, ScreenMode? Mode,
-    IReadOnlyList<ScreenDp> Dps, VendorCell Vendor, IReadOnlyList<StatusWarning> Warnings);
+    IReadOnlyList<ScreenDp> Dps, VendorCell Vendor, IReadOnlyList<StatusWarning> Warnings,
+    ViewerTracking? ViewerTracking = null);
 
 public sealed record ClientFlags(bool Active, bool Visible, bool Focused, bool Overlay);
 
@@ -330,7 +341,22 @@ public static class StatusSnapshotParser
             new VendorCell(v.Bool("present"), v.Bool("ready"), v.Bool("verified"), v.Bool("calibrated"),
                            v.Str("tracker", "UNKNOWN"), v.Str("lens", "UNKNOWN"), v.Str("model"), v.Str("serial"),
                            ww is { } w ? StatusWarning.From(w) : null, v.StrOrNull("dashboard_command")),
-            ReadWarnings(s));
+            ReadWarnings(s),
+            ReadViewerTracking(s.Obj("viewer_tracking")));
+    }
+
+    /// <summary>ADR-066 Part B: null from a CLI that predates it, or where the builder did not evaluate it.</summary>
+    private static ViewerTracking? ReadViewerTracking(JsonElement? vt)
+    {
+        if (vt is not { } o) return null;
+        var tracked = o.Obj("tracked");
+        bool? active = o.TryGetProperty("active", out var a) && a.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? a.GetBoolean()
+            : null;
+        return new ViewerTracking(o.Str("setting", "default"), o.Str("setting_source", "default"),
+                                  o.Str("effective", "off"), tracked.Bool("2d"), tracked.Bool("3d"),
+                                  o.StrOrNull("current_mode"), active, o.StrOrNull("provider"), o.Bool("available"),
+                                  o.StrOrNull("reason"), o.StrOrNull("detail"));
     }
 
     private static Client ReadClient(JsonElement c)

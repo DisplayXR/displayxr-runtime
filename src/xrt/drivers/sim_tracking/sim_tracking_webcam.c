@@ -15,6 +15,7 @@
 #include "os/os_time.h"
 #include "util/u_logging.h"
 #include "util/u_stereo_uvc.h"
+#include "os/os_uvc_capture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,21 +79,60 @@ sim_tracking_webcam_camera_key(const struct sim_webcam_settings *s, char *out, s
 }
 
 bool
-sim_tracking_webcam_probe(const struct sim_webcam_settings *s)
+sim_tracking_webcam_availability(const struct sim_webcam_settings *s, bool quiet, struct xrt_tracking_availability *out)
 {
+	// Enumeration only (sysfs / udev on Linux, MFEnumDeviceSources on Windows): no camera is opened.
+	out->available = 0;
+	out->reason = XRT_TRACKING_UNAVAILABLE_NONE;
+	out->detail[0] = '\0';
 	if (g_est_override == NULL && !sim_webcam_estimator_usable(s)) {
-		U_LOG_W(
-		    "sim-tracking: SOURCE=webcam declines - no usable face estimator in this build (built in: '%s'; "
-		    "-DXRT_SIM_WEBCAM_ESTIMATOR=onnx builds one)",
-		    sim_face_estimator_default_name());
+		out->reason = XRT_TRACKING_UNAVAILABLE_NO_ESTIMATOR;
+		snprintf(out->detail, sizeof(out->detail), "no face estimator in this build (built in: '%s')",
+		         sim_face_estimator_default_name());
+		if (quiet) {
+			U_LOG_I("sim-tracking: webcam source unavailable - %s", out->detail);
+		} else {
+			U_LOG_W(
+			    "sim-tracking: SOURCE=webcam declines - no usable face estimator in this build (built in: "
+			    "'%s'; -DXRT_SIM_WEBCAM_ESTIMATOR=onnx builds one)",
+			    sim_face_estimator_default_name());
+		}
+		return false;
+	}
+	struct u_stereo_uvc_backend os_backend;
+	if (backend_or_null() == NULL && !os_uvc_capture_backend(&os_backend)) {
+		out->reason = XRT_TRACKING_UNAVAILABLE_NO_CAPTURE_BACKEND;
+		snprintf(out->detail, sizeof(out->detail), "no camera capture backend on this platform");
+		if (!quiet) {
+			U_LOG_W("sim-tracking: SOURCE=webcam declines - %s", out->detail);
+		}
 		return false;
 	}
 	struct sim_webcam_camera_info cam;
 	if (sim_webcam_selected_camera(s, backend_or_null(), &cam) == 0) {
-		U_LOG_W("sim-tracking: SOURCE=webcam declines - no camera matches WEBCAM_DEVICE (or none present)");
+		out->reason = XRT_TRACKING_UNAVAILABLE_NO_CAMERA;
+		snprintf(out->detail, sizeof(out->detail), "no camera (none present, or none matches WEBCAM_DEVICE)");
+		if (quiet) {
+			U_LOG_I("sim-tracking: webcam source unavailable - %s", out->detail);
+		} else {
+			U_LOG_W(
+			    "sim-tracking: SOURCE=webcam declines - no camera matches WEBCAM_DEVICE (or none present)");
+		}
 		return false;
 	}
+	out->available = 1;
+	snprintf(out->detail, sizeof(out->detail), "webcam '%.*s'", (int)sizeof(out->detail) - 10,
+	         cam.name[0] != '\0' ? cam.name : cam.key);
 	return true;
+}
+
+bool
+sim_tracking_webcam_probe(const struct sim_webcam_settings *s)
+{
+	struct xrt_tracking_availability a;
+	memset(&a, 0, sizeof(a));
+	a.struct_size = (uint32_t)sizeof(a);
+	return sim_tracking_webcam_availability(s, false, &a);
 }
 
 void

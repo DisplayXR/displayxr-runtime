@@ -69,6 +69,23 @@ struct xrt_system_compositor_info;
 struct xrt_screen_list;
 struct xrt_dp_factory_registry;
 
+/*!
+ * A screen's viewer-tracking setting (ADR-066 Part B). Same values as
+ * `enum u_setting_viewer_tracking` (statically asserted in the .c).
+ */
+enum target_viewer_setting
+{
+	//! No per-screen value: OFF, unless the provider opts in by itself (then ALWAYS — what it was before).
+	TARGET_VIEWER_SETTING_DEFAULT = 0,
+	TARGET_VIEWER_SETTING_OFF = 1,    //!< never: no provider, the camera stays closed for this screen
+	TARGET_VIEWER_SETTING_3D = 2,     //!< the provider drives the views only in the 3D slot
+	TARGET_VIEWER_SETTING_ALWAYS = 3, //!< in 2D and 3D (head-coupled look-around in 2D too)
+};
+
+//! "default" / "off" / "3d" / "always".
+const char *
+target_viewer_setting_str(uint32_t setting);
+
 //! What the arbitration of ONE screen is fed.
 struct target_viewer_inputs
 {
@@ -79,6 +96,14 @@ struct target_viewer_inputs
 	const char *provider_id; //!< its registration id (when @ref provider_usable)
 	//! An enabled provider row is registered (loaded or not: a tracking display never loads one).
 	bool provider_enabled;
+	//! enum target_viewer_setting: the screen's viewer-tracking setting (0 = DEFAULT).
+	uint32_t setting;
+	/*!
+	 * The provider serves only screens whose setting asks for it: its own
+	 * opt-in (SERVE_BY_DEFAULT) is off. false = it also serves DEFAULT screens
+	 * (a provider without the availability slot; the legacy opt-in).
+	 */
+	bool provider_opt_in_only;
 };
 
 //! The answer for one screen.
@@ -95,7 +120,19 @@ struct target_viewer_decision
 	//! A provider could serve here but for the display: usable, or (when the
 	//! display tracks and so no scan ran) an enabled row — a DP / OWN answer is then "standby".
 	bool provider_available;
+	uint32_t setting;           //!< echo: enum target_viewer_setting as stored (DEFAULT = no value)
+	uint32_t effective_setting; //!< OFF / 3D / ALWAYS after DEFAULT was resolved
+	bool tracked_2d;            //!< SOURCE_PROVIDER: the 2D slot's views follow it (ALWAYS)
+	bool tracked_3d;            //!< SOURCE_PROVIDER: the 3D slot's views follow it (3D, ALWAYS)
 };
+
+/*!
+ * The source of @p d for a request made in @p mode (enum xrt_viewer_mode):
+ * PROVIDER only where the screen's setting covers that slot, NOMINAL for a
+ * provider screen outside it, the decision's source otherwise. Pure.
+ */
+enum xrt_viewer_source
+target_viewer_source_for_mode(const struct target_viewer_decision *d, uint32_t mode);
 
 //! `XR_DXR_display_info` eye-tracking mode bits (bit 0 MANAGED, bit 1 MANUAL).
 #define TARGET_VIEWER_MODE_MANAGED_BIT 1u
@@ -156,6 +193,10 @@ struct target_viewer_screen_in
 	uint32_t desktop_height;
 	float width_m;
 	float height_m;
+	//! enum target_viewer_setting for this screen (its stable key through the per-screen store).
+	uint32_t setting;
+	uint32_t setting_source; //!< enum u_setting_source of @ref setting (0 = default / not set)
+	char key[64];            //!< the screen key the setting was read under ("" = unknown)
 };
 
 //! The provider side of the per-screen arbitration (one provider for every screen).
@@ -165,7 +206,26 @@ struct target_viewer_provider_in
 	bool usable;    //!< a resident provider claimed a usable source
 	const char *id; //!< its registration id (when @ref usable)
 	bool enabled;   //!< an enabled provider row is registered (for "standby")
+	//! Serves only screens whose setting asks (see target_viewer_inputs::provider_opt_in_only).
+	bool opt_in_only;
+	//! ADR-066 Part B: when not @ref usable, why ("no face estimator in this build", ...); NULL = unknown.
+	const char *unavailable;
+	//! When @ref usable: what it would track from ("webcam 'Integrated Camera'"); NULL = unknown.
+	const char *detail;
 };
+
+/*!
+ * Is the per-screen viewer-tracking setting OFFERED on @p s (ADR-066 Part B
+ * B1 / B2)? Not on a screen whose display tracks the viewer itself, owns it,
+ * is FIXED or has no display processor, and not without an available
+ * provider. Writes the reason (unavailable) or the provider's detail
+ * (available) into @p reason. Pure.
+ */
+bool
+target_viewer_screen_offered(const struct target_viewer_screen_in *s,
+                             const struct target_viewer_provider_in *provider,
+                             char *reason,
+                             size_t cap);
 
 //! The answer for one screen.
 struct target_viewer_screen_decision
@@ -179,6 +239,12 @@ struct target_viewer_screen_decision
 	 * primary.
 	 */
 	float offset_m[3];
+	//! ADR-066 Part B: the setting is offered here (see @ref target_viewer_screen_offered).
+	bool offered;
+	//! Why not offered, or (offered) what the provider tracks from.
+	char offer_reason[128];
+	uint32_t setting_source; //!< enum u_setting_source of the setting
+	char key[64];            //!< the screen key
 };
 
 /*!
@@ -230,6 +296,8 @@ enum target_viewer_provider_state
 	TARGET_VIEWER_PROVIDER_STANDBY,
 	//! "no_source": the screen would take one (EXTERNAL_OK), none is usable.
 	TARGET_VIEWER_PROVIDER_NO_SOURCE,
+	//! "off": the screen's viewer-tracking setting keeps a provider off (ADR-066 Part B).
+	TARGET_VIEWER_PROVIDER_OFF,
 };
 
 //! The stable spelling of @p s.
@@ -321,6 +389,38 @@ target_viewer_tracking_screen_decisions(const struct xrt_screen_list *list,
                                         const struct xrt_dp_factory_registry *reg,
                                         struct target_viewer_screen_decision *out,
                                         uint32_t max);
+
+/*!
+ * ADR-066 Part B: re-read the per-screen viewer-tracking settings and, when
+ * they moved since the last arbitration (the store's reload generation and
+ * the values), re-run the per-screen arbitration for @p list. The service
+ * calls it on every display re-probe (the DIAG call `tracking set --screen`
+ * makes), so a toggle reaches running sessions' views within a frame. Cheap
+ * when nothing moved. Returns true when a screen's answer changed.
+ */
+bool
+target_viewer_tracking_settings_changed(const struct xrt_screen_list *list, const struct xrt_dp_factory_registry *reg);
+
+/*!
+ * ADR-066 Part B: after the FIRST topology publish (system create, before any
+ * session reads the system), recompose the primary screen's advertisement
+ * into @p info and @p head's mode flags from its per-screen setting, which
+ * apply could not read yet (the screen key is known only once the table is
+ * built). A no-op when the setting changes nothing. Later changes move the
+ * views only: the advertisement is static per instance.
+ */
+void
+target_viewer_tracking_recompose(struct xrt_system_compositor_info *info, struct xrt_device *head);
+
+/*!
+ * ADR-066 Part B, the seam for the rendering-mode code: which slots of
+ * @p screen_id (XRT_VIEWER_SCREEN_PRIMARY or a monitor id) a viewer-tracking
+ * provider drives under the screen's setting. `provider` false = no provider
+ * on this screen: keep the display's own per-mode tracked flags. False when
+ * the screen is unknown to this process.
+ */
+bool
+target_viewer_tracking_tracked_modes(uint64_t screen_id, struct xrt_viewer_tracked_modes *out);
 
 //! The live provider state for one screen's decision (reads the chosen provider's status and ring).
 enum target_viewer_provider_state

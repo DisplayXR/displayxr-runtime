@@ -16,6 +16,7 @@
 
 #include "util/u_setting.h"
 
+#include <cstdlib>
 #include <string>
 
 namespace {
@@ -130,4 +131,71 @@ TEST_CASE("per-screen preference is not a scalar option", "[u_setting][per_scree
 	CHECK_FALSE(u_setting_user_set_preferred_plugin_for_screen("A=B", "sim-display"));
 	CHECK_FALSE(u_setting_user_set_preferred_plugin_for_screen("A;B", "sim-display"));
 	CHECK_FALSE(u_setting_user_set_preferred_plugin_for_screen(nullptr, "sim-display"));
+}
+
+
+/*
+ *
+ * ADR-066 Part B: the per-screen viewer-tracking setting, same chain, own stores.
+ *
+ */
+
+TEST_CASE("viewer tracking: off / 3d / always, 'on' = 3d, anything else unset", "[u_setting][per_screen][viewer]")
+{
+	CHECK(u_setting_viewer_tracking_parse("off") == U_SETTING_VIEWER_TRACKING_OFF);
+	CHECK(u_setting_viewer_tracking_parse(" OFF ") == U_SETTING_VIEWER_TRACKING_OFF);
+	CHECK(u_setting_viewer_tracking_parse("3d") == U_SETTING_VIEWER_TRACKING_3D);
+	CHECK(u_setting_viewer_tracking_parse("3D") == U_SETTING_VIEWER_TRACKING_3D);
+	CHECK(u_setting_viewer_tracking_parse("on") == U_SETTING_VIEWER_TRACKING_3D);
+	CHECK(u_setting_viewer_tracking_parse("always") == U_SETTING_VIEWER_TRACKING_ALWAYS);
+	CHECK(u_setting_viewer_tracking_parse("sometimes") == U_SETTING_VIEWER_TRACKING_UNSET);
+	CHECK(u_setting_viewer_tracking_parse("") == U_SETTING_VIEWER_TRACKING_UNSET);
+	CHECK(u_setting_viewer_tracking_parse(nullptr) == U_SETTING_VIEWER_TRACKING_UNSET);
+	CHECK(std::string(u_setting_viewer_tracking_str(U_SETTING_VIEWER_TRACKING_3D)) == "3d");
+	CHECK(std::string(u_setting_viewer_tracking_str(U_SETTING_VIEWER_TRACKING_UNSET)) == "default");
+	// Round trip: what the writer stores, the parser reads back.
+	for (auto v : {U_SETTING_VIEWER_TRACKING_OFF, U_SETTING_VIEWER_TRACKING_3D, U_SETTING_VIEWER_TRACKING_ALWAYS}) {
+		CHECK(u_setting_viewer_tracking_parse(u_setting_viewer_tracking_str(v)) == v);
+	}
+}
+
+TEST_CASE("viewer tracking: its own object in the settings file, never the DP preference's",
+          "[u_setting][per_screen][viewer]")
+{
+	const char *json =
+	    "{\"preferred_plugin_per_screen\": {\"AUO-B194-0000ABCD\": \"leia-sr\"},"
+	    " \"viewer_tracking_per_screen\": {\"auo-1234-00000000@display1\": \"always\"}}";
+	char buf[32];
+	CHECK(u_setting_viewer_tracking_json_lookup(json, kLaptop, buf, sizeof(buf)));
+	CHECK(std::string(buf) == "always");
+	CHECK_FALSE(u_setting_viewer_tracking_json_lookup(json, kDs1, buf, sizeof(buf)));
+	CHECK(u_setting_per_screen_json_lookup(json, kDs1, buf, sizeof(buf)));
+	CHECK(std::string(buf) == "leia-sr");
+	CHECK_FALSE(u_setting_per_screen_json_lookup(json, kLaptop, buf, sizeof(buf)));
+}
+
+TEST_CASE("viewer tracking: the environment tier wins and a reload bumps the generation",
+          "[u_setting][per_screen][viewer]")
+{
+	const uint64_t g0 = u_setting_per_screen_generation();
+#ifdef _WIN32
+	_putenv_s(U_SETTING_VIEWER_TRACKING_ENV, "AUO-1234-00000000@DISPLAY1=3d; AUO-B194-0000ABCD = off");
+#else
+	setenv(U_SETTING_VIEWER_TRACKING_ENV, "AUO-1234-00000000@DISPLAY1=3d; AUO-B194-0000ABCD = off", 1);
+#endif
+	u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+	CHECK(u_setting_get_viewer_tracking_for_screen(kLaptop, &src) == U_SETTING_VIEWER_TRACKING_3D);
+	CHECK(src == U_SETTING_SOURCE_ENV);
+	CHECK(u_setting_get_viewer_tracking_for_screen(kDs1, &src) == U_SETTING_VIEWER_TRACKING_OFF);
+	CHECK(src == U_SETTING_SOURCE_ENV);
+#ifdef _WIN32
+	_putenv_s(U_SETTING_VIEWER_TRACKING_ENV, "");
+#else
+	unsetenv(U_SETTING_VIEWER_TRACKING_ENV);
+#endif
+	u_setting_per_screen_reload();
+	CHECK(u_setting_per_screen_generation() > g0);
+	// The writer refuses keys the env spec could not carry.
+	CHECK_FALSE(u_setting_user_set_viewer_tracking_for_screen("A=B", U_SETTING_VIEWER_TRACKING_3D));
+	CHECK_FALSE(u_setting_user_set_viewer_tracking_for_screen("", U_SETTING_VIEWER_TRACKING_3D));
 }

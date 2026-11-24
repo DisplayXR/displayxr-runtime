@@ -76,6 +76,12 @@ extern "C" {
 //! Size of the provider id / source / camera key strings in the page (NUL included).
 #define U_VPP_ID_MAX 64u
 #define U_VPP_TEXT_MAX 128u
+//! Size of the availability detail string in the producer block (ADR-066 Part B).
+#define U_VPP_AVAIL_DETAIL_MAX 64u
+//! Bits of @ref u_vpp_producer_status::avail_flags.
+#define U_VPP_AVAIL_STATED (1u << 0)           //!< the block carries an availability answer
+#define U_VPP_AVAIL_AVAILABLE (1u << 1)        //!< the provider could serve
+#define U_VPP_AVAIL_SERVE_BY_DEFAULT (1u << 2) //!< ...every screen with no per-screen value
 
 //! Producer heartbeat age past which the producer counts as gone (it beats every ~100 ms).
 #define U_VPP_HEARTBEAT_STALE_NS ((int64_t)1500 * 1000 * 1000)
@@ -132,6 +138,15 @@ struct u_vpp_producer_status
 	uint32_t license_state;
 	uint32_t license_source;       //!< XRT_COMPONENT_LICENSE_SOURCE_* (0 = not stated)
 	int64_t license_expiry_unix_s; //!< seconds since the Unix epoch UTC; 0 = none
+	/*!
+	 * ADR-066 Part B: the provider's availability as the host's probe read it
+	 * (U_VPP_AVAIL_* bits; 0 = an older host, nothing stated). Written on the
+	 * probe's no-provider exit too, so the service can say why. Formerly
+	 * unused, zero bytes of the producer block: the page version is unchanged.
+	 */
+	uint32_t avail_flags;
+	uint32_t avail_reason; //!< enum xrt_tracking_unavailable_reason / TARGET_TRACKING_UNAVAILABLE_*
+	char avail_detail[U_VPP_AVAIL_DETAIL_MAX];
 };
 
 //! The geometry block, as copied out by @ref u_vpp_read_geometry.
