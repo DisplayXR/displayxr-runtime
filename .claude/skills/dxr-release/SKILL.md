@@ -69,15 +69,19 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 | `earthview` / `demo-earthview` | `DisplayXR/displayxr-demo-earthview` | `earthview_demo` | `build-macos.yml` | same repo |
 | `unity` | `DisplayXR/displayxr-unity` | *(none — not pinned)* | `build-native.yml` | same repo |
 
-**`leia-conversion` and `ultraleap` have no release yet** (2026-11). Three things differ
-until each has one:
-- **`versions.json` has no field for them.** That is deliberate: a pin naming a tag that does
-  not exist breaks `setup-displayxr` and `displayxr-installer`'s coverage check. The first
-  release's `versions-bump` dispatch **adds** the field (`scripts/apply_versions_bump.py`,
-  `FIRST_RELEASE_FIELDS`), so Phase 4 reports `ADDED`, not `BUMPED`, and the commit subject
-  still reads `bump <field> → <tag>`. After that first release, remove the field from
-  `FIRST_RELEASE_FIELDS` and from `COMPONENTS_AWAITING_FIRST_RELEASE` (`components.sh` and
-  the `.bat`); `scripts/tests/test_component_tables.py` fails until all three agree.
+**`leia-conversion` has been released** (v0.1.0, 2026-11-23): `leia_conversion` is an
+ordinary pinned field and Phase 4 reports `BUMPED` for it. **`ultraleap` has no release
+yet.** The first two points below apply to `ultraleap` until it has one; the third holds
+for both providers on every release:
+- **`versions.json` has no `ultraleap` field.** That is deliberate: a pin naming a tag that
+  does not exist breaks `setup-displayxr` and `displayxr-installer`'s coverage check. The
+  first release's `versions-bump` dispatch **adds** the field
+  (`scripts/apply_versions_bump.py`, `FIRST_RELEASE_FIELDS`), so Phase 4 reports `ADDED`,
+  not `BUMPED`, and the commit subject still reads `bump <field> → <tag>`. After that first
+  release, remove the field from `FIRST_RELEASE_FIELDS` and from
+  `COMPONENTS_AWAITING_FIRST_RELEASE` (`components.sh` and the `.bat`);
+  `scripts/tests/test_apply_versions_bump.py` and `test_component_tables.py` fail on `main`
+  and on every PR until that is done.
 - **Before the first tag, `displayxr-installer` must already list the field** in
   `$IntentionallyUnbundled` (`scripts/check_bundle_coverage.ps1`). Otherwise the mirrored
   `versions.json` fails that repo's `build-bundle.yml` on the new key.
@@ -88,10 +92,13 @@ until each has one:
   on the runtime it was built at (ADR-063).
 
 `ultraleap` builds on a self-hosted runner that has the Ultraleap SDK, and its repo gates
-the dispatch on the repository variable `DXR_VERSIONS_BUMP=true`. Neither repo is known to
-the signing provider yet, so Phase 3.5 has nothing to dispatch for them (`INST=""`): an
+the dispatch on the repository variable `DXR_VERSIONS_BUMP=true`. `ultraleap` is not known
+to the signing provider yet, so Phase 3.5 has nothing to dispatch for it (`INST=""`): an
 unsigned provider release is **not listed in the component catalog** (every listed asset
 is signed), so teach the signing provider the component before expecting it there.
+`leia-conversion` is signed through Phase 3.5 like any installer component once the signing
+provider's `leia-conversion` recipe is merged; a provider without it returns no
+`DisplayXRLeiaConversionSetup-<version>.exe` and the release ships unsigned.
 
 **Browser is special** — it is the second private→public split after the shell
 (source, patch series, build lanes and the Android keystore live in the PRIVATE
@@ -806,11 +813,12 @@ fi
 ```
 
 ### Step 3.5.2: Normalize the component name for the workflow
-The workflow expects canonical names (`runtime|leia-plugin|mcp|gauss|modelviewer|mediaplayer|avatar|earthview`).
+The workflow expects canonical names (`runtime|leia-plugin|leia-conversion|mcp|gauss|modelviewer|mediaplayer|avatar|earthview`).
 Map the skill's aliases:
 ```bash
 case "$COMPONENT" in
   leia|leia-plugin)              COMP=leia-plugin ;;
+  leia-conversion)               COMP=leia-conversion ;;
   gauss|demo-gaussiansplat)      COMP=gauss ;;
   modelviewer|demo-modelviewer)  COMP=modelviewer ;;
   avatar|demo-avatar)            COMP=avatar ;;
@@ -828,6 +836,7 @@ esac
 # Expected installer basename per component — the artifact must hold EXACTLY this file.
 case "$COMP" in
   leia-plugin) INST=DisplayXRLeiaSRSetup ;;
+  leia-conversion) INST=DisplayXRLeiaConversionSetup ;;
   mcp)         INST=DisplayXRMCPSetup ;;
   gauss)       INST=DisplayXRGaussianSplatSetup ;;
   modelviewer) INST=DisplayXRModelViewerSetup ;;

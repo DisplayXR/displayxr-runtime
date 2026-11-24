@@ -39,6 +39,7 @@
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_shmem.h"
 #include "server/ipc_server.h"
+#include "server/ipc_server_conv.h" // #2769: the display re-probe hook
 #include "server/ipc_server_stereo_camera.h"
 #include "server/ipc_server_interface.h"
 #include "server/ipc_server_peer_creds.h"
@@ -1105,6 +1106,9 @@ reprobe_run(struct ipc_server *s, const char *reason, bool world_event)
 		U_LOG_W("display re-probe (%s): adopted plug-in '%s' (was the fallback).",
 		        reason != NULL ? reason : "?", s->xsysc->info.active_plugin_id);
 	}
+	// #2769: the active display driver (and so whether it offers lift) may
+	// have changed: the conversion side lists its built-in dp-lift row on it.
+	ipc_server_conv_display_plugins_reprobed(ipc_server_get_conv());
 }
 
 static void *

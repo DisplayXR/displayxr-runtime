@@ -927,8 +927,10 @@ xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift; /* a DP that serves ONLY the lif
   Modes 0 / a NULL slot / an older `struct_size` all read as "no module".
 - **Knobs live in the SERVICE's environment.** A vendor module that reads env vars (backend
   choice, gains) reads them in `displayxr-service.exe`'s process, not the app's.
-- **sim_display** fills the slots only under `SIM_DISPLAY_FAKE_LIFT=1` (shifted SBS/N-view,
-  gradient depth, a two-layer 3DGS PLY) so the whole path runs hardware-free.
+- **sim_display** fills the slots, and exports the lift-only factory, only with its test
+  converter on (setting `LIFT`, legacy `SIM_DISPLAY_FAKE_LIFT=1`: shifted SBS/N-view, gradient
+  depth, a two-layer 3DGS PLY) so the whole path runs hardware-free. Off by default: a default
+  sim_display offers no lift and the runtime lists no `dp-lift` row for it (#2769).
 - **Purely additive**, so no `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020).
 
 ## Where the window may LAND: `snap_window_rect`

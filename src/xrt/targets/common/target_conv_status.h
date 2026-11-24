@@ -20,7 +20,8 @@
  * The legacy `dp-lift` adapter row (spec §4.5) is described STATICALLY here:
  * declared when the active display plug-in exposes the lift-only factory,
  * without calling it. The service's adapter (#2003) replaces this with its
- * live row; until then this is the only place a dp-lift row exists.
+ * live row, registered on the same test (#2769): no lift-only factory = the
+ * display driver offers no lift = no dp-lift row, headless or live.
  *
  * @ingroup target_common
  */

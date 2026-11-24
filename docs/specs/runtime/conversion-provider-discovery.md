@@ -602,11 +602,13 @@ Both hostings implement the same service-side **host interface** (describe, warm
 
 A runtime-internal provider with no DLL and no negotiate: a synthetic row at **ProbeOrder 150**. It wraps whatever the lift-only factory resolves to today — the active display plug-in's `create_dp_d3d11_lift` (`xrt_plugin.h:1261`, plumbed at `target_instance.c:136-143`), else the ordinary D3D11 factory with a NULL window (`comp_d3d11_service.cpp:35798-35799`, `d3d11_lift.cpp:837-839`) — and its D3D11 lift slots (BASE+25..29, +33).
 
+- **Listed only when the display driver offers lift (#2769, the 2026-11 decision).** No display driver carries a 2D-to-3D converter from now on; converters ship only as conversion providers. So the row is registered in the service, and listed by `conv list` / `selftest` / the Dashboard, **only when the active display plug-in exports the lift-only factory** (`create_dp_d3d11_lift`). That is the one cheap, truthful sign that a driver offers lift: the runtime reads a pointer and creates nothing. A driver without it gets no row at all, and the service logs one line saying so. The live service and the headless pass use the same test, so they agree. Not covered: a plug-in that fills the lift slots on its ordinary factory but exports no lift-only factory is no longer probed (that needed a display processor created on a NULL window just to look); the slots and the factory were introduced together and every released plug-in that fills the slots exports the factory.
+- **The answer is re-checked while the service runs:** when the GPU side attaches, on every display re-probe and on a `DisplayProcessors` registry change. A plug-in that offers lift and is adopted after the service started gets its row then. The other direction is not live: the conversion core cannot remove a provider, so a row that was registered stays until the service restarts and answers `ABSENT`, as it did before this rule.
 - **Hosting: in-service, always.** It needs the display plug-in, which never leaves the service (ADR-035 D4), and the lift-only factory assumes the service's context. It ignores `Hosting`.
 - **Hidden** when a registered provider declares `Supersedes = dp-lift`, so a vendor's new provider and its old DP slots are never listed twice.
 - **Re-resolved on every retry** from the plug-in that registered it, never from the per-window DP factory; a display plug-in swap (`refresh_display_processors_cb`, `target_instance.c:565`) re-describes it.
 
-**Static describe.** If the active display plug-in exposes the lift-only factory, or `create_dp_d3d11` with `XRT_DP_D3D11_HAS_LIFT`, the adapter declares `DEPTH_MONO`, `DEPTH_VIDEO` and `VIEWS_MONO` (min 2, max 8) as **INSTALLED** with provisional outputs, without calling the factory. It refines the declaration after the first `lift_get_caps`, and reports `ABSENT` only after the factory refuses or the module reports ABSENT. "Not yet asked" is never terminal.
+**Static describe.** If the active display plug-in exposes the lift-only factory, the adapter declares `DEPTH_MONO`, `DEPTH_VIDEO` and `VIEWS_MONO` (min 2, max 8) as **INSTALLED** with provisional outputs, without calling the factory. It refines the declaration after the first `lift_get_caps`, and reports `ABSENT` only after the factory refuses or the module reports ABSENT. "Not yet asked" is never terminal.
 
 **Capability refinement** from `lift_get_caps` (polled ≤ 1 Hz while not READY):
 
@@ -626,7 +628,7 @@ All three capabilities: `licence_class = UNKNOWN`, `commercial_ok = 0`, **exempt
 |---|---|---|
 | Freeze | P1 | Nothing is ever appended to `xrt_dp_lift.h`, the D3D11 lift slots or `create_dp_d3d11_lift`. A header banner says so; the header stays in `downstream-pins.json` `feature_surface` so a stray edit still trips the repin gate. Frozen as dead ABI under `XRT_PLUGIN_API_VERSION` 5. |
 | Parallel | P3 | The vendor ships a separate conversion provider with `Supersedes = dp-lift`, satellite-hosted; it may keep filling the DP slots for older runtimes (ABI 5 unaffected). |
-| Deprecate | first runtime release after that | one WARN per service start while the adapter is active: "display plug-in lift slots are deprecated — ship a conversion provider". |
+| Deprecate | **as built, 2026-11 (#2769 step a, "hide")** | Chosen by the 2026-11 decision in place of the WARN this row used to describe (never built): the row exists only when the active display driver offers lift (the rule at the top of this section). Nothing is deleted: a plug-in that still fills the slots is served exactly as before. One WARN when the row is registered; one line when it is not listed. The in-tree `sim_display` follows the same rule: it exports the lift-only factory only with its test converter on (setting `LIFT`). |
 | Remove | the next `XRT_PLUGIN_API_VERSION` major (**v6**), whenever it happens for its own reasons | the slots leave with the v6 layout; `xrt_dp_lift.h` is deleted. No lift-only major bump: dead appended slots cost nothing (ADR-020 §2). |
 
 ---
@@ -981,7 +983,7 @@ New check **`conversion_providers`** (`cli_query.c` check table `:2918-3087`):
 - Verifies ABI 1, a well-formed `describe_cap` (known task, `lanes ≠ 0`, `min_views ≤ max_views ≤ 8`, `VIEWS_*` ⇒ `EXPLICIT_VIEWPOINTS`, known licence class, unique `cap_id`) and in-range states.
 - **Absence never fails** — no provider registered, or no service, passes.
 - A malformed descriptor fails with the new exit code **`CLI_SELFTEST_BAD_CONVERSION = 13`**.
-- `lift_caps` / exit 11 stays and reads the `dp-lift` row.
+- `lift_caps` / exit 11 stays and reads the `dp-lift` row when there is one. With a display driver that offers no lift there is no row (§4.5); the note then reads "not listed, the display driver offers no lift (no lift-only factory; OK)" and nothing fails.
 - CI registers `sim-conversion` with `ENABLE` = 1 and requires `conversion_providers.count ≥ 1` in `selftest --json`.
 
 As built (#2006): the pass is `target_conv_status` (targets/common), shared with `conv
@@ -992,6 +994,7 @@ in the §7.3 row shape) next to the `conversion_providers` row of `checks[]`. A 
 *registry row* (no `Binary`, bad JSON) and a loader reject (ABI, missing binary) are
 reported, never failed — only a malformed *descriptor* or an out-of-range `get_state` is.
 `lift_caps` no longer instantiates anything headless: it reports the static `dp-lift` row
+(present only when the active display driver offers lift, §4.5; `dp_lift_declared` says which)
 and, when a service is listening, the service's live caps over one DIAG
 `lift_get_properties` (`cli_lift_service.c`). The CI gate on `count ≥ 1` runs only when the
 sim provider DLL was built and registered (until #2002 makes that unconditional).

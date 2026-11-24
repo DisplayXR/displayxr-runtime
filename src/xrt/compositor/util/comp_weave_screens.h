@@ -137,6 +137,75 @@ comp_weave_screens_project(const struct xrt_screen_list *in,
                            struct comp_seg_rect *out_window);
 
 /*!
+ * A native-Wayland window as the in-process Vulkan compositor's geometry
+ * service hands it over (comp_vk_native_wl_window_rect): device px RELATIVE to
+ * the window's own monitor, plus the logical (Mutter stage) origins of the
+ * content and of that monitor and the stage -> device factor it converted with.
+ */
+struct comp_weave_monitor_window
+{
+	//! Content top-left, device px, relative to its monitor's top-left.
+	int32_t left_px, top_px;
+	//! Content size, device px.
+	uint32_t w, h;
+	//! The window's monitor's own size, device px.
+	uint32_t monitor_w, monitor_h;
+	//! Content and monitor top-left, logical (stage) px.
+	int32_t content_logical_x, content_logical_y;
+	int32_t mon_logical_x, mon_logical_y;
+	//! Device px per stage px for this window.
+	float scale;
+};
+
+//! The outcome of @ref comp_weave_screens_project_monitor_relative.
+enum comp_weave_monitor_match
+{
+	//! Placed: exactly one screen is the window's monitor.
+	COMP_WEAVE_MONITOR_OK = 0,
+	//! No usable window or scale: nothing placed.
+	COMP_WEAVE_MONITOR_NO_WINDOW = 1,
+	//! The projection put no screen where the window's monitor is (the
+	//! screen list and the geometry service disagree about the layout).
+	COMP_WEAVE_MONITOR_NO_SCREEN = 2,
+	//! More than one screen fits the window's monitor.
+	COMP_WEAVE_MONITOR_AMBIGUOUS = 3,
+};
+
+//! A short phrase for @p r, for the log.
+const char *
+comp_weave_monitor_match_str(enum comp_weave_monitor_match r);
+
+/*!
+ * Native Wayland, in-process (ADR-047 on #1596's monitor-relative geometry):
+ * place @p in's screens and the window in the window's own pixel frame with
+ * @ref comp_weave_screens_project (LOGICAL rule), the window anchored the way
+ * the XR_DXR_weave geometry convention anchors it (its monitor's logical
+ * origin x the factor, plus its monitor-relative offset), then find the
+ * window's monitor among the projected screens.
+ *
+ * A screen IS the window's monitor when its projected rect starts where the
+ * window says its monitor starts (window - (left_px, top_px)) and has the
+ * monitor's device size, each within 1 px (a compositor that keeps positions
+ * fractional reports a content rect one pixel off the logical conversion).
+ * Size alone is not enough (two identical panels), and position alone is not
+ * either (a screen whose scale the list does not know projects at the wrong
+ * size). Exactly one match places the window; none, or more than one, refuses
+ * and the caller keeps its single-screen path.
+ *
+ * @param[out] out            the projected list (always written; a copy of
+ *                            @p in unless the result is OK).
+ * @param[out] out_window     the window's content rect in that frame.
+ * @param[out] out_monitor    (may be NULL) index into @p in of the window's
+ *                            monitor; UINT32_MAX unless OK.
+ */
+enum comp_weave_monitor_match
+comp_weave_screens_project_monitor_relative(const struct xrt_screen_list *in,
+                                            const struct comp_weave_monitor_window *mw,
+                                            struct xrt_screen_list *out,
+                                            struct comp_seg_rect *out_window,
+                                            uint32_t *out_monitor);
+
+/*!
  * The macOS present-owner's window as the bind published it (spec v7
  * XrWeaveWindowGeometryDXR on macOS).
  */

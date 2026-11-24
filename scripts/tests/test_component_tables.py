@@ -29,6 +29,10 @@ SH = (REPO_ROOT / "scripts/lib/components.sh").read_text(encoding="utf-8")
 BAT = (REPO_ROOT / "scripts/setup-displayxr.bat").read_text(encoding="utf-8")
 VERSIONS = json.loads((REPO_ROOT / "versions.json").read_text(encoding="utf-8"))
 
+# The out-of-tree providers: each has its own repo, a plug-in ABI gate of its own
+# and an opt-in flag, whether or not it has had its first release.
+PROVIDERS = ("leia_conversion", "ultraleap")
+
 
 def sh_var(name: str) -> str | None:
     m = re.search(r'(?m)^' + re.escape(name) + r'="([^"]*)"', SH)
@@ -46,10 +50,29 @@ class AwaitingFirstRelease(unittest.TestCase):
         self.assertEqual(sorted(sh_var("COMPONENTS_AWAITING_FIRST_RELEASE").split()), want)
         self.assertEqual(sorted(bat_var("COMPONENTS_AWAITING_FIRST_RELEASE").split()), want)
 
-    def test_an_awaiting_component_has_no_pin_and_full_plumbing(self):
+    def test_an_awaiting_component_has_no_pin(self):
         for name in avb.FIRST_RELEASE_FIELDS:
             with self.subTest(component=name):
                 self.assertNotIn(name, VERSIONS)
+                self.assertIn(name, PROVIDERS)
+
+    def test_a_provider_is_pinned_or_awaiting_never_both_never_neither(self):
+        for name in PROVIDERS:
+            with self.subTest(component=name):
+                self.assertNotEqual(name in VERSIONS, name in avb.FIRST_RELEASE_FIELDS)
+
+    def test_bat_reads_a_pin_as_optional_only_while_it_awaits_a_release(self):
+        optional = re.findall(r"(?m)call :read_pin_optional (\w+) ", BAT)
+        self.assertEqual(sorted(optional), sorted(avb.FIRST_RELEASE_FIELDS))
+        strict = re.findall(r"(?m)^call :read_pin (\w+) ", BAT)
+        for name in PROVIDERS:
+            if name in VERSIONS:
+                self.assertIn(name, strict)
+
+    def test_a_provider_has_full_plumbing(self):
+        # Before its first release and after it.
+        for name in PROVIDERS:
+            with self.subTest(component=name):
                 self.assertTrue(sh_var(f"COMPONENT_REPO_{name}"))
                 self.assertTrue(sh_var(f"COMPONENT_EXE_WINDOWS_{name}"))
                 self.assertEqual(bat_var(f"COMPONENT_REPO_{name}"), sh_var(f"COMPONENT_REPO_{name}"))
@@ -80,9 +103,12 @@ class OptIn(unittest.TestCase):
                 self.assertIn(f'if /i "%~1"=="{flag}"', BAT)
 
     def test_awaiting_components_are_opt_in_never_default(self):
+        # A first release does not make a provider a default install.
+        self.assertLessEqual(set(avb.FIRST_RELEASE_FIELDS), set(PROVIDERS))
         optin = {p.split(":")[1] for p in sh_var("OPTIN_COMPONENTS").split()}
-        for name in avb.FIRST_RELEASE_FIELDS:
+        for name in PROVIDERS:
             self.assertIn(name, optin)
+            self.assertIn(f"call :install_component {name} ", BAT)
             # The .bat default chain never names them unconditionally.
             for line in BAT.splitlines():
                 if f"call :install_component {name} " in line:

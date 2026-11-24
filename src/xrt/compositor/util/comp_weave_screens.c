@@ -161,6 +161,94 @@ comp_weave_screens_project(const struct xrt_screen_list *in,
 	return COMP_WEAVE_FRAME_LOGICAL;
 }
 
+const char *
+comp_weave_monitor_match_str(enum comp_weave_monitor_match r)
+{
+	switch (r) {
+	case COMP_WEAVE_MONITOR_OK: return "placed";
+	case COMP_WEAVE_MONITOR_NO_WINDOW: return "no window geometry";
+	case COMP_WEAVE_MONITOR_NO_SCREEN: return "no listed screen is the window's monitor";
+	case COMP_WEAVE_MONITOR_AMBIGUOUS: return "more than one listed screen fits the window's monitor";
+	default: return "unknown";
+	}
+}
+
+static bool
+within_1px(int64_t a, int64_t b)
+{
+	return a - b <= 1 && b - a <= 1;
+}
+
+enum comp_weave_monitor_match
+comp_weave_screens_project_monitor_relative(const struct xrt_screen_list *in,
+                                            const struct comp_weave_monitor_window *mw,
+                                            struct xrt_screen_list *out,
+                                            struct comp_seg_rect *out_window,
+                                            uint32_t *out_monitor)
+{
+	if (out_monitor != NULL) {
+		*out_monitor = UINT32_MAX;
+	}
+	if (out == NULL || out_window == NULL) {
+		return COMP_WEAVE_MONITOR_NO_WINDOW;
+	}
+	memset(out_window, 0, sizeof(*out_window));
+	if (in == NULL) {
+		memset(out, 0, sizeof(*out));
+		return COMP_WEAVE_MONITOR_NO_WINDOW;
+	}
+	*out = *in;
+	if (mw == NULL || mw->w == 0 || mw->h == 0 || mw->monitor_w == 0 || mw->monitor_h == 0 || !(mw->scale > 0.0f) ||
+	    mw->scale > 64.0f) {
+		return COMP_WEAVE_MONITOR_NO_WINDOW;
+	}
+
+	// The XR_DXR_weave geometry convention: the monitor's logical origin x
+	// the factor, plus the monitor-relative device offset. Any anchor gives
+	// the same table (the projection is anchored on the window); this one
+	// reads naturally in the log.
+	const struct comp_weave_window win = {
+	    .x = u_wl_logical_to_px(mw->mon_logical_x, (double)mw->scale) + mw->left_px,
+	    .y = u_wl_logical_to_px(mw->mon_logical_y, (double)mw->scale) + mw->top_px,
+	    .w = mw->w,
+	    .h = mw->h,
+	    .logical_valid = true,
+	    .logical_x = mw->content_logical_x,
+	    .logical_y = mw->content_logical_y,
+	    .logical_scale = mw->scale,
+	};
+	struct comp_seg_rect wr;
+	if (comp_weave_screens_project(in, &win, out, &wr) != COMP_WEAVE_FRAME_LOGICAL) {
+		*out = *in;
+		return COMP_WEAVE_MONITOR_NO_WINDOW;
+	}
+
+	const int64_t mon_x = (int64_t)win.x - mw->left_px;
+	const int64_t mon_y = (int64_t)win.y - mw->top_px;
+	uint32_t hit = UINT32_MAX;
+	uint32_t hits = 0;
+	for (uint32_t i = 0; i < out->count && i < XRT_SCREEN_LIST_MAX; i++) {
+		const struct xrt_screen *o = &out->screens[i];
+		if (!screen_placed(o)) {
+			continue;
+		}
+		if (within_1px(o->desktop_left, mon_x) && within_1px(o->desktop_top, mon_y) &&
+		    within_1px(o->desktop_width, mw->monitor_w) && within_1px(o->desktop_height, mw->monitor_h)) {
+			hit = i;
+			hits++;
+		}
+	}
+	if (hits != 1) {
+		*out = *in;
+		return hits == 0 ? COMP_WEAVE_MONITOR_NO_SCREEN : COMP_WEAVE_MONITOR_AMBIGUOUS;
+	}
+	*out_window = wr;
+	if (out_monitor != NULL) {
+		*out_monitor = hit;
+	}
+	return COMP_WEAVE_MONITOR_OK;
+}
+
 float
 comp_weave_screens_cg_scale(const struct xrt_screen *s)
 {

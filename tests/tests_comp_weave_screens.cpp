@@ -763,3 +763,180 @@ TEST_CASE("weave_screens: an EDID physical-size refinement alone is not a new ta
 	b.screens[0].confidence = 1;
 	CHECK(comp_weave_screens_compare(&a, &b) == COMP_WEAVE_SCREENS_MEMBERSHIP);
 }
+
+/*
+ *
+ * Native Wayland, in-process (ADR-047 on #1596): the window as wl_geom reports
+ * it — device px relative to its own monitor, plus logical origins.
+ *
+ */
+
+namespace {
+
+/*!
+ * ds1-linux as it is today: the laptop (2880x1800 at 167 %, logical 1728x1080
+ * at 0,0) and the DS1 (3840x2160 at 200 %, logical 1920x1080 at 1728,0).
+ * XWayland's root is the stage x 2, so the laptop is 3456x2160 X11 px and the
+ * DS1 sits at X11 x = 3456 (what the runtime resolved for the panel).
+ */
+xrt_screen_list
+desk_ds1()
+{
+	xrt_screen_list l{};
+	l.count = 2;
+	l.screens[0] = mk_screen(ZR, XRT_SCREEN_FLAG_SYSTEM_DEFAULT, 3456, 0, 3840, 2160, 3840, 2160, 2.0f, "leia-sr");
+	l.screens[1] =
+	    mk_screen(EDP, XRT_SCREEN_FLAG_PRIMARY, 0, 0, 3456, 2160, 2880, 1800, LAPTOP_SCALE, "sim-display");
+	return l;
+}
+
+//! What wl_geom hands over for content at logical (lx, ly), w x h device px,
+//! on the monitor at logical (mon_lx, mon_ly) of mon_w x mon_h device px.
+comp_weave_monitor_window
+wl_win(int32_t mon_lx,
+       int32_t mon_ly,
+       uint32_t mon_w,
+       uint32_t mon_h,
+       float scale,
+       int32_t lx,
+       int32_t ly,
+       uint32_t w,
+       uint32_t h)
+{
+	comp_weave_monitor_window m{};
+	m.left_px = u_wl_logical_to_px(lx - mon_lx, scale);
+	m.top_px = u_wl_logical_to_px(ly - mon_ly, scale);
+	m.w = w;
+	m.h = h;
+	m.monitor_w = mon_w;
+	m.monitor_h = mon_h;
+	m.content_logical_x = lx;
+	m.content_logical_y = ly;
+	m.mon_logical_x = mon_lx;
+	m.mon_logical_y = mon_ly;
+	m.scale = scale;
+	return m;
+}
+
+struct wl_cut
+{
+	comp_weave_monitor_match r;
+	uint32_t monitor;
+	xrt_screen_list proj;
+	comp_seg_rect win;
+	comp_segment_table t;
+	bool split;
+};
+
+wl_cut
+place_wl(const xrt_screen_list &l, const comp_weave_monitor_window &mw)
+{
+	wl_cut c{};
+	c.r = comp_weave_screens_project_monitor_relative(&l, &mw, &c.proj, &c.win, &c.monitor);
+	if (c.r == COMP_WEAVE_MONITOR_OK) {
+		comp_segments_screen scr[COMP_SEGMENTS_MAX_SCREENS];
+		const uint32_t n = seg_screens(c.proj, scr);
+		const comp_seg_rect canvas = {0, 0, c.win.w, c.win.h};
+		comp_segments_compute(&c.win, &canvas, scr, n, &c.t);
+		c.split = comp_segments_table_is_split(&c.t, c.win.w, c.win.h);
+	}
+	return c;
+}
+
+} // namespace
+
+TEST_CASE("weave_screens Wayland: a window wholly on the laptop takes the laptop's segment")
+{
+	const xrt_screen_list l = desk_ds1();
+	const wl_cut c = place_wl(l, wl_win(0, 0, 2880, 1800, LAPTOP_SCALE, 100, 200, 1600, 1000));
+	REQUIRE(c.r == COMP_WEAVE_MONITOR_OK);
+	CHECK(c.monitor == 1);
+	// The laptop lands where the window says its monitor starts, at its device size.
+	CHECK(c.proj.screens[1].desktop_left == c.win.x - 167);
+	CHECK(c.proj.screens[1].desktop_top == c.win.y - 333);
+	CHECK(c.proj.screens[1].desktop_width == 2880);
+	CHECK(c.proj.screens[1].desktop_height == 1800);
+	// The DS1 sits right of it in the window's frame, resampled (another scale).
+	CHECK(c.proj.screens[0].desktop_left == c.proj.screens[1].desktop_left + 2880);
+	CHECK(c.proj.screens[0].native_width != c.proj.screens[0].desktop_width);
+
+	REQUIRE(c.t.count == 1);
+	CHECK(c.t.seg[0].screen_id == EDP);
+	CHECK_FALSE(c.t.seg[0].is_primary);
+	CHECK(c.t.seg[0].screen_1to1 == COMP_SEG_1TO1_YES);
+	CHECK(c.split); // off the default screen: the one-segment table is published
+}
+
+TEST_CASE("weave_screens Wayland: a window wholly on the 3D panel stays on the primary")
+{
+	const xrt_screen_list l = desk_ds1();
+	const wl_cut c = place_wl(l, wl_win(1728, 0, 3840, 2160, 2.0f, 1828, 100, 1200, 800));
+	REQUIRE(c.r == COMP_WEAVE_MONITOR_OK);
+	CHECK(c.monitor == 0);
+	CHECK(c.proj.screens[0].desktop_width == 3840);
+	CHECK(c.proj.screens[0].native_width == 3840);
+	CHECK(c.win.x - c.proj.screens[0].desktop_left == 200); // the panel-relative device origin
+	REQUIRE(c.t.count == 1);
+	CHECK(c.t.seg[0].is_primary);
+	CHECK_FALSE(c.split); // nothing published: the single-screen path, unchanged
+}
+
+TEST_CASE("weave_screens Wayland: a window across the seam is cut per screen")
+{
+	const xrt_screen_list l = desk_ds1();
+	// On the laptop (its monitor), 480 logical px wide from logical x 1500:
+	// 228 logical on the laptop, 252 on the DS1.
+	const wl_cut c = place_wl(l, wl_win(0, 0, 2880, 1800, LAPTOP_SCALE, 1500, 100, 800, 500));
+	REQUIRE(c.r == COMP_WEAVE_MONITOR_OK);
+	CHECK(c.monitor == 1);
+	REQUIRE(c.t.count == 2);
+	CHECK(c.split);
+	uint32_t edp_w = 0, zr_w = 0;
+	for (uint32_t k = 0; k < c.t.count; k++) {
+		(c.t.seg[k].screen_id == EDP ? edp_w : zr_w) = c.t.seg[k].window_rect.w;
+	}
+	CHECK(edp_w == 380); // 228 logical x 5/3
+	CHECK(zr_w == 420);
+}
+
+TEST_CASE("weave_screens Wayland: a content rect one px off the conversion still places")
+{
+	const xrt_screen_list l = desk_ds1();
+	comp_weave_monitor_window mw = wl_win(0, 0, 2880, 1800, LAPTOP_SCALE, 100, 200, 1600, 1000);
+	mw.left_px += 1; // buffer_device from a compositor with fractional positions
+	const wl_cut c = place_wl(l, mw);
+	CHECK(c.r == COMP_WEAVE_MONITOR_OK);
+	CHECK(c.monitor == 1);
+}
+
+TEST_CASE("weave_screens Wayland: no unambiguous monitor refuses, leaving the list untouched")
+{
+	const xrt_screen_list l = desk_ds1();
+
+	// The geometry service's monitor is not one the list places there.
+	wl_cut c = place_wl(l, wl_win(0, 0, 1920, 1080, LAPTOP_SCALE, 100, 200, 1600, 1000));
+	CHECK(c.r == COMP_WEAVE_MONITOR_NO_SCREEN);
+	CHECK(c.monitor == UINT32_MAX);
+	CHECK(std::memcmp(&c.proj, &l, sizeof(l)) == 0);
+
+	// A list that disagrees about the laptop's scale puts it elsewhere.
+	xrt_screen_list bad = l;
+	bad.screens[1].desktop_scale = 1.25f;
+	c = place_wl(bad, wl_win(0, 0, 2880, 1800, LAPTOP_SCALE, 100, 200, 1600, 1000));
+	CHECK(c.r == COMP_WEAVE_MONITOR_NO_SCREEN);
+
+	// Two identical laptops at the same place (a mirror): ambiguous.
+	xrt_screen_list mirror = l;
+	mirror.count = 3;
+	mirror.screens[2] = mirror.screens[1];
+	mirror.screens[2].id = 0x3003;
+	c = place_wl(mirror, wl_win(0, 0, 2880, 1800, LAPTOP_SCALE, 100, 200, 1600, 1000));
+	CHECK(c.r == COMP_WEAVE_MONITOR_AMBIGUOUS);
+
+	// No scale, or no size: no window.
+	comp_weave_monitor_window mw = wl_win(0, 0, 2880, 1800, LAPTOP_SCALE, 100, 200, 1600, 1000);
+	mw.scale = 0.0f;
+	CHECK(place_wl(l, mw).r == COMP_WEAVE_MONITOR_NO_WINDOW);
+	mw = wl_win(0, 0, 2880, 1800, LAPTOP_SCALE, 100, 200, 0, 1000);
+	CHECK(place_wl(l, mw).r == COMP_WEAVE_MONITOR_NO_WINDOW);
+}
