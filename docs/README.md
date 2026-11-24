@@ -58,6 +58,7 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 - **[Rear depth budget (explainer)](architecture/rear-depth-budget.md)** — plain-language: how a transparent app decides whether it may draw behind the screen (the plug-in supplies a desktop thumbnail, the runtime measures horizontal cues under the app's content bounds and publishes a budget, the app moves its far plane; ADR-040)
 - **[Service-Mode Multi-Compositor](architecture/multi-compositor.md)** — server-side N-client compositor (workspace + IPC apps + bridge)
 - **[Extension vs Legacy Apps](architecture/extension-vs-legacy.md)** — how the runtime handles both app types
+- **[Workspace Input Routing](architecture/workspace-input-routing.md)** — how pointer + keyboard reach a content app under a workspace controller, per platform (Windows PostMessage vs Linux/macOS queue + `XR_DXR_workspace_client_input`)
 - **[Service Architecture](architecture/service-architecture.md)** — the service as built: processes, threads, locks, the two compositor modes, client classes, failure domains, limits
 - **[One Compositor Pipeline (D3D11 service)](architecture/service-one-pipeline.md)** — #964 design note: always-on multi-comp, presenter kinds, default presenter policy, one DP per panel, legacy gate
 - **[comp_multi One Pipeline (macOS/Linux/Android)](architecture/comp-multi-one-pipeline.md)** — #967 design note: bounded waits, shared-surface port to Android, issue split

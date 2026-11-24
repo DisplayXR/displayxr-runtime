@@ -736,6 +736,10 @@ the #930 signature (no banner) rather than #943's (banner present). See the #943
 | #925 S1–S5 | ✔ | partly (#1005/#1007: waits bounded with a per-client stall deadline, GPU work + present under `render_lock` not `list_and_timing_lock`; `process_atlas` itself is still a vendor call without a timeout) | as macOS | as macOS |
 | supervision | orchestrator for children; nothing for the service | orchestrator | systemd user manager (`Restart=on-failure`; the socket re-starts it on the next connect) | the OS (`START_STICKY`, but restart arrives with a null Intent → not re-foregrounded, `MonadoService.kt:63-71`); no client reconnect |
 
+**Input under a workspace controller** is pushed into the app's hidden HWND on Windows and
+queued per client for the app to drain on macOS / Linux desktop — see
+[workspace-input-routing.md](workspace-input-routing.md).
+
 **ADR-025 clarification.** "Out-of-process" there means the *app* is isolated from the vendor
 SDK by the app↔service split; the DP still lives in the service. There is no DP proxy/host in
 the tree, #510 is open with every box unchecked, and CI does not exercise the Android service
