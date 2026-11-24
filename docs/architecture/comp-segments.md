@@ -168,9 +168,12 @@ or destroy is one WARN.
 ## Scope and switches
 
 - In-process Vulkan compositor, desktop Linux, **X11/XWayland**: root coordinates
-  are desktop-absolute, the same space as the registry's RandR rects. Native Wayland
-  stays primary-only — the geometry payload does not describe the other monitors
-  (`docs/specs/runtime/wayland-window-geometry.md` §5). On **Windows** the same
+  are desktop-absolute, the same space as the registry's RandR rects. **Native
+  Wayland** segments too: the screens are projected into the window's own pixel
+  frame from the geometry payload's monitor-relative rect and logical origins
+  (`comp_weave_screens_project_monitor_relative`), and the 1:1 hold is per DP
+  (`comp_segments_surface_hold`; `docs/specs/runtime/wayland-window-geometry.md`
+  §5). On **Windows** the same
   compositor segments too — see *Windows / Vulkan (M6)* below.
 - **Mixed vendors** (M3): a Leia DS1 next to a sim_display laptop panel is
   segmented like any other layout; each segment DP comes from its own screen's plug-in

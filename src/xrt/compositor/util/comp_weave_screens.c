@@ -179,6 +179,31 @@ within_1px(int64_t a, int64_t b)
 	return a - b <= 1 && b - a <= 1;
 }
 
+bool
+comp_weave_monitor_window_to_buffer(struct comp_weave_monitor_window *mw, uint32_t buffer_w, uint32_t buffer_h)
+{
+	if (mw == NULL || mw->w == 0 || mw->h == 0 || buffer_w == 0 || buffer_h == 0) {
+		return false;
+	}
+	if (buffer_w == mw->w && buffer_h == mw->h) {
+		return false;
+	}
+	const double kx = (double)buffer_w / (double)mw->w;
+	const double ky = (double)buffer_h / (double)mw->h;
+	// Uniform within a pixel over the window, or it is not a scale of it.
+	if (fabs(kx - ky) * (double)(mw->w > mw->h ? mw->w : mw->h) > 1.0) {
+		return false;
+	}
+	mw->left_px = (int32_t)lround((double)mw->left_px * kx);
+	mw->top_px = (int32_t)lround((double)mw->top_px * ky);
+	mw->monitor_w = (uint32_t)lround((double)mw->monitor_w * kx);
+	mw->monitor_h = (uint32_t)lround((double)mw->monitor_h * ky);
+	mw->scale = (float)((double)mw->scale * kx);
+	mw->w = buffer_w;
+	mw->h = buffer_h;
+	return true;
+}
+
 enum comp_weave_monitor_match
 comp_weave_screens_project_monitor_relative(const struct xrt_screen_list *in,
                                             const struct comp_weave_monitor_window *mw,

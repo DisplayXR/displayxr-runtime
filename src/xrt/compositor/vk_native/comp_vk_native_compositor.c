@@ -886,6 +886,9 @@ struct comp_vk_native_compositor
 #endif
 	//! Last SPAN_2D band count logged, so the line fires on change only.
 	uint32_t last_offpanel_band_count;
+	//! This frame was woven per screen (segments): its off-panel parts are
+	//! the segment record's (each screen's DP, or flat), not SPAN_2D bands.
+	bool frame_woven_per_screen;
 	/*!
 	 * #1748 measurement hook (DXR_WL_ORIGIN_STAMP=1): a host-visible buffer
 	 * holding a barcode of this frame's present origin, copied into the
@@ -1005,8 +1008,8 @@ struct comp_vk_native_compositor
 	 * Native Wayland (ADR-047 on #1596 geometry): the screens projected into
 	 * the window's own pixel frame (@ref vk_wl_seg_place) — what the manager's
 	 * screen rects were last set to (NULL = not applied to this manager yet).
-	 * Wayland segments for VIEWS only: the table frames xrLocateViews for a
-	 * window wholly on another screen; the frame keeps the single-DP path.
+	 * A window not wholly on the primary screen is woven per screen in that
+	 * frame, as the service weave engine weaves a present-owner.
 	 */
 	struct xrt_screen_list *seg_wl_proj;
 	//! Scratch for the placement (heap: an xrt_screen_list is a few KB).
@@ -1014,8 +1017,18 @@ struct comp_vk_native_compositor
 	//! The last placement outcome + monitor index logged (change-only WARN).
 	int seg_wl_logged_result;
 	uint32_t seg_wl_logged_monitor;
-	//! This weave's manager update found the window off the primary screen.
-	bool seg_wl_split;
+	/*!
+	 * The last weave could weave this window per screen: placed, segmentation
+	 * enabled, and a DP path the split records (not self-submitting, a render
+	 * pass). Read by the 1:1 hold (@ref vk_linux_update_surface_not_1to1).
+	 */
+	bool seg_wl_weave_ready;
+	//! The window's own monitor is the primary screen (last weave's table).
+	bool seg_wl_win_on_primary;
+	//! What the window's own monitor's segment DP says about a resample.
+	enum comp_seg_dp_resample seg_wl_win_dp;
+	//! The primary DP was last phased from the panel segment (change-only WARN).
+	bool seg_wl_primary_phased;
 	//! A one-screen table is published for xrLocateViews (change-only WARN).
 	bool seg_wl_published;
 	uint64_t seg_wl_published_screen;
@@ -4570,6 +4583,17 @@ vk_composite_offpanel_2d(struct comp_vk_native_compositor *c,
 	if (enabled == 0 || !c->use_wayland || cmd == VK_NULL_HANDLE || target_image == VK_NULL_HANDLE) {
 		return;
 	}
+	// Woven per screen: every part off the panel is the segment record's —
+	// its own screen's DP, or flat where none can weave (the #1654 rule, per
+	// screen, as in the service weave engine). No bands over it.
+	if (c->frame_woven_per_screen) {
+		if (c->last_offpanel_band_count != 0) {
+			c->last_offpanel_band_count = 0;
+			U_LOG_W(
+			    "SPAN_2D: window woven per screen — no off-panel bands (each screen's DP draws its part)");
+		}
+		return;
+	}
 	// Where the window is, and how big the panel is. Both from the same
 	// metrics read the present origin uses, so the bands and the weave phase
 	// can never disagree.
@@ -6039,9 +6063,26 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 	const bool fits_surface = wr.surface_within_frame;
 	// Multi-screen M2: (b) and (c) are resamples; a DP whose output survives
 	// one (XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) is not degraded by them.
-	// (a) stays: off the panel, native Wayland has no segment to weave into.
 	const bool tolerant = c->display_processor != NULL && c->dp_tolerates_resample;
-	const bool not_1to1 = !on_panel || (!tolerant && (!fits_window || !fits_surface));
+	// (a) is per DP now, not per session: a window off the panel that the
+	// last weave could weave per screen is drawn there by its own screen's DP
+	// in the app's mode (the service weave engine's "Per-screen display
+	// processors", #2218 item 6). The panel's lens still goes 2D because the
+	// window left it (#2247); the session is no longer forced to hardware 2D.
+	// Without a per-screen weave, off the panel holds exactly as before.
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	const bool per_screen = c->seg_wl_weave_ready;
+	const enum comp_seg_dp_resample win_dp = c->seg_wl_win_dp;
+#else
+	const bool per_screen = false;
+	const enum comp_seg_dp_resample win_dp = COMP_SEG_DP_RESAMPLE_UNKNOWN;
+#endif
+	const enum comp_seg_surface_hold verdict =
+	    comp_segments_surface_hold(on_panel, per_screen, !fits_window || !fits_surface, tolerant, win_dp);
+	if (verdict == COMP_SEG_SURFACE_HOLD_KEEP) {
+		return; // the window's screen's DP is not known yet: never degrade on ignorance
+	}
+	const bool not_1to1 = verdict == COMP_SEG_SURFACE_HOLD_YES;
 
 	if (not_1to1 == c->linux_surface_not_1to1) {
 		return;
@@ -6054,11 +6095,18 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 		    "NOT_1TO1: presenting 2D (no weave) — %s. buffer %ux%u px, surface %ux%u px on a %ux%u px "
 		    "output, 3D panel %ux%u px. A resampled weave is a uniform double image; flat 2D is "
 		    "correct content and recovers as soon as the session is 1:1. (#1595)",
-		    !on_panel       ? "this surface is not on the 3D panel"
+		    (!on_panel && !per_screen) ? "this surface is not on the 3D panel (and cannot be woven per screen)"
 		    : !fits_surface ? "the committed surface spills past the window frame (buffer not mapped to it)"
-		                    : "the buffer is not the size of the region the compositor paints it into",
+		    : !on_panel ? "the buffer is resampled on this screen and its display processor needs 1:1 pixels"
+		                : "the buffer is not the size of the region the compositor paints it into",
 		    buf_px_w, buf_px_h, wr.width_px, wr.height_px, wr.monitor_width_px, wr.monitor_height_px,
 		    panel_px_w, panel_px_h);
+	} else if (!on_panel) {
+		U_LOG_W(
+		    "NOT_1TO1 cleared: the window is off the 3D panel (a %ux%u px output) and woven per screen — its "
+		    "screen's display processor draws the session's own %s; the panel's lens follows coverage "
+		    "(#2247). (#1595 per DP, #2218 item 6)",
+		    wr.monitor_width_px, wr.monitor_height_px, c->display_mode_hold.wanted_3d ? "3D" : "2D");
 	} else {
 		U_LOG_W(
 		    "NOT_1TO1 cleared: buffer %ux%u px now lands 1:1 on the %ux%u px panel — weaving again, "
@@ -6714,14 +6762,14 @@ vk_own_window_snap_cb(void *userdata,
  * primary one. Everything that cannot be segmented today answers false and
  * keeps the shipped single-DP path, byte for byte:
  *
- * - native Wayland, for the FRAME: the geometry service reports a rect
- *   relative to the window's own monitor, in that monitor's device px — not a
- *   desktop rect (docs/specs/runtime/wayland-window-geometry.md, M2
- *   follow-up). The screens are placed in the window's frame instead
- *   (@ref vk_wl_seg_place) and the manager runs its table + DP lifecycle, but
- *   only for xrLocateViews (a window wholly on another screen takes that
- *   screen's eyes and size): the frame keeps the single-DP path, with the
- *   #1595 1:1 hold and the #1654 off-panel bands, and this answers false;
+ * - native Wayland the window cannot be placed against the screens for: the
+ *   geometry service reports a rect relative to the window's own monitor, in
+ *   that monitor's device px, not a desktop rect. The screens are placed in
+ *   the window's frame instead (@ref vk_wl_seg_place, the service weave
+ *   engine's projection); placed, the window is segmented like an X11 one
+ *   (each screen's part by its own DP, the 1:1 rule per DP —
+ *   comp_segments_surface_hold); not placed, the single-DP path with the
+ *   #1595 hold and the #1654 off-panel bands;
  * - Windows under the #918 split (the weave is the split's D3D11 one, which
  *   segments with the D3D11 manager inside hub_d3d11/comp_hub_d3d11.cpp — here
  *   display_processor is NULL);
@@ -6751,11 +6799,32 @@ vk_own_window_snap_cb(void *userdata,
  * window's scale lands exactly where the geometry service says the window's
  * monitor is — the placement is refused unless exactly one screen does.
  *
- * Never touches the present origin or the drop-time snap (the PHASE consumer
- * stays refused off the panel, #1654). One WARN per outcome change.
+ * Never touches the drop-time snap (the PHASE consumer stays refused off the
+ * panel, #1654); a straddle's panel phase is @ref vk_wl_seg_after_update's.
+ * One WARN per outcome change.
  *
  * @return true when placed.
  */
+//! Change-only WARN for @ref vk_wl_seg_after_update's panel phase.
+static void
+vk_wl_seg_phase_log(struct comp_vk_native_compositor *c, bool phased, int32_t x, int32_t y)
+{
+	if (phased == c->seg_wl_primary_phased) {
+		return;
+	}
+	c->seg_wl_primary_phased = phased;
+	if (phased) {
+		U_LOG_W(
+		    "segments (Wayland): window mostly off the panel but on it in part — the panel's DP phased from "
+		    "its segment's present origin (%d,%d) in the window's frame (#2218 item 6)",
+		    x, y);
+	} else {
+		U_LOG_W(
+		    "segments (Wayland): the panel's DP is no longer phased from its segment (window on the "
+		    "panel, wholly off it, or its part there is flat)");
+	}
+}
+
 static bool
 vk_wl_seg_place(struct comp_vk_native_compositor *c)
 {
@@ -6773,7 +6842,21 @@ vk_wl_seg_place(struct comp_vk_native_compositor *c)
 	struct comp_seg_rect win = {0};
 	uint32_t mon = UINT32_MAX;
 	if (comp_vk_native_wl_geom_get_window_rect(c->wl_geom, &wr)) {
-		const struct comp_weave_monitor_window mw = {
+		// The frame the segments are cut in is the BUFFER's, not the window's
+		// monitor's. The geometry service speaks the device px of the window's
+		// own monitor, but the app sizes its buffer for the compositor's
+		// preferred surface scale, which is the HIGHEST scale among the
+		// outputs the surface touches: a 1152x648-logical window whose monitor
+		// is a 1.6667 laptop is 1920x1080 there, and the moment it touches a
+		// 2.0 panel its buffer is 2304x1296 — 1:1 on the panel, resampled on
+		// the laptop. Cutting that buffer with the monitor-px rect put the
+		// seam 1.2x too far left and drew a 1920x1080 canvas in the corner of
+		// a 2304x1296 target. So rescale the service's rect by buffer/content.
+		uint32_t buf_w = 0, buf_h = 0;
+		if (c->target != NULL) {
+			comp_vk_native_target_get_dimensions(c->target, &buf_w, &buf_h);
+		}
+		struct comp_weave_monitor_window mw = {
 		    .left_px = wr.left_px,
 		    .top_px = wr.top_px,
 		    .w = wr.width_px,
@@ -6786,6 +6869,7 @@ vk_wl_seg_place(struct comp_vk_native_compositor *c)
 		    .mon_logical_y = wr.mon_logical_y,
 		    .scale = wr.scale,
 		};
+		comp_weave_monitor_window_to_buffer(&mw, buf_w, buf_h);
 		r = comp_weave_screens_project_monitor_relative(c->seg_screens, &mw, c->seg_wl_next, &win, &mon);
 	}
 	// Lifecycle only: the window changed monitor, or the placement started or
@@ -6816,7 +6900,78 @@ vk_wl_seg_place(struct comp_vk_native_compositor *c)
 	}
 	c->seg_window = win;
 	c->have_seg_window = true;
+	// The canvas follows the window OFF the panel too: vk_update_present_origin
+	// caches the client size only from panel-scoped metrics, which are refused
+	// off the panel (#1654), so a window that never reached the panel had no
+	// canvas at all, and one that left it kept its size from there. Off the
+	// panel the canvas is the placed window — the buffer the segments are cut
+	// from. ON the panel that read stays the only source, unchanged: the
+	// canvas there feeds the panel-scoped projection, in the panel's own px.
+	if ((c->seg_screens->screens[mon].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) == 0) {
+		c->last_window_px_w = win.w;
+		c->last_window_px_h = win.h;
+		c->have_last_window_size = true;
+	}
 	return true;
+}
+
+/*!
+ * Native Wayland, after the manager's update of a weave that can weave per
+ * screen:
+ *
+ * - Record what the 1:1 hold (@ref vk_linux_update_surface_not_1to1) needs
+ *   about the window's OWN monitor: is it the primary screen, and what does
+ *   its segment DP say about a resample (comp_segments_surface_hold).
+ * - A straddling window whose own monitor is NOT the panel has no phase from
+ *   @ref vk_update_present_origin (that consumer is refused off the panel,
+ *   #1654). Phase the panel's DP from the panel segment's present origin in
+ *   the projected frame instead — the window's origin relative to the panel,
+ *   in the window's device px: the service weave engine's panel-relative
+ *   origin (weave_feed_dp_geometry). Only where the panel is 1:1 for the
+ *   window (elsewhere its part is flat, segment record) and never while the
+ *   frame is collapsed to 2D. On the panel nothing changes (drag snap, MOVE
+ *   SYNC, #1596).
+ */
+static void
+vk_wl_seg_after_update(struct comp_vk_native_compositor *c, bool split, const struct comp_seg_rect *canvas)
+{
+	c->seg_wl_win_on_primary = true;
+	c->seg_wl_win_dp = COMP_SEG_DP_RESAMPLE_UNKNOWN;
+	const struct comp_segment_table *t = comp_vk_native_segments_get_table(c->segments);
+	const uint32_t mon = c->seg_wl_logged_monitor;
+	if (!split || t == NULL || c->seg_screens == NULL || mon >= c->seg_screens->count) {
+		vk_wl_seg_phase_log(c, false, 0, 0);
+		return;
+	}
+	const uint64_t mon_id = c->seg_screens->screens[mon].id;
+	const struct comp_segment *primary = NULL;
+	for (uint32_t k = 0; k < t->count; k++) {
+		if (t->seg[k].is_primary) {
+			primary = &t->seg[k];
+		}
+		if (t->seg[k].screen_id == mon_id) {
+			c->seg_wl_win_on_primary = t->seg[k].is_primary;
+		}
+	}
+	if (!c->seg_wl_win_on_primary) {
+		struct xrt_segment_metrics m;
+		if (comp_vk_native_segments_get_metrics(c->segments, &c->seg_window, canvas, true, &m)) {
+			for (uint32_t k = 0; k < m.count; k++) {
+				if (m.seg[k].screen_id == mon_id && m.seg[k].has_dp) {
+					c->seg_wl_win_dp = m.seg[k].tolerates_resample
+					                       ? COMP_SEG_DP_RESAMPLE_TOLERATES
+					                       : COMP_SEG_DP_RESAMPLE_NEEDS_1TO1;
+				}
+			}
+		}
+	}
+	const bool phase = !c->seg_wl_win_on_primary && primary != NULL && primary->screen_1to1 != COMP_SEG_1TO1_NO &&
+	                   !vk_linux_collapsed_2d(c);
+	if (phase) {
+		xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)c->display_processor,
+		                                            primary->present_origin_x, primary->present_origin_y);
+	}
+	vk_wl_seg_phase_log(c, phase, phase ? primary->present_origin_x : 0, phase ? primary->present_origin_y : 0);
 }
 #endif
 
@@ -6829,6 +6984,10 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
                                bool *out_would_split)
 {
 	*out_would_split = false;
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	// Re-established below only when this weave can weave per screen.
+	c->seg_wl_weave_ready = false;
+#endif
 	if (c->seg_screens == NULL || c->display_processor == NULL || c->cmd_pool == VK_NULL_HANDLE) {
 		return false;
 	}
@@ -6837,7 +6996,6 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 	if (c->use_wayland) {
 #ifdef DXR_HAVE_WL_GEOM
 		wl = true;
-		c->seg_wl_split = false;
 		if (!vk_wl_seg_place(c)) {
 			// Not placed: no table at all (a stale one would keep framing
 			// views for a screen the window may have left) — the
@@ -6915,14 +7073,10 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 #if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
 	if (wl) {
 		/*
-		 * Views only. The manager takes the screens in the window's frame
-		 * (its DPs and screen bindings untouched — a projection change is a
-		 * geometry change, comp_weave_screens_compare), then cuts the table
-		 * and runs the DP lifecycle, so a screen the window is wholly on has
-		 * its own segment DP whose eyes xrLocateViews takes. Nothing is
-		 * recorded per segment: zero-copy, the DP's submission mode and the
-		 * frame are left exactly as they were, and the segment DPs stay 2D —
-		 * they never weave on this path.
+		 * The manager takes the screens in the window's frame (its DPs and
+		 * screen bindings untouched — a projection change is a geometry
+		 * change, comp_weave_screens_compare), the frame the service weave
+		 * engine places a present-owner in (weave_segs_update).
 		 */
 		if (c->seg_wl_proj == NULL ||
 		    comp_weave_screens_compare(c->seg_wl_proj, c->seg_wl_next) != COMP_WEAVE_SCREENS_SAME) {
@@ -6936,11 +7090,22 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 				*c->seg_wl_proj = *c->seg_wl_next;
 			}
 		}
-		c->seg_wl_split = comp_vk_native_segments_update(
-		    c->segments, &c->seg_window, &canvas, (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked,
-		    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0);
-		comp_vk_native_segments_set_display_mode(c->segments, false);
-		return false;
+		if (dp_self_submits || dp_render_pass == VK_NULL_HANDLE) {
+			/*
+			 * A DP the split cannot record around (the same exclusion the
+			 * X11 path makes below): views only, as before per-screen
+			 * weaving. The table and the DP lifecycle still run, so a
+			 * window wholly on another screen takes that screen's eyes;
+			 * the segment DPs stay 2D and never weave; the frame keeps the
+			 * single-DP path with the #1595 hold and the #1654 bands.
+			 */
+			(void)comp_vk_native_segments_update(
+			    c->segments, &c->seg_window, &canvas, (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked,
+			    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0);
+			comp_vk_native_segments_set_display_mode(c->segments, false);
+			return false;
+		}
+		c->seg_wl_weave_ready = true;
 	}
 #else
 	(void)wl;
@@ -6959,7 +7124,17 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 #ifdef XRT_OS_WINDOWS
 	comp_vk_native_segments_set_visibility(c->segments, c->visibility);
 #endif
-	comp_vk_native_segments_set_display_mode(c->segments, c->hardware_display_3d);
+	bool seg_3d = c->hardware_display_3d;
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	if (wl) {
+		// The app's mode — not the runtime's 2D hold, which collapses the
+		// frame to one view (a laptop DP in 3D would draw that one view as
+		// a stereo pair of itself).
+		seg_3d = seg_3d && !vk_linux_collapsed_2d(c);
+		vk_wl_seg_after_update(c, split, &canvas);
+	}
+#endif
+	comp_vk_native_segments_set_display_mode(c->segments, seg_3d);
 	return split;
 }
 
@@ -7004,24 +7179,29 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 	}
 #if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
 	/*
-	 * Native Wayland (views only, see vk_segments_frame_update_split): a
-	 * window WHOLLY on one other screen publishes that one-segment table —
-	 * also while the session is collapsed to 2D there (#1595), the normal case
-	 * off the panel: one segment is one view set, which the collapse's single
-	 * tile holds. xrLocateViews then frames the window for that screen (its
-	 * DP's eyes, its size; ADR-047). A window across screens publishes
-	 * nothing: its frame is one picture woven by the session DP with
-	 * off-panel bands (#1654), which per-segment views would not match.
+	 * Native Wayland: a split frame publishes its table exactly as above
+	 * (per-segment views; the majority screen frames a one-view-set app).
+	 * Two Wayland-only additions:
+	 *
+	 * - a window WHOLLY on one other screen publishes that one-segment table
+	 *   also while the session is collapsed to 2D (#1595 / auto-2D): one
+	 *   segment is one view set, which the collapse's single tile holds, so
+	 *   xrLocateViews still frames the window for that screen (its DP's
+	 *   eyes, its size; ADR-047);
+	 * - a DP the split cannot record around (views only,
+	 *   vk_segments_frame_update_split) never splits, but its table still
+	 *   frames a window wholly on another screen the same way.
 	 */
 	if (c->use_wayland) {
-		if (c->seg_wl_split) {
+		if (m.count == 0 && c->segments != NULL && comp_vk_native_segments_enabled(c->segments) &&
+		    c->have_seg_window) {
 			(void)comp_vk_native_segments_get_metrics(c->segments, &c->seg_window, &canvas,
 			                                          c->display_processor != NULL, &m);
 			if (m.count != 1 || m.seg[0].is_primary) {
 				memset(&m, 0, sizeof(m));
 			}
 		}
-		const bool pub = m.count == 1;
+		const bool pub = m.count == 1 && !m.seg[0].is_primary;
 		const uint64_t pub_screen = pub ? m.seg[0].screen_id : 0;
 		if (pub != c->seg_wl_published || pub_screen != c->seg_wl_published_screen) {
 			const bool was = c->seg_wl_published;
@@ -7029,15 +7209,17 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 			c->seg_wl_published_screen = pub_screen;
 			if (pub) {
 				U_LOG_W(
-				    "segments (Wayland): window wholly on screen 0x%016llx (%.3f x %.3f m) — views "
-				    "framed for that screen: its segment DP's eyes (nominal until the DP exists) "
-				    "and its size (ADR-047)",
+				    "segments (Wayland): window wholly on screen 0x%016llx (%.3f x %.3f m) — %s; views "
+				    "framed for that screen: its DP's eyes (nominal until the DP exists) and its size "
+				    "(ADR-047, #2218 item 6)",
 				    (unsigned long long)pub_screen, (double)m.seg[0].screen_width_m,
-				    (double)m.seg[0].screen_height_m);
+				    (double)m.seg[0].screen_height_m,
+				    split ? "drawn by that screen's own DP in the app's mode (flat until the DP exists)"
+				          : "views only, the frame is not woven per screen (self-submitting DP)");
 			} else if (was) {
 				U_LOG_W(
 				    "segments (Wayland): window back on the primary screen (or across screens) — views "
-				    "framed for the session's display again");
+				    "framed for the session's display or per segment again");
 			}
 		}
 	}
@@ -9436,6 +9618,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 #else
 			const bool seg_split = false;
 #endif
+#ifdef XRT_OS_LINUX_DESKTOP
+			c->frame_woven_per_screen = seg_split;
+#endif
 			if (seg_split && ws_chain) {
 				// #2095: the segments branch records its own per-screen
 				// process_atlas calls and never arms the primary DP, so the
@@ -9466,11 +9651,18 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				    .target_format = (VkFormat)comp_vk_native_target_get_format(c->target),
 				    .canvas = {dp_canvas.offset.w, dp_canvas.offset.h,
 				               (uint32_t)(dp_canvas.extent.w > 0 ? dp_canvas.extent.w : (int)tgt_width),
-				               (uint32_t)(dp_canvas.extent.h > 0 ? dp_canvas.extent.h : (int)tgt_height)},
+				               (uint32_t)(dp_canvas.extent.h > 0 ? dp_canvas.extent.h
+				                                                 : (int)tgt_height)},
 				    .content = &c->seg_content, // #1883: crop where the views were painted
 				    .transparent_background = c->transparent_background,
 				    .atlas_encoding = vk_segments_atlas_encoding(c),
 				    .primary_dp = c->display_processor,
+#ifdef XRT_HAVE_WAYLAND
+				    // The panel's part judged by the panel's own 1:1 too:
+				    // the session gate judges the window's own monitor.
+				    .primary_gate_per_segment = c->use_wayland,
+				    .primary_tolerates_resample = c->dp_tolerates_resample,
+#endif
 				};
 				(void)comp_vk_native_segments_record(c->segments, &sf);
 #endif

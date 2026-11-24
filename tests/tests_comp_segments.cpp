@@ -255,6 +255,105 @@ TEST_CASE("comp_segments: 1:1 policy")
 	CHECK(comp_segments_decide(true, false, COMP_SEG_1TO1_UNKNOWN) == COMP_SEG_RENDER_WEAVE);
 }
 
+TEST_CASE("comp_segments: a zero weave canvas resolves to the window, so a straddle stays routed (#2791)")
+{
+	// The panel test of #2791, as logged: a native-Wayland 1920x1080 window
+	// launched on the laptop and dragged left onto the panel, in the window's
+	// projected frame. It had never been on the panel, so the compositor had
+	// no cached client size and its weave canvas was the zero "whole window"
+	// sentinel. The table is right (compute treats zero as the window) ...
+	const comp_segments_screen screens[2] = {
+	    screen(DS1, 0, 0, 3200, 1800, 3840, 2160, true),     // the panel, resampled for this window
+	    screen(EDP, 3200, 0, 2880, 1800, 2880, 1800, false), // the laptop, 1:1
+	};
+	const comp_seg_rect window = {3135, 283, 1920, 1080};
+	const comp_seg_rect zero = {0, 0, 0, 0};
+	comp_segment_table t{};
+	REQUIRE(comp_segments_compute(&window, &zero, screens, 2, &t) == 2);
+	CHECK(t.seg[0].window_rect.w == 65);
+	CHECK(t.seg[1].window_rect.x == 65);
+	CHECK(t.seg[1].window_rect.w == 1855);
+
+	// ... but the routing maps each segment into the tile against the
+	// PUBLISHED canvas. The zero sentinel maps nothing: the frame went
+	// unrouted and the panel segment's views stretched over the laptop part.
+	const uint32_t tile_w = 2304, tile_h = 648;
+	comp_seg_rect tr{};
+	CHECK_FALSE(comp_segments_tile_rect(&t.seg[1].window_rect, &zero, tile_w, tile_h, &tr));
+
+	// Resolved, both segments map — the laptop's at its own share of the tile.
+	const comp_seg_rect cv = comp_segments_resolve_canvas(&zero, window.w, window.h);
+	CHECK(cv.x == 0);
+	CHECK(cv.y == 0);
+	CHECK(cv.w == 1920);
+	CHECK(cv.h == 1080);
+	REQUIRE(comp_segments_tile_rect(&t.seg[0].window_rect, &cv, tile_w, tile_h, &tr));
+	CHECK(tr.x == 0);
+	CHECK(tr.w == 78); // 65 * 2304 / 1920
+	REQUIRE(comp_segments_tile_rect(&t.seg[1].window_rect, &cv, tile_w, tile_h, &tr));
+	CHECK(tr.x == 78);
+	CHECK(tr.w == tile_w - 78);
+	CHECK(tr.h == tile_h);
+
+	// A real canvas passes through untouched.
+	const comp_seg_rect real = {10, 20, 1900, 1040};
+	const comp_seg_rect kept = comp_segments_resolve_canvas(&real, window.w, window.h);
+	CHECK(kept.x == 10);
+	CHECK(kept.y == 20);
+	CHECK(kept.w == 1900);
+	CHECK(kept.h == 1040);
+	CHECK(comp_segments_resolve_canvas(nullptr, 640, 480).w == 640);
+}
+
+TEST_CASE("comp_segments: per-DP surface hold (native Wayland, #1595 per screen)")
+{
+	const auto U = COMP_SEG_DP_RESAMPLE_UNKNOWN;
+	const auto N = COMP_SEG_DP_RESAMPLE_NEEDS_1TO1;
+	const auto T = COMP_SEG_DP_RESAMPLE_TOLERATES;
+	const auto YES = COMP_SEG_SURFACE_HOLD_YES;
+	const auto NO = COMP_SEG_SURFACE_HOLD_NO;
+	const auto KEEP = COMP_SEG_SURFACE_HOLD_KEEP;
+
+	SECTION("on the panel: the shipped rule, whatever the other screens' DPs say")
+	{
+		for (auto w : {U, N, T}) {
+			for (bool ps : {false, true}) {
+				// 1:1 surface: weave.
+				CHECK(comp_segments_surface_hold(true, ps, false, false, w) == NO);
+				CHECK(comp_segments_surface_hold(true, ps, false, true, w) == NO);
+				// Resampled: the panel's lenticular DP holds, a tolerant one weaves.
+				CHECK(comp_segments_surface_hold(true, ps, true, false, w) == YES);
+				CHECK(comp_segments_surface_hold(true, ps, true, true, w) == NO);
+			}
+		}
+	}
+	SECTION("off the panel, no per-screen weave: held 2D as before")
+	{
+		for (auto w : {U, N, T}) {
+			for (bool rs : {false, true}) {
+				for (bool st : {false, true}) {
+					CHECK(comp_segments_surface_hold(false, false, rs, st, w) == YES);
+				}
+			}
+		}
+	}
+	SECTION("off the panel, woven per screen: the window's screen's DP decides")
+	{
+		// The laptop case: a 1:1 surface is never held — the app's mode is
+		// drawn by the laptop's DP, the session DP's tolerance is irrelevant.
+		for (auto w : {U, N, T}) {
+			CHECK(comp_segments_surface_hold(false, true, false, false, w) == NO);
+			CHECK(comp_segments_surface_hold(false, true, false, true, w) == NO);
+		}
+		// A resampled surface: anaglyph weaves, interlaced holds, unknown keeps.
+		CHECK(comp_segments_surface_hold(false, true, true, false, T) == NO);
+		CHECK(comp_segments_surface_hold(false, true, true, false, N) == YES);
+		CHECK(comp_segments_surface_hold(false, true, true, false, U) == KEEP);
+		// ...and the session (panel) DP's tolerance plays no part there.
+		CHECK(comp_segments_surface_hold(false, true, true, true, N) == YES);
+	}
+}
+
 namespace {
 
 comp_segment_table

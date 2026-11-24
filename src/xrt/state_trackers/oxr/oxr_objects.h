@@ -3232,6 +3232,8 @@ struct oxr_session
 	struct xrt_segment_view_routing seg_route;
 	//! Last per-segment view layout logged (one INFO line per change).
 	struct xrt_segment_view_routing seg_route_logged;
+	//! One-shot WARN: a spanning multiview window whose app cannot take per-segment view sets.
+	bool warned_split_needs_activity;
 	/*!
 	 * Multi-screen over IPC (ADR-047 Amendment 3): this service session asked
 	 * the service to segment its window (compositor_segments_enable), so its
