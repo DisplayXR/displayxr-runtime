@@ -582,21 +582,23 @@ public sealed class ComponentsPage : Page
         {
             foreach (var task in list.TaskNamesOf(r.Id))
             {
+                // The words name the task plainly; its id stays in the command each tooltip prints.
+                string taskName = StatusText.ConversionTaskName(task);
                 if (list.IsPreferredFor(task, r.Id))
                 {
-                    row.Add(U.Chip($"Your choice for {task}", Level.Info));
-                    var reset = U.Button($"Choose {task} automatically", () => Run(PolicyCommands.ResetTask(task, machine)), "quiet", "sm");
+                    row.Add(U.Chip(StatusText.TaskChoiceChip(task), Level.Info));
+                    var reset = U.Button(StatusText.ResetTaskButton(task), () => Run(PolicyCommands.ResetTask(task, machine)), "quiet", "sm");
                     reset.IsEnabled = !busy && !prefLocked;
                     ToolTip.SetTip(reset, prefLocked ? lockTip : $"Let DisplayXR pick again. (displayxr-cli {PolicyCommands.ResetTask(task, machine)})");
-                    AutomationProperties.SetName(reset, $"Choose {task} automatically: {r.Name}");
+                    AutomationProperties.SetName(reset, $"{StatusText.ResetTaskButton(task)}: {r.Name}");
                     row.Add(reset);
                 }
                 else if (!r.BuiltIn) // the built-in adapter is never a provider to prefer
                 {
-                    var prefer = U.Button($"Use this one for {task}", () => Run(PolicyCommands.PreferTask(task, r.Id, machine)), "quiet", "sm");
+                    var prefer = U.Button(StatusText.PreferTaskButton(task), () => Run(PolicyCommands.PreferTask(task, r.Id, machine)), "quiet", "sm");
                     prefer.IsEnabled = !busy && r.Enabled && !r.Untrusted && !prefLocked;
-                    ToolTip.SetTip(prefer, prefLocked ? lockTip : $"Use this {cls.Noun()} first for {task}. (displayxr-cli {PolicyCommands.PreferTask(task, r.Id, machine)})");
-                    AutomationProperties.SetName(prefer, $"Use this one for {task}: {r.Name}");
+                    ToolTip.SetTip(prefer, prefLocked ? lockTip : $"Use this {cls.Noun()} first for {taskName}. (displayxr-cli {PolicyCommands.PreferTask(task, r.Id, machine)})");
+                    AutomationProperties.SetName(prefer, $"{StatusText.PreferTaskButton(task)}: {r.Name}");
                     row.Add(prefer);
                 }
             }

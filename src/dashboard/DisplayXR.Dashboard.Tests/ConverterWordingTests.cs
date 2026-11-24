@@ -313,4 +313,59 @@ public class ConverterWordingTests
 
         Assert.All(shown, text => Assert.DoesNotContain(Banned, text, StringComparison.OrdinalIgnoreCase));
     }
+
+    // ── a task is named in plain words, never by its id ─────────────────────
+
+    [Theory]
+    [InlineData("depth-mono", "depth from a photo")]
+    [InlineData("depth-video", "depth from video")]
+    [InlineData("disparity-stereo", "depth from a 3D photo or video")]
+    [InlineData("views-mono", "3D from 2D video and photos")]
+    [InlineData("views-stereo", "more views from a 3D photo or video")]
+    [InlineData("views-from-depth", "3D from a picture and its depth")]
+    [InlineData("splats-mono", "3D scene from a photo")]
+    [InlineData("splats-stereo", "3D scene from a 3D photo")]
+    public void ATask_HasAPlainName(string id, string name)
+    {
+        Assert.Equal(name, StatusText.ConversionTaskName(id));
+        Assert.DoesNotContain(id, StatusText.ConversionTaskName(id), StringComparison.Ordinal);
+        Assert.DoesNotContain(Banned, name, StringComparison.OrdinalIgnoreCase);
+        // The words of the controls are built from it.
+        Assert.Equal($"Use this one for {name}", StatusText.PreferTaskButton(id));
+        Assert.Equal($"Your choice for {name}", StatusText.TaskChoiceChip(id));
+        Assert.Equal($"Choose automatically for {name}", StatusText.ResetTaskButton(id));
+    }
+
+    [Fact]
+    public void TheButtons_ReadAsASentence()
+    {
+        Assert.Equal("Use this one for depth from a photo", StatusText.PreferTaskButton("depth-mono"));
+        Assert.Equal("Use this one for depth from video", StatusText.PreferTaskButton("depth-video"));
+        Assert.Equal("Use this one for 3D from 2D video and photos", StatusText.PreferTaskButton("views-mono"));
+        Assert.Equal("Choose automatically for depth from video", StatusText.ResetTaskButton("depth-video"));
+        Assert.Equal("Your choice for 3D scene from a photo", StatusText.TaskChoiceChip("splats-mono"));
+    }
+
+    [Theory]
+    [InlineData("aux:acme-relight")]
+    [InlineData("some-new-task")]
+    [InlineData("")]
+    public void AnUnknownTask_IsShownByItsId(string id)
+    {
+        Assert.Equal(id, StatusText.ConversionTaskName(id));
+        Assert.Equal(id, StatusText.ConversionTaskLabel(id)); // an id is never re-cased
+        Assert.Equal($"Use this one for {id}", StatusText.PreferTaskButton(id));
+    }
+
+    [Fact]
+    public void ARowsDetails_NameTheTaskPlainly_AndKeepItsId()
+    {
+        var s = Snapshot(new[] { Provider("acme", "Acme Depth", "LOADED") },
+                         new[] { TaskRow(0, "acme", "depth-video", true), TaskRow(0, "acme", "aux:acme-relight", false, verdict: "behind") });
+        var row = Assert.Single(Providers(s).Items);
+        var fact = Assert.Single(row.DetailFacts, f => f.Label == "Depth from video");
+        Assert.EndsWith("id depth-video", fact.Text, StringComparison.Ordinal);
+        Assert.DoesNotContain(row.DetailFacts, f => f.Label == "depth-video");
+        Assert.Contains(row.DetailFacts, f => f.Label == "aux:acme-relight"); // unknown: the id itself
+    }
 }

@@ -79,7 +79,8 @@ public class ConversionProvidersTests
         // The built-in adapter has a plain name; its registered name is a line of Details.
         Assert.Equal("Converter in the display driver", lift.Name);
         Assert.Contains(("Registered name", "Display plug-in lift slots (legacy adapter)"), lift.DetailFacts);
-        Assert.Contains(lift.Lines, l => l.StartsWith("views-mono: warming 50%") && l.Contains("selected") && l.Contains("1 streams"));
+        Assert.Contains(lift.Lines, l => l.StartsWith("3D from 2D video and photos: warming 50%") && l.Contains("selected") && l.Contains("1 streams")
+                                         && l.EndsWith("id views-mono")); // plain words first, the id last
         Assert.Contains(lift.Lines, l => l.Contains("licence: grandfathered"));
 
         var sim = sec.Items[1];
