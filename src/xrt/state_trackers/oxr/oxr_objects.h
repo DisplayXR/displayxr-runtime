@@ -3235,6 +3235,22 @@ struct oxr_session
 	//! One-shot WARN: a spanning multiview window whose app cannot take per-segment view sets.
 	bool warned_split_needs_activity;
 	/*!
+	 * The app has chained XrViewActivityStateDXR or XrViewDisplayBindingsDXR
+	 * on an xrLocateViews: it can take per-segment view sets, for the rest of
+	 * the session (oxr_segment_views_aware_latch).
+	 */
+	bool segment_views_aware;
+	/*!
+	 * The split decision of the app's last xrLocateViews (true: per-segment
+	 * view sets were allowed). The runtime's own locate
+	 * (oxr_session_frame_view_cameras, which chains nothing) takes this
+	 * instead of deciding from its own chain, so the frame's cameras are the
+	 * views the app was handed.
+	 */
+	bool app_locate_can_split;
+	//! The locate in progress is the runtime's own (oxr_session_frame_view_cameras), not the app's.
+	bool locate_internal;
+	/*!
 	 * Multi-screen over IPC (ADR-047 Amendment 3): this service session asked
 	 * the service to segment its window (compositor_segments_enable), so its
 	 * locates fetch the service's segment table and its frames send the

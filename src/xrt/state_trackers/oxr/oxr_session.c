@@ -6667,9 +6667,21 @@ oxr_session_locate_views(struct oxr_logger *log,
 		                                             XrViewDisplayBindingsDXR) != NULL;
 	}
 #endif
-	const bool rig_allows = is_multiview && locate_can_split(sess, viewLocateInfo);
-	const bool can_split =
-	    oxr_segment_views_can_split(is_multiview, rig_allows, chained_activity, chained_bindings);
+	// Latched per session: once the app chained either struct it is aware,
+	// so a call that chains neither does not flip the split.
+	bool can_split;
+	if (sess->locate_internal) {
+		// The runtime's own locate chains nothing (and no rig / zone): it
+		// takes the app's last decision, so its cameras are the app's views.
+		can_split = sess->app_locate_can_split;
+	} else {
+		const bool aware =
+		    oxr_segment_views_aware_latch(&sess->segment_views_aware, chained_activity, chained_bindings);
+		const bool rig_allows = is_multiview && locate_can_split(sess, viewLocateInfo);
+		can_split = oxr_segment_views_can_split(is_multiview, rig_allows, aware, false);
+		sess->app_locate_can_split = can_split;
+	}
+	const bool rig_allows = is_multiview && !sess->locate_internal && locate_can_split(sess, viewLocateInfo);
 	if (is_multiview && rig_allows && !can_split && m.count > 1 && !sess->warned_split_needs_activity) {
 		sess->warned_split_needs_activity = true;
 		U_LOG_W(
@@ -7040,7 +7052,12 @@ oxr_session_frame_view_cameras(struct oxr_logger *log,
 	const struct xrt_segment_view_routing route_logged = sess->seg_route_logged;
 
 	uint32_t count = 0;
+	// The app's last split decision, not one taken from this chain-less
+	// locate: per-segment view sets when the app took them, one set when it
+	// did not (oxr_objects.h app_locate_can_split).
+	sess->locate_internal = true;
 	XrResult ret = oxr_session_locate_views(log, sess, &info, &view_state, XRT_MAX_VIEWS, &count, views);
+	sess->locate_internal = false;
 
 	// Undo the #1502 publish this locate performed — BEFORE the conversion
 	// loop below, whose locate reads the offset back as its base offset. The

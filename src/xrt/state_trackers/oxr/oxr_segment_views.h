@@ -459,6 +459,30 @@ oxr_segment_views_can_split(bool is_multiview, bool rig_allows, bool chained_act
 }
 
 /*!
+ * Has this session's app ever shown it can take per-segment view sets? Latched
+ * per session: once an xrLocateViews chained XrViewActivityStateDXR or
+ * XrViewDisplayBindingsDXR, the app is "aware" for the rest of the session,
+ * and later locates that chain neither still hand out per-segment sets. The
+ * split must not flip with the chain: an app that chains the struct on only
+ * some calls (e.g. its render locate but not a pick / UI locate) would
+ * otherwise get one view set from one call and per-segment sets from the next
+ * in the same frame.
+ *
+ * @param latch            The session's latch (in/out).
+ * @param chained_activity XrViewActivityStateDXR is on this call's output chain.
+ * @param chained_bindings XrViewDisplayBindingsDXR is on this call's output chain.
+ * @return the latched value after this call.
+ */
+static inline bool
+oxr_segment_views_aware_latch(bool *latch, bool chained_activity, bool chained_bindings)
+{
+	if (chained_activity || chained_bindings) {
+		*latch = true;
+	}
+	return *latch;
+}
+
+/*!
  * XR_DXR_cursor_depth (ADR-046) on a split window: the segment under the
  * pointer, and the pointer re-expressed in it. Each per-segment view set
  * frames ONE segment as its canvas, so the cursor is placed - and drawn -
