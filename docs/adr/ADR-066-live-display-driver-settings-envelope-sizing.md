@@ -7,9 +7,9 @@ related: [ADR-010, ADR-020, ADR-022, ADR-028, ADR-030, ADR-041, ADR-047, ADR-051
 ---
 # ADR-066: Display-driver settings apply live; envelope sizing first, swapchain recreation as the rare path
 
-**Status:** Proposed (2026-11-23). The project lead approved the direction; it is open for
-cross-box review. Nothing here is implemented. **Merge gate:** no code for this ADR or for ADR-047
-Amendment 10 merges to `main` before runtime v2.70.5 (the QA build) is tagged (§ *Roadmap*).
+**Status:** Accepted (2026-11-23); C1 (per-screen 3D modes, applied live) and Part B (per-screen
+viewer tracking) implemented 2026-11-24, after runtime v2.70.5 (the QA build) was tagged; C2
+(swapchain recreation) is open.
 
 **What it changes in other ADRs:**
 
@@ -588,8 +588,8 @@ options:
   - `XrEventDataRenderingModeTableChangedDXR` and the worst-case statement (stage 3);
   - the recreate bit's semantics (stage 5).
 
-  Each takes the next `SPEC_VERSION` when it lands. The spec carries a "proposed, not implemented"
-  note until then (`docs/specs/extensions/XR_DXR_display_info.md` § *Proposed*).
+  Each takes the next `SPEC_VERSION` when it lands. Stage 3 landed as v27 (the event) and v28
+  (the table follows the window's screen; the worst case).
 - The app rules gain one exception (C2.6). INV-4.2 says "size at the stated worst case" (C1.6).
 - The CLI gains `dp mode list|set|reset` and `tracking set|reset --screen`. `status --json` gains
   `mode_3d` and `viewer_tracking` per screen. Keys are only added.
