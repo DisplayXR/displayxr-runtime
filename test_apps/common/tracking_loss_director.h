@@ -70,6 +70,12 @@ struct TrackingLossDirector
 	//! LENS_2D preset owns the lens only then: in a mode the user chose as 2D,
 	//! a tracking recovery must not turn the lens back on (SetMode3D).
 	bool mode3D = true;
+	//! The ACTIVE rendering mode consumes viewer tracking
+	//! (XrDisplayRenderingModeTrackingInfoDXR::hasTracking, via SetModeTracking).
+	//! False: the runtime reports isTracking = false in that mode whatever the
+	//! tracker does, so there is no face to lose: the bar says "No tracking"
+	//! and the MANUAL transition stays idle (no depth collapse).
+	bool modeTracking = true;
 	float sinceEdge = 1e9f; // seconds since the last tracking edge
 	float u = 1.0f;         // 1 = full depth, 0 = flat (ipd = smoothstep(u))
 	float clock = 0.0f;
@@ -145,7 +151,7 @@ struct TrackingLossDirector
 			// recovery does not request 3D over it.
 			lens2DRequested = false;
 		}
-		if (!manual || preset == OFF) {
+		if (!manual || preset == OFF || !modeTracking) {
 			u = u + dt / kRecoverS > 1.0f ? 1.0f : u + dt / kRecoverS;
 			if (lens2DRequested) {
 				lens = 1;
@@ -200,6 +206,20 @@ struct TrackingLossDirector
 	{
 		mode3D = hardware3D;
 	}
+	//! Feed the active rendering mode's hasTracking each frame (true while
+	//! unknown: a runtime that does not report it keeps the old behaviour).
+	void
+	SetModeTracking(bool hasTracking)
+	{
+		modeTracking = hasTracking;
+	}
+	//! The bar shows tracking state only when the display tracks AND the
+	//! active mode consumes it.
+	bool
+	ShowsTracking() const
+	{
+		return capsTracking && modeTracking;
+	}
 	//! Zero-disparity status bar colour (display-referred RGB).
 	void
 	BarColor(bool manual, float rgb[3]) const
@@ -209,7 +229,7 @@ struct TrackingLossDirector
 			rgb[1] = g;
 			rgb[2] = b;
 		};
-		if (!capsTracking) { // grey: the display does not track
+		if (!ShowsTracking()) { // grey: the display, or the active mode, does not track
 			set(0.5f, 0.5f, 0.5f);
 			return;
 		}
@@ -232,7 +252,8 @@ struct TrackingLossDirector
 	}
 	/*!
 	 * The status bar's text label, so a viewer can read which mode they are
-	 * in instead of decoding the colour: "NO EYE TRACKING", "MANAGED",
+	 * in instead of decoding the colour: "NO EYE TRACKING" (the display
+	 * does not track), "No tracking" (the active mode does not), "MANAGED",
  * "MANAGED - face lost", "MANAGED (no MANUAL)",
 	 * "MANUAL", "MANUAL [lens-2D] - face lost (collapse)", ... The preset is
 	 * named only when it is not the default (converge). Writes into @p buf
@@ -246,6 +267,10 @@ struct TrackingLossDirector
 		}
 		if (!capsTracking) {
 			std::snprintf(buf, n, "%s", "NO EYE TRACKING");
+			return buf;
+		}
+		if (!modeTracking) {
+			std::snprintf(buf, n, "%s", "No tracking");
 			return buf;
 		}
 		if (!manual) {
