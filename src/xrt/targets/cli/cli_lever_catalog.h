@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 82 levers: 62 Tier 1 (next launch), 20 Tier 2 (service-scoped).
+ * 83 levers: 62 Tier 1 (next launch), 21 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -115,6 +115,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_WEAVE_APP_SUBMIT_GUARD", 2, "App", "off", "#1394. Stops a fill weave running between the app's xrBeginFrame and xrEndFrame, i.e. across the app's own vkQueueSubmit calls."},
 	{"DXR_WEAVE_IDLE_MS", 2, "Svc", "5000", "#2582 grace before a connected weave present-owner (the DisplayXR Browser) that has stopped submitting has its display processors released, so the tracking camera turns off between 3D pages; the..."},
 	{"DXR_WEAVE_OUTPUT_LINEAR", 2, "Svc", "off", "Desktop-Linux XR_DXR_weave stage B (#1699): the woven dma-buf output's DRM modifier."},
+	{"DXR_WEAVE_REFUSE_DEAD_WINDOW", 2, "Svc", "1", "browser-pvt#378: refuse a weave present-owner's submits and sticky flat latches once its bound window has died, so a client that never rebinds reconnects and re-resolves its window."},
 };
 // clang-format on
 
