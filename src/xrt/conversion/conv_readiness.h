@@ -104,9 +104,13 @@ enum conv_readiness_event_type
 	CONV_EV_REGISTRY_CHANGED, //!< the provider's row / manifest changed (retries FAILED + ABSENT)
 	CONV_EV_BUDGET_CHANGED,   //!< adapter memory budget changed (retries FAILED(RESOURCES))
 	CONV_EV_TIMER,            //!< time passed; fires the backoff / crash-loop retry when due
-	//! A READY / WARMING / EVICTED capability failed outside warm (a convert
-	//! or job reported DEVICE_LOST, the provider's get_state turned FAILED, or
-	//! the stall watchdog abandoned it). reason + retryable, as WARM_FAILED.
+	//! A READY / WARMING / INSTALLED / EVICTED capability failed outside warm
+	//! (a convert or job reported DEVICE_LOST, the provider's get_state turned
+	//! FAILED / UNLICENSED / INCOMPATIBLE, or the stall watchdog abandoned it).
+	//! reason + retryable, as WARM_FAILED. A cold row takes it too: a provider
+	//! that serves several tasks from one module fails them all when a warm of
+	//! ONE of them finds the module unusable, and the rows nobody warmed must
+	//! stop being selected (leia-conversion#11).
 	CONV_EV_RUNTIME_FAILED,
 	/*!
 	 * The provider itself declared the capability unavailable and NOT

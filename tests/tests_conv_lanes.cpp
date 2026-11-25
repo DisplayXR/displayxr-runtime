@@ -29,6 +29,7 @@
 #include "conversion/conv_core.h"
 #include "conversion/conv_host_inproc.h"
 #include "conversion/conv_pipeline.h"
+#include "conversion/conv_readiness.h"
 #include "conversion/conv_policy.h"
 #include "conversion/conv_stage.h"
 
@@ -2383,6 +2384,58 @@ TEST_CASE("core: a live policy change (PreferredProvider, AllowResearchOnly) rea
 	conv_fake_fini(&r);
 }
 
+
+
+TEST_CASE("core: cold rows follow their provider to UNLICENSED, so selection falls through (leia-conversion#11)",
+          "[conv_lanes]")
+{
+	// One provider, one module behind several tasks (the Leia conversion
+	// provider's shape): a warm of DEPTH_MONO finds the licence refused and the
+	// provider reports EVERY capability UNLICENSED. VIEWS_MONO was never warmed;
+	// it must stop being selected, so the next provider serves it.
+	conv_fake_provider l, o;
+	conv_fake_init(&l, "prov-module");
+	conv_fake_init(&o, "prov-open");
+	conv_fake_add_cap(&l, 1, XRT_CONV_TASK_DEPTH_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	conv_fake_add_cap(&l, 3, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	conv_fake_cap *oc =
+	    conv_fake_add_cap(&o, 3, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	oc->state = XRT_CONV_STATE_READY;
+	{
+		Core core(false);
+		REQUIRE(core.add(l, 50) >= 0);
+		REQUIRE(core.add(o, 200) >= 0);
+		auto first_candidate = [&](uint32_t task) {
+			xrt_conv_wire_candidate c[4]{};
+			const uint32_t n = conv_core_enum_candidates(core.c, task, c, 4);
+			std::string out;
+			for (uint32_t i = 0; i < n && out.empty(); i++) {
+				if (conv_state_is_selectable(c[i].state)) {
+					out = c[i].provider_id;
+				}
+			}
+			return out;
+		};
+		// Cold and installed: the module's provider is first.
+		CHECK(first_candidate(XRT_CONV_TASK_VIEWS_MONO) == "prov-module");
+		sleep_ms(100); // a few ticks: an INSTALLED answer never fails a cold row
+		CHECK(first_candidate(XRT_CONV_TASK_VIEWS_MONO) == "prov-module");
+
+		// The module refuses its licence. No warm of VIEWS_MONO happens.
+		conv_fake_set_state(&l, 1, XRT_CONV_STATE_UNLICENSED, XRT_CONV_FAIL_LICENCE, false);
+		conv_fake_set_state(&l, 3, XRT_CONV_STATE_UNLICENSED, XRT_CONV_FAIL_LICENCE, true);
+		REQUIRE(wait_until([&] { return first_candidate(XRT_CONV_TASK_VIEWS_MONO) == "prov-open"; }, 2000));
+		CHECK(first_candidate(XRT_CONV_TASK_DEPTH_MONO).empty());
+
+		auto d = stream_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2);
+		xrt_conv_wire_stream_created cr{};
+		REQUIRE(conv_core_stream_create(core.c, 1, &d, nullptr, &cr) == XRT_SUCCESS);
+		CHECK(std::string(stats(core.c, cr.stream_id).provider_id) == "prov-open");
+		REQUIRE(conv_core_stream_destroy(core.c, cr.stream_id) == XRT_SUCCESS);
+	}
+	conv_fake_fini(&l);
+	conv_fake_fini(&o);
+}
 
 
 /*
