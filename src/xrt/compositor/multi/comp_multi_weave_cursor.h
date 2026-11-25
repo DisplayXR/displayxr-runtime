@@ -111,7 +111,8 @@ struct comp_multi_weave_cursor
 	uint64_t look_serial_gen; //!< 0 = no serial yet
 	uint64_t serial_counter;
 
-	int reason; //!< last logged outcome (change-only WARN)
+	int reason;              //!< last logged outcome (change-only)
+	uint32_t reasons_warned; //!< outcomes already logged at WARN (bit per reason; later flips are INFO)
 };
 
 //! One view's draw: the (blur-padded) box in atlas px, its sprite uv, its scissor.

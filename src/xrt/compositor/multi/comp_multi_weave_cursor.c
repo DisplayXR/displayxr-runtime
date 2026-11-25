@@ -86,9 +86,16 @@ weave_cursor_log(struct comp_multi_weave_cursor *c, const char *client, int why,
 		return;
 	}
 	c->reason = why;
-	U_LOG_W("[weave cursor] '%s': %s%s%s (sprite generation %llu, ADR-046 Amendment 6)",
-	        client != NULL && client[0] != '\0' ? client : "?", weave_cursor_reason_str(why),
-	        detail != NULL ? " - " : "", detail != NULL ? detail : "", (unsigned long long)c->sprite_gen);
+	// The outcome flips at mouse rate (the pointer crossing a rect, content
+	// depth crossing the plane): WARN the first time each outcome appears,
+	// INFO for every later transition back to it.
+	const uint32_t bit = (why >= 0 && why < 32) ? (1u << (uint32_t)why) : 0u;
+	const bool first = bit != 0 && (c->reasons_warned & bit) == 0;
+	c->reasons_warned |= bit;
+	U_LOG_IFL(first ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+	          "[weave cursor] '%s': %s%s%s (sprite generation %llu, ADR-046 Amendment 6)",
+	          client != NULL && client[0] != '\0' ? client : "?", weave_cursor_reason_str(why),
+	          detail != NULL ? " - " : "", detail != NULL ? detail : "", (unsigned long long)c->sprite_gen);
 }
 
 static void

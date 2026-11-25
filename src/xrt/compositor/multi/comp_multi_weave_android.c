@@ -1077,8 +1077,10 @@ weave_pf_publish(struct multi_compositor *mc, uint64_t weave_start_ns)
 	// 0 = unknown (no fresh report): the DP keeps its own heuristic.
 	uint64_t horizon_ns = comp_weave_pf_predict(&mc->weave.pf, weave_start_ns);
 	if (horizon_ns > WEAVE_PF_HORIZON_MAX_NS) {
-		// Lifecycle-rare by construction (a median this large); never per frame.
-		if (horizon_ns != mc->weave.pf_last_bad_ns) {
+		// WARN on the good->bad edge only: the median moves with nearly every
+		// report, so a value-change guard would log about once per frame.
+		if (!mc->weave.pf_bad) {
+			mc->weave.pf_bad = true;
 			mc->weave.pf_last_bad_ns = horizon_ns;
 			U_LOG_W("#206: weave present feedback — measured weave->scanout residual %" PRIu64
 			        " ms is outside [0, 200] — NOT published; the DP keeps its own heuristic. A "
@@ -1086,6 +1088,8 @@ weave_pf_publish(struct multi_compositor *mc, uint64_t weave_start_ns)
 			        horizon_ns / U_TIME_1MS_IN_NS);
 		}
 		horizon_ns = 0;
+	} else {
+		mc->weave.pf_bad = false;
 	}
 	xrt_display_processor_vk_set_predicted_scanout((struct xrt_display_processor_vk *)mc->weave.dp, horizon_ns);
 
@@ -1277,9 +1281,18 @@ comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id)
 	os_mutex_lock(&mc->weave.mutex);
 	// Opaque on Android: there is no window handle the runtime can act on. The
 	// geometry that actually matters arrives through set_window_geometry.
+	const bool first = !mc->weave.window_bound;
+	const bool changed = first || mc->weave.window_id != window_id;
+	mc->weave.window_bound = true;
 	mc->weave.window_id = window_id;
 	os_mutex_unlock(&mc->weave.mutex);
-	U_LOG_W("weave(#1036): bound present-owner window id 0x%" PRIx64, window_id);
+	// A present-owner may re-bind on every move: one WARN for the session's
+	// first bind, INFO when the id changes, silence on a repeat (as Linux).
+	if (first) {
+		U_LOG_W("weave(#1036): bound present-owner window id 0x%" PRIx64, window_id);
+	} else if (changed) {
+		U_LOG_I("weave(#1036): present-owner window id now 0x%" PRIx64, window_id);
+	}
 	return true;
 }
 
@@ -1300,6 +1313,7 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
 	const bool changed = !mc->weave.have_geometry || mc->weave.win_x != origin_x || mc->weave.win_y != origin_y ||
 	                     mc->weave.win_w != client_w || mc->weave.win_h != client_h ||
 	                     mc->weave.win_display_id != display_id;
+	const bool geometry_lifecycle = !mc->weave.have_geometry || mc->weave.win_display_id != display_id;
 	mc->weave.have_geometry = true;
 	mc->weave.win_x = origin_x;
 	mc->weave.win_y = origin_y;
@@ -1309,10 +1323,12 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
 	mc->weave.geometry_dirty = mc->weave.geometry_dirty || changed;
 	os_mutex_unlock(&mc->weave.mutex);
 	if (changed) {
-		// Lifecycle event (the present-owner's window moved / resized), and the
-		// caller is expected to re-publish every frame — so log only on change.
-		U_LOG_W("weave(#1036): present-owner window %d,%d %ux%u on display %d", origin_x, origin_y, client_w,
-		        client_h, display_id);
+		// The caller re-publishes every frame and a drag / resize changes the
+		// rect on every one: WARN for the first geometry and a display change,
+		// INFO for a move or resize.
+		U_LOG_IFL(geometry_lifecycle ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+		          "weave(#1036): present-owner window %d,%d %ux%u on display %d", origin_x, origin_y, client_w,
+		          client_h, display_id);
 	}
 	return true;
 }
@@ -2831,8 +2847,11 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				mc->weave.sbs_h = want_h;
 				mc->weave.sbs_first_use = true;
 			}
-			U_LOG_W("weave(#1036): output %ux%u (%s layout)", want_w, want_h,
-			        nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"));
+			// The first output is a WARN; a re-allocation follows every resize step.
+			U_LOG_IFL(mc->weave.out_allocs_logged == 0 ? U_LOGGING_WARN : U_LOGGING_INFO,
+			          u_log_get_global_level(), "weave(#1036): output %ux%u (%s layout)", want_w, want_h,
+			          nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"));
+			mc->weave.out_allocs_logged++;
 		}
 
 		// v6 crop staging: (re)create when the packed region is smaller than the
@@ -3407,8 +3426,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			    (struct xrt_display_processor_vk *)mc->weave.dp, mc->weave.win_x, mc->weave.win_y,
 			    dp_w, dp_h, mc->weave.win_display_id);
 			if (mc->weave.geometry_dirty) {
+				// Dirty on every drag step: WARN once per verdict, INFO after.
 				mc->weave.geometry_dirty = false;
-				U_LOG_W("weave(#1036): window rect %s the DP phase slot", fed ? "fed to" : "NOT accepted by");
+				const int verdict = fed ? 1 : 2;
+				U_LOG_IFL(mc->weave.rect_fed_logged != verdict ? U_LOGGING_WARN : U_LOGGING_INFO,
+				          u_log_get_global_level(), "weave(#1036): window rect %s the DP phase slot",
+				          fed ? "fed to" : "NOT accepted by");
+				mc->weave.rect_fed_logged = verdict;
 			}
 		}
 
@@ -3532,7 +3556,11 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				close(acquire_fd);
 				acquire_imported = true;
 			} else {
-				U_LOG_W("weave v20: acquire sync_file import failed — CPU-polling it this frame");
+				// Once per session at WARN: a failing import fails every frame.
+				U_LOG_IFL(mc->weave.sync_import_warned ? U_LOGGING_INFO : U_LOGGING_WARN,
+				          u_log_get_global_level(),
+				          "weave v20: acquire sync_file import failed — CPU-polling it this frame");
+				mc->weave.sync_import_warned = true;
 				const bool signalled = weave_sync_poll_and_close(acquire_fd);
 				if (!signalled) {
 					acquire_fd = -1;

@@ -805,9 +805,18 @@ comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id)
 	os_mutex_lock(&mc->weave.mutex);
 	// Stored only: the present origin comes from the explicit geometry (spec v7),
 	// never from the id (it is an opaque handle on macOS).
+	const bool first = !mc->weave.window_bound;
+	const bool changed = first || mc->weave.window_id != window_id;
+	mc->weave.window_bound = true;
 	mc->weave.window_id = window_id;
 	os_mutex_unlock(&mc->weave.mutex);
-	U_LOG_W("weave(#759): bound present-owner window id 0x%" PRIx64, window_id);
+	// A present-owner may re-bind on every move: one WARN for the session's
+	// first bind, INFO when the id changes, silence on a repeat (as Linux).
+	if (first) {
+		U_LOG_W("weave(#759): bound present-owner window id 0x%" PRIx64, window_id);
+	} else if (changed) {
+		U_LOG_I("weave(#759): present-owner window id now 0x%" PRIx64, window_id);
+	}
 	return true;
 }
 
@@ -1008,8 +1017,14 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				mc->weave.overlay_iosurface = (void *)overlay; // adopt the retained ref
 				mc->weave.overlay_iosurface_id = overlay_id;
 				overlay = NULL; // ownership transferred
-				U_LOG_W("weave(#759) v4: overlay import cached (%ux%u)", mc->weave.overlay_w,
-				        mc->weave.overlay_h);
+				// A double-buffered overlay alternates ids every frame: WARN
+				// for the first imports only (as Linux), INFO after.
+				U_LOG_IFL(mc->weave.overlay_imports_logged < 16 ? U_LOGGING_WARN : U_LOGGING_INFO,
+				          u_log_get_global_level(), "weave(#759) v4: overlay import cached (%ux%u)",
+				          mc->weave.overlay_w, mc->weave.overlay_h);
+				if (mc->weave.overlay_imports_logged < 16) {
+					mc->weave.overlay_imports_logged++;
+				}
 			}
 		}
 

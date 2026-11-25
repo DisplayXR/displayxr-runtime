@@ -332,31 +332,68 @@ comp_segments_view_size_tile_map(const struct comp_segments_segment_grid *g,
 }
 
 /*!
- * The one change-only WARN every segment manager logs when its effective
+ * Did the effective table move in more than its scales and view pixels? A
+ * clamped spanning window's scale follows its size (u_screen_modes_effective),
+ * so a live resize changes the table on every frame; only the rest is a
+ * lifecycle change. Pure.
+ */
+static inline bool
+comp_segments_view_size_structural_change(const struct xrt_effective_mode_table *prev,
+                                          const struct xrt_effective_mode_table *e)
+{
+	if (prev == NULL || e == NULL || prev->valid != e->valid) {
+		return true;
+	}
+	if (!e->valid) {
+		return false;
+	}
+	if (prev->screen_count != e->screen_count || prev->majority_screen_id != e->majority_screen_id) {
+		return true;
+	}
+	for (uint32_t s = 0; s < 2; s++) {
+		const struct xrt_effective_mode_slot *a = &prev->slot[s];
+		const struct xrt_effective_mode_slot *b = &e->slot[s];
+		if (prev->layout_screen_id[s] != e->layout_screen_id[s] || prev->clamped[s] != e->clamped[s] ||
+		    a->view_count != b->view_count || a->tile_columns != b->tile_columns ||
+		    a->tile_rows != b->tile_rows || a->hardware_display_3d != b->hardware_display_3d ||
+		    a->mode_flags != b->mode_flags || strncmp(a->mode_name, b->mode_name, sizeof(a->mode_name)) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
+ * The one change-only line every segment manager logs when its effective
  * table moved (ADR-047 Amendment 10), so one grep works on every platform
- * and compositor. Call only on a change.
+ * and compositor. Call only on a change. A WARN when the table moved
+ * structurally against @p prev (the table before this change; NULL = always),
+ * an INFO when only the scales moved (a clamped window being resized).
  */
 static inline void
-comp_segments_view_size_log_change(const struct xrt_effective_mode_table *e)
+comp_segments_view_size_log_change(const struct xrt_effective_mode_table *e,
+                                   const struct xrt_effective_mode_table *prev)
 {
 	if (e == NULL) {
 		return;
 	}
+	const enum u_logging_level level =
+	    comp_segments_view_size_structural_change(prev, e) ? U_LOGGING_WARN : U_LOGGING_INFO;
 	if (!e->valid) {
-		U_LOG_W(
-		    "view size: the window is on the session screen - its app is told the session display's "
-		    "table (ADR-047 Amendment 10)");
+		U_LOG_IFL(level, u_log_get_global_level(),
+		          "view size: the window is on the session screen - its app is told the session display's "
+		          "table (ADR-047 Amendment 10)");
 		return;
 	}
-	U_LOG_W(
-	    "view size: the window covers %u screen(s), majority 0x%016llx - its app is told slot 0 "
-	    "'%s' %ux%u tiles x %.3f x %.3f, slot 1 '%s' %u view(s) %ux%u tiles x %.3f x %.3f%s "
-	    "(ADR-047 Amendment 10)",
-	    e->screen_count, (unsigned long long)e->majority_screen_id, e->slot[0].mode_name, e->slot[0].tile_columns,
-	    e->slot[0].tile_rows, (double)e->slot[0].view_scale_x, (double)e->slot[0].view_scale_y,
-	    e->slot[1].mode_name, e->slot[1].view_count, e->slot[1].tile_columns, e->slot[1].tile_rows,
-	    (double)e->slot[1].view_scale_x, (double)e->slot[1].view_scale_y,
-	    (e->clamped[0] || e->clamped[1]) ? " - clamped to the instance's worst case" : "");
+	U_LOG_IFL(level, u_log_get_global_level(),
+	          "view size: the window covers %u screen(s), majority 0x%016llx - its app is told slot 0 "
+	          "'%s' %ux%u tiles x %.3f x %.3f, slot 1 '%s' %u view(s) %ux%u tiles x %.3f x %.3f%s "
+	          "(ADR-047 Amendment 10)",
+	          e->screen_count, (unsigned long long)e->majority_screen_id, e->slot[0].mode_name,
+	          e->slot[0].tile_columns, e->slot[0].tile_rows, (double)e->slot[0].view_scale_x,
+	          (double)e->slot[0].view_scale_y, e->slot[1].mode_name, e->slot[1].view_count, e->slot[1].tile_columns,
+	          e->slot[1].tile_rows, (double)e->slot[1].view_scale_x, (double)e->slot[1].view_scale_y,
+	          (e->clamped[0] || e->clamped[1]) ? " - clamped to the instance's worst case" : "");
 }
 
 #ifdef __cplusplus

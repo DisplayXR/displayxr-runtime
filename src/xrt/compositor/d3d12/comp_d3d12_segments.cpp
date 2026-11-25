@@ -1164,6 +1164,7 @@ comp_d3d12_segments_update_view_size(struct comp_d3d12_segments *segs,
 		return false;
 	}
 	*next = segs->vs;
+	const struct xrt_effective_mode_table prev_eff = segs->vs.eff;
 	const bool changed = comp_segments_view_size_update_for_window(next, window_desktop, canvas, segs->screens,
 	                                                               segs->screen_count, head_modes, head_count,
 	                                                               max_views, cap_w, cap_h, os_monotonic_get_ns());
@@ -1171,7 +1172,7 @@ comp_d3d12_segments_update_view_size(struct comp_d3d12_segments *segs,
 	segs->vs = *next;
 	os_mutex_unlock(&segs->dp_mutex);
 	if (changed) {
-		comp_segments_view_size_log_change(&next->eff);
+		comp_segments_view_size_log_change(&next->eff, &prev_eff);
 	}
 	free(next);
 	return changed;
