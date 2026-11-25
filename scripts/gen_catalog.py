@@ -918,8 +918,8 @@ V2_ITEMS = {
                 "detect": [
                     {"kind": "registry_sz_min", "key": "HKLM\\SOFTWARE\\LeiaInc\\NeurD",
                      "value": "Version", "min": "0.4.6",
-                     "note": "registered by NeurD's own installer; a NeurD found only on PATH "
-                             "or through NEURD_PATH is not seen by this rule"},
+                     "note": "registered by its own installer; a copy found only on PATH "
+                             "or through an environment variable is not seen by this rule"},
                 ],
             },
         ],

@@ -314,7 +314,8 @@ class Schema2OnlyComponents(unittest.TestCase):
         rule = ext["detect"][0]
         self.assertEqual((rule["kind"], rule["key"], rule["value"], rule["min"]),
                          ("registry_sz_min", "HKLM\\SOFTWARE\\LeiaInc\\NeurD", "Version", "0.4.6"))
-        self.assertIn("NEURD_PATH", rule["note"])  # what the rule cannot see is said, not guessed around
+        self.assertIn("environment variable", rule["note"])  # what the rule cannot see is said, not guessed around
+        self.assertNotIn("neurd", rule["note"].lower())  # the note is shown to the user: plain words only
         self.assertNotIn("confidence", rule)
         self.assertEqual(gen_catalog.validate_rule(rule), (rule, []))
         self.assertNotIn("runtime", item)    # a floor, not a range
