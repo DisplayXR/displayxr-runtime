@@ -1022,6 +1022,14 @@ struct comp_vk_native_compositor
 	 * The last weave could weave this window per screen: placed, segmentation
 	 * enabled, and a DP path the split records (not self-submitting, a render
 	 * pass). Read by the 1:1 hold (@ref vk_linux_update_surface_not_1to1).
+	 *
+	 * Locking (this, seg_wl_win_on_primary, seg_wl_win_dp): written only by
+	 * the weave (vk_segments_frame_update_split / vk_wl_seg_after_update,
+	 * inside vk_dp_weave_and_present), and every weave runs under c->mutex -
+	 * the commit's direct weave, the weave thread's hand-off serve and the
+	 * repaint loop's fill all take it first. The reader is
+	 * vk_compositor_layer_commit_locked, also under c->mutex. Not racy; the
+	 * value is at worst the previous weave's (one frame old), by design.
 	 */
 	bool seg_wl_weave_ready;
 	//! The window's own monitor is the primary screen (last weave's table).

@@ -396,6 +396,28 @@ TEST_CASE("per-segment view sets need an app that can learn the sum", "[oxr][seg
 	CHECK_FALSE(oxr_segment_views_can_split(true, false, true, true));
 }
 
+TEST_CASE("per-segment awareness is latched per session, not decided per call", "[oxr][segment_views]")
+{
+	bool latch = false;
+	// Never chained: not aware, one view set.
+	CHECK_FALSE(oxr_segment_views_aware_latch(&latch, false, false));
+	CHECK_FALSE(oxr_segment_views_can_split(true, true, latch, false));
+	// The render locate chains the activity state: aware from now on.
+	CHECK(oxr_segment_views_aware_latch(&latch, true, false));
+	CHECK(oxr_segment_views_can_split(true, true, latch, false));
+	// A later locate in the same frame that chains nothing (a pick / UI
+	// locate) gets the SAME answer, not one view set.
+	CHECK(oxr_segment_views_aware_latch(&latch, false, false));
+	CHECK(oxr_segment_views_can_split(true, true, latch, false));
+	// Bindings alone latch too.
+	bool latch2 = false;
+	CHECK(oxr_segment_views_aware_latch(&latch2, false, true));
+	CHECK(oxr_segment_views_aware_latch(&latch2, false, false));
+	// The latch never overrides the rig / zone / view-configuration rules.
+	CHECK_FALSE(oxr_segment_views_can_split(true, false, latch, false));
+	CHECK_FALSE(oxr_segment_views_can_split(false, true, latch, false));
+}
+
 TEST_CASE("a segment takes its DP's eyes tracked or not, like the single-screen path", "[oxr][segment_views]")
 {
 	// Untracked but valid (sim_display): accepted — not replaced by the

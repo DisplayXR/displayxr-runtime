@@ -1410,9 +1410,21 @@ display showing its own crop of them or a flat 2D copy; a camera-centric locate
 (`XrCameraRigDXR`, or the qwerty camera rig of a runtime-window session), which frames a
 fixed-FOV camera on the whole window; a zone-scoped locate (`XrDisplayZoneDXR`); a window
 covering more displays than `XRT_MAX_SEGMENTS`; a display of unknown physical size; a
-locate whose `XrViewState` chains neither `XrViewActivityStateDXR` nor
-`XrViewDisplayBindingsDXR` — such an app cannot learn that the active count is the sum over
+session whose app has never chained `XrViewActivityStateDXR` or `XrViewDisplayBindingsDXR`
+on an `xrLocateViews` — such an app cannot learn that the active count is the sum over
 segments, so it would submit one set and have it drawn in every segment.
+
+**Awareness is latched per session.** Whether an app can take per-segment view sets is
+decided once per session, not per call: from the first `xrLocateViews` whose `XrViewState`
+chains `XrViewActivityStateDXR` or `XrViewDisplayBindingsDXR`, the session is *aware*, and
+every later locate in it (including one that chains neither, e.g. a picking or UI locate)
+gets per-segment sets wherever the window is woven per segment. Deciding per call would
+hand an app that chains the struct on only some calls one view set from one locate and
+per-segment sets from the next in the same frame. The other one-set conditions above (view
+configuration, camera-centric or zone-scoped locate, …) are still judged per call. The
+runtime's own per-frame locate (the cameras it gives `XR_REFERENCE_SPACE_TYPE_VIEW` layers
+when a frame has no projection layer) takes the app's last decision, so those cameras are
+the views the app was handed.
 
 **Scope.** Every compositor that segments a window per screen (see
 `docs/architecture/comp-segments.md` for the list per platform; on desktop Linux the
