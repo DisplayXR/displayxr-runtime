@@ -376,6 +376,15 @@ value (`default`). It is a runtime setting, not a display-processor option.
 | `always` | 2D and 3D: head-coupled look-around in 2D too |
 | no value (`default`) | **off**, unless the provider opts in by itself (`SERVE_BY_DEFAULT`, sim-tracking's legacy `ENABLE=1`, or any provider without the availability slot): then `always`, what a provider did before the setting existed |
 
+**"Same as 2D" is the 2D slot for viewer tracking** (decided 2026-11-24, ADR-066 decision note).
+The principle: unless the user turns on a 3D feature, the screen looks the same as 2D. A
+passthrough 3D entry in slot 1 (`XRT_RENDERING_MODE_FLAG_3D_PASSTHROUGH`, sim-display's default
+"Same as 2D") is one full-resolution view at scale 1x1, untracked, exactly like mode 0, so viewer
+tracking treats it as 2D: a screen set to `3d` does not track while its 3D mode is Same as 2D (no
+viewer is requested, the camera stays closed, its per-entry tracked flag is clear), and only an
+explicit `always` tracks there. Pinned by `tests_viewer_tracking_per_screen` ("'Same as 2D' counts
+as 2D for viewer tracking").
+
 Steps 1 and 3 are unchanged: a display that tracks the viewer itself (or owns it, or is FIXED) is
 never routed to a provider whatever its setting, and the setting is **not offered** there. A
 tracking display's camera never drives another screen's views: each screen's views come from its
