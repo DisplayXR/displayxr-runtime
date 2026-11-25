@@ -565,7 +565,8 @@ public static class StatusText
 
     /// <summary>What the 3D mode picker does, in plain words.</summary>
     public const string Mode3DExplanation =
-        "How this display shows a 3D app. A change applies right away, also to apps that are already running.";
+        "How this display shows a 3D app. Most changes apply right away, also to apps that are already running. " +
+        "Some apply the next time an app starts.";
 
     /// <summary>
     /// Whether a display card shows the 3D mode picker: only when the feed reports the screen's 3D modes
@@ -574,17 +575,38 @@ public static class StatusText
     public static bool Mode3DPickerShown(Screen s) => s.Key is not null && s.Mode3D is { Choices.Count: >= 2 };
 
     /// <summary>
+    /// A stored choice on a display whose driver reports no 3D modes now: no picker, but the row stays,
+    /// with the stored choice and the reason, so the choice can be seen and cleared.
+    /// </summary>
+    public static bool Mode3DStoredOnly(Screen s) =>
+        s.Key is not null && s.Mode3D is { Choices.Count: 0, Setting: { Length: > 0 } };
+
+    /// <summary>Whether a display card shows the 3D mode row at all (the picker, or a stored choice alone).</summary>
+    public static bool Mode3DRowShown(Screen s) => Mode3DPickerShown(s) || Mode3DStoredOnly(s);
+
+    /// <summary>
     /// The entries the picker lists, in the driver's order and by the driver's labels. A mode this display
-    /// cannot show is left out (<see cref="Mode3DNotes"/> names it and says why), unless it is the one in use.
+    /// cannot show is left out, so it cannot be picked (<see cref="Mode3DNotes"/> names it and says why),
+    /// unless it is the one drawn now. A mode that applies at the next app start is listed and can be picked.
     /// </summary>
     public static IReadOnlyList<Mode3DChoice> Mode3DItems(Mode3D m) =>
         m.Choices.Where(c => !c.NotSupported || c.Name == m.Active).ToList();
 
-    /// <summary>The picker's selected entry: the mode in use, else the stored one, else none (-1).</summary>
+    /// <summary>
+    /// What the picker shows for an entry: the driver's label, and for a mode that waits for an app start
+    /// (not the one drawn now) the plain fact that it does.
+    /// </summary>
+    public static string Mode3DItemText(Mode3D m, Mode3DChoice c) =>
+        c.NeedsRestart && c.Name != m.Active ? $"{c.Label} (applies the next time an app starts)" : c.Label;
+
+    /// <summary>
+    /// The picker's selected entry: the stored choice when it is listed (it is what was picked, also while
+    /// it waits for the next app start), else the mode drawn now, else none (-1).
+    /// </summary>
     public static int Mode3DSelected(Mode3D m)
     {
         var items = Mode3DItems(m);
-        foreach (var name in new[] { m.Active, m.Setting })
+        foreach (var name in new[] { m.Setting, m.Active })
             for (int i = 0; name is not null && i < items.Count; i++)
                 if (items[i].Name == name) return i;
         return -1;
@@ -598,36 +620,49 @@ public static class StatusText
 
     /// <summary>
     /// Whether "Reset to default" is offered: only for this user's own choice. A choice made for everyone
-    /// on the PC is not cleared by the per-user verb, so no button is offered for it.
+    /// on the PC is not cleared by the per-user verb, so no reset is offered for it.
     /// </summary>
     public static bool Mode3DCanReset(Mode3D m) => m.Source == "user";
 
-    /// <summary>Next to the picker: who chose the mode in use; null when it is a default.</summary>
+    /// <summary>Next to the picker: who chose the mode; null when it is a default.</summary>
     public static string? Mode3DSourceText(Mode3D m) => m.Source switch
     {
         "user" => "Chosen by you",
+        "machine" when m.Choices.Count < 2 => "Chosen for everyone on this PC.",
         "machine" => "Chosen for everyone on this PC. Choosing a mode here is for you only, and yours is used.",
         _ => null,
     };
 
+    /// <summary>The stored choice, as shown when there is no picker: the driver's label when known, else the stored name.</summary>
+    public static string Mode3DStoredText(Mode3D m) => m.Find(m.Setting)?.Label ?? m.Setting ?? "";
+
     /// <summary>
-    /// The lines under the picker, each with the driver's own reason: the selected mode needs an app
-    /// restart; a stored choice is not the mode in use; the modes this display cannot show.
+    /// The lines under the row: a stored choice that waits for the next app start; the note of the mode
+    /// drawn now; a stored choice that is not used; the modes this display cannot show, each with its
+    /// reason; and, with no modes at all, why there are none.
     /// </summary>
     public static IReadOnlyList<string> Mode3DNotes(Mode3D m)
     {
         var notes = new List<string>();
-        int sel = Mode3DSelected(m);
-        var selected = sel >= 0 ? Mode3DItems(m)[sel] : null;
-        if (selected is { NeedsRestart: true })
-            notes.Add(Sentence(selected.Reason is { Length: > 0 } r ? r : "restart the app to apply"));
-        if (m.Find(m.Setting) is { } stored && stored.Name != selected?.Name && stored.Applies != "now")
+        var stored = m.Find(m.Setting);
+        var active = m.Find(m.Active);
+        bool waiting = stored is not null && stored.Name != m.Active;
+        if (waiting && stored!.NeedsRestart)
+            notes.Add(active is null
+                ? $"{stored.Label} is stored. It applies the next time an app starts."
+                : $"{stored.Label} is stored. It applies the next time an app starts. Apps that are running keep {active.Label}.");
+        else if (waiting && stored!.NotSupported)
             notes.Add(stored.Reason is { Length: > 0 } why
-                ? $"{stored.Label} is chosen but not in use: {why}."
-                : $"{stored.Label} is chosen but not in use.");
-        var missing = m.Choices.Where(c => c.NotSupported && c.Name != m.Active)
+                ? $"{stored.Label} is stored, but this display cannot show it: {why}."
+                : $"{stored.Label} is stored, but this display cannot show it.");
+        else if (!waiting && active is { Reason: { Length: > 0 } note })
+            notes.Add(Sentence(note));
+        if (m.Setting is { Length: > 0 } name && stored is null && m.Choices.Count > 0)
+            notes.Add($"The stored choice \"{name}\" is not one of this display's 3D modes and is not used.");
+        var missing = m.Choices.Where(c => c.NotSupported && c.Name != m.Active && c.Name != m.Setting)
             .Select(c => c.Reason is { Length: > 0 } r ? $"{c.Label} ({r})" : c.Label).ToList();
         if (missing.Count > 0) notes.Add($"Not available on this display: {string.Join("; ", missing)}.");
+        if (m.Choices.Count == 0 && m.Reason is { Length: > 0 } none) notes.Add(Sentence(none));
         return notes;
     }
 
@@ -639,7 +674,7 @@ public static class StatusText
     /// <summary>What a display card's rebuild key reads of a screen's 3D mode.</summary>
     public static string Mode3DKey(Mode3D? m) => m is null
         ? "-"
-        : $"{m.Active}/{m.Setting}/{m.Source}/{string.Join(",", m.Choices.Select(c => $"{c.Name}:{c.Label}:{c.Applies}:{c.Reason}"))}";
+        : $"{m.Active}/{m.Setting}/{m.Source}/{m.Reason}/{string.Join(",", m.Choices.Select(c => $"{c.Name}:{c.Label}:{c.Applies}:{c.Reason}"))}";
 
     private static string Sentence(string text)
     {

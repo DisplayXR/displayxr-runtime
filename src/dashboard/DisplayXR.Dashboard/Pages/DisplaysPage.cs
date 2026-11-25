@@ -188,44 +188,59 @@ public sealed class DisplaysPage : Page
     }
 
     /// <summary>
-    /// The per-display 3D mode picker: the 3D modes the display's driver offers, by the driver's own
-    /// labels, the one in use selected. Absent when there is nothing to choose (the feed says so, or lists
-    /// fewer than two modes). A choice runs `dp mode set &lt;name&gt; --screen &lt;key&gt;`; "Reset to
-    /// default" runs `dp mode reset --screen &lt;key&gt;`; the status feed shows the result. A mode the
-    /// display cannot show is not listed: the line under the picker names it and says why.
+    /// The per-display 3D mode row. With two or more modes it is a picker: the display's 3D modes by the
+    /// driver's own labels, the stored choice selected (else the one drawn now). A choice runs
+    /// `dp mode set &lt;name&gt; --screen &lt;key&gt;`; "Reset to default" runs `dp mode reset --screen
+    /// &lt;key&gt;` and is offered for this user's own choice only; the status feed shows the result. A
+    /// mode that applies at the next app start can be picked and says so; a mode the display cannot show
+    /// is not listed, and the line under the picker names it and says why. With a stored choice and no
+    /// modes reported, the row shows the stored choice and the reason, without a picker. Absent when the
+    /// feed says there is nothing (null), or lists one mode with nothing to choose.
     /// </summary>
     private Control? Mode3DRow(Screen s)
     {
-        if (!StatusText.Mode3DPickerShown(s) || s.Mode3D is not { } mode || s.Key is null) return null;
+        if (!StatusText.Mode3DRowShown(s) || s.Mode3D is not { } mode || s.Key is null) return null;
         string key = s.Key;
-        var items = StatusText.Mode3DItems(mode);
-        int selected = StatusText.Mode3DSelected(mode);
-        var combo = new ComboBox
-        {
-            ItemsSource = items.Select(c => c.Label).ToList(),
-            SelectedIndex = selected,
-            MinWidth = 200,
-            IsEnabled = !Ctx.ActionRunning,
-            VerticalAlignment = VerticalAlignment.Center,
-        };
-        combo.Classes.Add("field");
-        Avalonia.Automation.AutomationProperties.SetName(combo, $"3D mode for {StatusText.ScreenName(s)}");
-        combo.DropDownOpened += (_, _) => _openDropDowns++;
-        combo.DropDownClosed += (_, _) =>
-        {
-            _openDropDowns = System.Math.Max(0, _openDropDowns - 1);
-            Avalonia.Threading.Dispatcher.UIThread.Post(() => Update());
-        };
-        combo.SelectionChanged += (_, _) =>
-        {
-            int i = combo.SelectedIndex;
-            if (i < 0 || i == selected || i >= items.Count || Ctx.ActionRunning) return;
-            _modeKey = key;
-            _ = Ctx.RunActionsAsync("screen-mode", StatusText.Mode3DVerb(key, items[i]));
-        };
         var label = U.Text("3D mode", "label");
         label.VerticalAlignment = VerticalAlignment.Center;
-        var row = U.Flow(12, 4, label, combo);
+        Control value;
+        if (StatusText.Mode3DPickerShown(s))
+        {
+            var items = StatusText.Mode3DItems(mode);
+            int selected = StatusText.Mode3DSelected(mode);
+            var combo = new ComboBox
+            {
+                ItemsSource = items.Select(c => StatusText.Mode3DItemText(mode, c)).ToList(),
+                SelectedIndex = selected,
+                MinWidth = 200,
+                IsEnabled = !Ctx.ActionRunning,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            combo.Classes.Add("field");
+            Avalonia.Automation.AutomationProperties.SetName(combo, $"3D mode for {StatusText.ScreenName(s)}");
+            combo.DropDownOpened += (_, _) => _openDropDowns++;
+            combo.DropDownClosed += (_, _) =>
+            {
+                _openDropDowns = System.Math.Max(0, _openDropDowns - 1);
+                Avalonia.Threading.Dispatcher.UIThread.Post(() => Update());
+            };
+            combo.SelectionChanged += (_, _) =>
+            {
+                int i = combo.SelectedIndex;
+                if (i < 0 || i == selected || i >= items.Count || Ctx.ActionRunning) return;
+                _modeKey = key;
+                _ = Ctx.RunActionsAsync("screen-mode", StatusText.Mode3DVerb(key, items[i]));
+            };
+            value = combo;
+        }
+        else
+        {
+            // A stored choice, no modes reported: nothing to pick from, the choice stays visible.
+            var stored = U.Text(StatusText.Mode3DStoredText(mode));
+            stored.VerticalAlignment = VerticalAlignment.Center;
+            value = stored;
+        }
+        var row = U.Flow(12, 4, label, value);
         if (StatusText.Mode3DSourceText(mode) is { } source)
         {
             var src = U.Text(source, "meta");
@@ -247,7 +262,7 @@ public sealed class DisplaysPage : Page
         var col = U.VStack(2, row);
         col.Margin = new Thickness(0, 6, 0, 0);
         foreach (var note in StatusText.Mode3DNotes(mode)) col.Children.Add(U.Wrapped(note, "soft"));
-        col.Children.Add(U.Wrapped(StatusText.Mode3DExplanation, "desc"));
+        if (StatusText.Mode3DPickerShown(s)) col.Children.Add(U.Wrapped(StatusText.Mode3DExplanation, "desc"));
         if (Ctx.LastActionArea == "screen-mode" && _modeKey == key && Ctx.LastAction is { } last && Ctx.LastActionFailed)
             col.Children.Add(U.Wrapped(last, "soft"));
         return col;

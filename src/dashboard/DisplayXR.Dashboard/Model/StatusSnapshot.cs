@@ -150,8 +150,9 @@ public sealed record ScreenMode(int Index, string Name, int Views, bool Is3D);
 /// <summary>
 /// One 3D mode a screen's display driver offers (<c>screens[i].mode_3d.choices[j]</c>). <see cref="Name"/>
 /// is what <c>dp mode set</c> takes, <see cref="Label"/> the driver's own words (shown as given).
-/// <see cref="Applies"/> is "now" / "restart_app" / "not_supported"; <see cref="Reason"/> says why when it
-/// is not "now".
+/// <see cref="Applies"/> is "now" (a live change) / "restart_app" (the choice is stored and used the next
+/// time an app starts) / "not_supported" (it cannot be chosen). <see cref="Reason"/> is the runtime's
+/// note: why, when it is not "now"; a "now" mode can carry one too ("4 views: stereo apps show 2D").
 /// </summary>
 public sealed record Mode3DChoice(string Name, string Label, int Views, bool Tracked, bool Passthrough,
                                   string Applies, string? Reason)
@@ -161,14 +162,19 @@ public sealed record Mode3DChoice(string Name, string Label, int Views, bool Tra
 }
 
 /// <summary>
-/// A screen's 3D mode (<c>screens[i].mode_3d</c>): which of its driver's 3D modes is in use
+/// A screen's 3D mode (<c>screens[i].mode_3d</c>): which of its driver's 3D modes is drawn now
 /// (<see cref="Active"/>), what is stored for this screen (<see cref="Setting"/>, null = nothing), and
-/// where the mode in use comes from (<see cref="Source"/>: "driver_default" / "runtime_default" /
-/// "user" / "machine"). The whole record is null when the feed says <c>null</c> (the driver offers one
-/// 3D mode: nothing to choose) or predates it.
+/// what chose it (<see cref="Source"/>: "driver_default" / "runtime_default" / "user" / "machine").
+/// The two differ while a stored choice waits for the next app start. A stored choice on a screen whose
+/// driver reports no 3D modes reads <see cref="Active"/> null, no <see cref="Choices"/> and a
+/// <see cref="Reason"/>. The whole record is null when the feed says <c>null</c> (nothing known and
+/// nothing stored) or predates it.
 /// </summary>
 public sealed record Mode3D(string? Active, string? Setting, string Source, IReadOnlyList<Mode3DChoice> Choices)
 {
+    /// <summary>Why there are no choices (the feed's top-level <c>reason</c>); null otherwise.</summary>
+    public string? Reason { get; init; }
+
     public Mode3DChoice? Find(string? name) => name is null ? null : Choices.FirstOrDefault(c => c.Name == name);
 }
 
@@ -340,7 +346,8 @@ public static class StatusSnapshotParser
             .Select(c => new Mode3DChoice(c.Str("name"), c.Str("label", c.Str("name")), c.Int("views"), c.Bool("tracked"),
                                           c.Bool("passthrough"), c.Str("applies", "now"), c.StrOrNull("reason")))
             .ToArray();
-        return new Mode3D(o.StrOrNull("active"), o.StrOrNull("setting"), o.Str("source", "runtime_default"), choices);
+        return new Mode3D(o.StrOrNull("active"), o.StrOrNull("setting"), o.Str("source", "runtime_default"), choices)
+        { Reason = o.StrOrNull("reason") is { Length: > 0 } why ? why : null };
     }
 
     private static PixelRect ReadRect(JsonElement? e) =>
