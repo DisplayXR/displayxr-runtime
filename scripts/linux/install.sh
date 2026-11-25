@@ -96,6 +96,14 @@ if [ -f "$HERE/GLIBC_FLOOR" ]; then
 fi
 
 echo "==> Installing DisplayXR runtime to $PREFIX"
+# A RUNNING displayxr.service executes from (and has mapped the libraries in)
+# the tree we are about to overwrite: copying over it fails ("Text file busy")
+# or crashes it, and a survivor would refuse every new-version client at the
+# version gate. Stop it first (as root: in every user manager); the socket
+# starts the new binary on the next connect. Never starts anything.
+if [ "$NO_SERVICE" = 0 ] && [ -x "$HERE/bin/displayxr-restart-service" ]; then
+    "$HERE/bin/displayxr-restart-service" stop || true
+fi
 mkdir -p "$PREFIX"
 cp -R "$HERE/bin" "$PREFIX/"
 cp -R "$HERE/lib" "$PREFIX/"

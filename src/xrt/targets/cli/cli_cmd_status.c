@@ -286,6 +286,13 @@ note_headless(xrt_result_t why)
 	if (why == XRT_ERROR_NOT_AUTHORIZED) {
 		note_refused();
 	}
+	if (why == XRT_ERROR_IPC_VERSION_SKEW) {
+		// cli_ipc_connect already named both versions and the restart.
+		fprintf(stderr,
+		        "displayxr-cli status: the running service is a different version — showing the HEADLESS "
+		        "snapshot (what a process of this version starting now would get).\n");
+		return;
+	}
 #ifdef XRT_OS_MACOS
 	if (why != XRT_ERROR_NOT_AUTHORIZED && why != XRT_ERROR_FEATURE_NOT_SUPPORTED) {
 		note_launch_agent();

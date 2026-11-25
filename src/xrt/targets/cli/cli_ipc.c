@@ -15,6 +15,7 @@
 #include "client/ipc_client.h"
 #include "client/ipc_client_connection.h"
 #include "ipc_client_generated.h"
+#include "util/u_git_tag.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -77,6 +78,29 @@ cli_ipc_connect(struct ipc_connection *ipc_c, enum u_logging_level log_level, co
 		}
 	}
 #endif
+	if (xret == XRT_ERROR_IPC_VERSION_SKEW) {
+		// A service IS running, but a different build: the client/service
+		// version gate refused this CLI. Never let a caller report that as "no
+		// service reachable" without saying so (typically a package upgrade
+		// left the old service running). Once per process: `status --watch`
+		// reconnects in a loop.
+		static bool said_skew = false;
+		if (!said_skew) {
+			said_skew = true;
+			const char *svc = ipc_client_connection_skew_service_version();
+#ifdef XRT_OS_LINUX_DESKTOP
+			const char *restart = "systemctl --user restart displayxr.service";
+#else
+			const char *restart = "restart displayxr-service (or log out and back in)";
+#endif
+			fprintf(stderr,
+			        "displayxr-cli: a DisplayXR service is running, but it is version %s and this "
+			        "displayxr-cli is %s:\n"
+			        "  the version gate refused the connection, so nothing below comes from that service.\n"
+			        "  Run the installed version with: %s\n",
+			        svc != NULL ? svc : "(unknown)", u_git_tag, restart);
+		}
+	}
 	return xret;
 }
 

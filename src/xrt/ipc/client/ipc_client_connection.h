@@ -187,6 +187,17 @@ bool
 ipc_client_connection_handshake_timed_out(void);
 
 /*!
+ * When the last ipc_client_connection_init() on this process failed the
+ * client/service version gate (XRT_ERROR_IPC_VERSION_SKEW): the running
+ * service's version string. NULL otherwise. Not thread-safe; meant for
+ * diagnostics that connect from one thread (displayxr-cli).
+ *
+ * @ingroup ipc_client
+ */
+const char *
+ipc_client_connection_skew_service_version(void);
+
+/*!
  * Set up the basics of the client connection: socket and shared mem
  * @param ipc_c     Empty IPC connection struct
  * @param log_level Log level for IPC messages

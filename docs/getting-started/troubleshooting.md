@@ -647,6 +647,30 @@ service applies the change immediately. The workspace controller itself (e.g. th
 DisplayXR Shell) claims its own toggle chord only while it is running. Spec:
 `docs/specs/runtime/workspace-controller-registration.md` §*Launch settings*.
 
+## After an upgrade every app fails: "client library version … does not match service version …" (Linux)
+
+**Symptom.** Right after upgrading DisplayXR, every service client (the browser, the
+workspace controller, any `XRT_FORCE_MODE=ipc` app) fails to start, and its log says
+`DisplayXR client library version vB does not match service version vA`. `displayxr-cli`
+says *a DisplayXR service is running, but it is version vA and this displayxr-cli is vB*
+and shows a headless snapshot.
+
+**Cause.** A `displayxr.service` that was already running when the package was upgraded
+keeps running the old binaries, and the client/service version gate refuses every client of
+the new version. Since #2811 the runtime `.deb`'s postinst restarts a running user service
+in every logged-in session (`/usr/lib/displayxr/bin/displayxr-restart-service`), and the
+tarball's `install.sh` stops it before copying. Older packages did neither, and an install
+run with `DXR_NO_SERVICE_RESTART=1` skips it on purpose.
+
+**Fix.**
+
+```bash
+systemctl --user restart displayxr.service
+```
+
+Clients that were attached to the old service carry the old client library and must be
+relaunched too.
+
 ## Still stuck?
 
 Grab a bug-report dump and open an issue on the

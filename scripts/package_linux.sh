@@ -13,6 +13,8 @@
 #   bin/displayxr-conversion-host  (ADR-053 D5: the conversion-provider satellite,
 #       spawned by the service from its own directory)
 #   bin/displayxr-gnome-extension-enable
+#   bin/displayxr-restart-service  (install.sh stops a running displayxr.service
+#       with it before copying over the binaries it runs from)
 #   bin/displayxr-dashboard  (the DisplayXR Dashboard: self-contained .NET single
 #       file, beside the displayxr-cli it runs; from resolve_dashboard_bin.sh)
 #   share/applications/displayxr-dashboard.desktop.in + share/icons/displayxr-dashboard.png
@@ -200,6 +202,7 @@ cp "$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock.json.in" "$STAGE/share
 cp "$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock_implicit.json.in" "$STAGE/share/vulkan/"  # #886
 for f in $EXT_FILES; do cp "$EXT_SRC/$f" "$STAGE/share/gnome-shell/extensions/$EXT_UUID/"; done
 install -m 0755 "$ROOT/scripts/linux/displayxr-gnome-extension-enable" "$STAGE/bin/"
+install -m 0755 "$ROOT/scripts/linux/displayxr-restart-service" "$STAGE/bin/"
 cp "$ROOT/scripts/linux/install.sh" "$ROOT/scripts/linux/uninstall.sh" "$STAGE/"
 chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"
 echo "$VERSION" > "$STAGE/VERSION"
