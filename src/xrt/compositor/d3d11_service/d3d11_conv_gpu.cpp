@@ -1540,8 +1540,18 @@ d3d11_lift_glue_import_input_cpu(
 		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
 		blit_dst dst = {rkm, rtv};
 		ok = snapshot_blit(l, dst, gs->imp_srv, gs->imp_w, gs->imp_h, 0, 0, w, h, w, h);
+		// snapshot_blit released the scratch target's keyed mutex, and D3D11
+		// DROPS a copy from a keyed-mutex resource this device does not hold:
+		// the staging texture then read back as zeros, so every one-shot
+		// GAUSSIANS photo reached its provider black. Re-acquire for the copy,
+		// as the weave path's readback does (cpu_snapshot, #2553).
+		if (ok) {
+			const HRESULT hr = rkm->AcquireSync(0, 4);
+			ok = SUCCEEDED(hr) && hr != (HRESULT)WAIT_TIMEOUT;
+		}
 		if (ok) {
 			l->svc_context->CopyResource(st, rt);
+			rkm->ReleaseSync(0);
 			D3D11_MAPPED_SUBRESOURCE m = {};
 			ok = SUCCEEDED(l->svc_context->Map(st, 0, D3D11_MAP_READ, 0, &m));
 			if (ok) {
