@@ -95,6 +95,17 @@ fake_maintenance(void *, const char *)
 	return g_maint_held.load();
 }
 
+//! The fake "is the provider's row still the one this proxy is bound to" (#2793).
+std::atomic<bool> g_reg_current{true};
+std::atomic<uint32_t> g_reg_checks{0};
+
+bool
+fake_registration(void *, const char *, const char *)
+{
+	g_reg_checks++;
+	return g_reg_current.load();
+}
+
 bool
 cpu_alloc(void *, const conv_image_request *req, xrt_conv_image *out)
 {
@@ -283,6 +294,7 @@ struct Fixture : CoreOps
 		pc.spawn_for_describe = spawn_for_describe; // these tests start with no describe cache
 		if (fake_mutex) {
 			pc.maintenance_held = fake_maintenance; // else the real OS check
+			pc.registration_current = fake_registration; // current unless a test says otherwise
 		}
 		REQUIRE(conv_host_proxy_create(&pc, &host) == XRT_SUCCESS);
 
@@ -641,6 +653,213 @@ TEST_CASE("proxy: a registration rebind makes the next host load the new binary;
 	std::remove(log.c_str());
 }
 
+TEST_CASE("proxy: a row removed or rewritten under the maintenance mutex is re-read before any spawn (#2793)",
+          "[conv_proxy]")
+{
+	// Discovery spec §3.8.1. An uninstaller holds the provider's maintenance
+	// mutex, Restart Manager closes the host (exit 20), the binary and the
+	// row are removed, the mutex is released. The supervisor polls the mutex
+	// itself and used to respawn at the release -- one short-lived host on the
+	// binary that was leaving -- before the service's rescan marked the
+	// provider gone. The scripted host logs the binary each start was given.
+	const std::string log = temp_marker() + ".binaries";
+	const std::string marker = temp_marker() + ".update";
+	std::remove(log.c_str());
+	g_maint_held = false;
+	g_reg_current = true;
+	g_reg_checks = 0;
+	Fixture fx({"--fake-binary-log", log, "--fake-update-after", "3", "--fake-update-once", marker}, 0, 5,
+	           CONV_PROXY_HOST, "sat-test", "old-binary", true, nullptr, true);
+	const uint64_t sid = fx.stream();
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x61, &r));
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	REQUIRE(fx.convert(sid, 0x62, &r));
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	const uint32_t spawns = fx.sup().spawns;
+	REQUIRE(spawns == 1u);
+	CHECK(g_reg_checks.load() == 1u); // the row is read once per host start
+	CHECK_FALSE(conv_host_proxy_registration_pending(fx.host));
+
+	// The uninstaller takes the mutex, then closes the host.
+	g_maint_held = true;
+	REQUIRE(fx.submit(sid, 0x63));
+	REQUIRE(wait_until([&] { return fx.sup().last_exit == CONV_HOST_EXIT_UPDATE; }, 10000));
+	REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_UPDATING; }, 5000));
+	// It removes the row and releases the mutex. Nothing has told the proxy
+	// (the service's rescan has not run); the stream keeps submitting, so the
+	// respawn is owed and due the moment the mutex reads free.
+	g_reg_current = false;
+	g_maint_held = false;
+	for (int i = 0; i < 40; i++) { // 2 s: well past the 1 Hz probe
+		(void)fx.submit(sid, 0x64);
+		sleep_ms(50);
+	}
+	// Zero spawns between the release and the "registration is gone"
+	// transition: the spawn was taken back, not performed.
+	CHECK(fx.sup().spawns == spawns);
+	CHECK(fx.sup().restarts == 0u);
+	CHECK(fx.sup().last_exit == CONV_HOST_EXIT_UPDATE); // no later exit: no process was started
+	CHECK(read_lines(log).size() == 1u);
+	CHECK(conv_host_proxy_registration_pending(fx.host));
+	CHECK(g_reg_checks.load() == 2u); // asked once more, then held: not re-read on every pass
+	CHECK(conv_host_is_down(fx.host));
+	CHECK(fx.row_state() == XRT_CONV_STATE_WARMING); // still "updating", not FAILED
+
+	SECTION("the row is gone (uninstall): never a host again until it is back")
+	{
+		// What the service's rescan does on REMOVE.
+		conv_host_proxy_set_registration_pending(fx.host, true);
+		conv_core_set_provider_enabled(fx.c, "sat-test", false);
+		conv_core_set_provider_registered(fx.c, "sat-test", false);
+		g_reg_current = true; // even if a later read would say "current"
+		for (int i = 0; i < 30; i++) {
+			(void)fx.submit(sid, 0x65);
+			sleep_ms(50);
+		}
+		CHECK(fx.sup().spawns == spawns);
+		CHECK(read_lines(log).size() == 1u);
+		CHECK(fx.sup().restarts == 0u);
+
+		// Reinstalled at a new path (RESTORE): the rebind releases the hold.
+		conv_core_set_provider_registered(fx.c, "sat-test", true);
+		conv_core_set_provider_enabled(fx.c, "sat-test", true);
+		CHECK(conv_host_proxy_rebind(fx.host, "new-binary", false));
+		conv_host_proxy_config_changed(fx.host);
+		CHECK_FALSE(conv_host_proxy_registration_pending(fx.host));
+		REQUIRE(wait_until([&] { return fx.sup().spawns == spawns + 1u; }, 20000));
+		REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_RUNNING; }, 40000));
+		const auto lines = read_lines(log);
+		REQUIRE(lines.size() == 2u);
+		CHECK(lines[1] == "new-binary");
+	}
+	SECTION("the row names another binary (update): the first spawn after the release is the new binary")
+	{
+		// What the service's rescan does on REBIND.
+		g_reg_current = true;
+		CHECK(conv_host_proxy_rebind(fx.host, "new-binary", false));
+		conv_host_proxy_config_changed(fx.host);
+		CHECK_FALSE(conv_host_proxy_registration_pending(fx.host));
+		REQUIRE(fx.convert(sid, 0x66, &r, 20000));
+		check_views(r, 0x66);
+		conv_core_stream_release(fx.c, sid, r.ring_slot);
+		CHECK(fx.sup().spawns == spawns + 1u);
+		CHECK(fx.sup().restarts == 0u);
+		CHECK(fx.stats(sid).rebinds == 0u);
+		const auto lines = read_lines(log);
+		REQUIRE(lines.size() == 2u);
+		CHECK(lines[0] == "old-binary");
+		CHECK(lines[1] == "new-binary"); // "old-binary" was never started a second time
+	}
+	SECTION("the row reads the same after all: the owner releases the hold, the old binary respawns")
+	{
+		g_reg_current = true;
+		conv_host_proxy_set_registration_pending(fx.host, false);
+		REQUIRE(fx.convert(sid, 0x67, &r, 20000));
+		check_views(r, 0x67);
+		conv_core_stream_release(fx.c, sid, r.ring_slot);
+		CHECK(fx.sup().spawns == spawns + 1u);
+		CHECK(fx.sup().restarts == 0u);
+		const auto lines = read_lines(log);
+		REQUIRE(lines.size() == 2u);
+		CHECK(lines[1] == "old-binary");
+	}
+	g_reg_current = true;
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	std::remove(log.c_str());
+	std::remove(marker.c_str());
+}
+
+TEST_CASE("proxy: a declined probe (host exit 16) is a reported load failure: latched, one retry per change (#2798)",
+          "[conv_proxy]")
+{
+	// The host of an opt-in provider that is not enabled (sim-conversion as
+	// shipped), or of one with nothing to serve on this machine, exits 16
+	// before it is up. The supervisor latches it (no respawn loop); the proxy
+	// now also says so, so the status rows can read PROBE_DECLINED instead of
+	// looking like a provider that was never started.
+	Fixture fx({"--fake-exit-at-start", "16"});
+	REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 20000));
+	CHECK(fx.sup().last_exit == CONV_HOST_EXIT_PROBE_DECLINED);
+	CHECK(conv_host_get_load_failure(fx.host) == CONV_HOST_EXIT_PROBE_DECLINED);
+	CHECK(conv_host_exit_is_probe_declined(conv_host_get_load_failure(fx.host)));
+	CHECK(fx.sup().restarts == 0u);                  // not a crash
+	CHECK(fx.row_state() == XRT_CONV_STATE_UNKNOWN); // never described: no capability row
+
+	// Latched: the describe is still wanted (demand), and nothing respawns --
+	// well past the 1 Hz maintenance probe and any backoff.
+	const uint32_t spawns = fx.sup().spawns;
+	CHECK(spawns == 1u);
+	sleep_ms(1500);
+	CHECK(fx.sup().spawns == spawns);
+	CHECK(fx.sup().state == CONV_SUP_FAILED);
+
+	// A configuration change (`conv set`, `conv enable`, a new Version) is one
+	// retry: exactly one more short spawn, and the reader never sees the
+	// provider as "not started" in between.
+	bool saw_none = false;
+	conv_host_proxy_config_changed(fx.host);
+	REQUIRE(wait_until(
+	    [&] {
+		    saw_none = saw_none || conv_host_get_load_failure(fx.host) == 0;
+		    const conv_supervisor_status st = fx.sup();
+		    return st.spawns == spawns + 1u && st.state == CONV_SUP_FAILED;
+	    },
+	    20000));
+	CHECK_FALSE(saw_none);
+	sleep_ms(1500);
+	CHECK(fx.sup().spawns == spawns + 1u);
+	CHECK(conv_host_get_load_failure(fx.host) == CONV_HOST_EXIT_PROBE_DECLINED);
+
+	// The registration is rebound to another binary: what the previous binary
+	// reported is dropped at once (its supervisor gate is cleared separately,
+	// by conv_host_proxy_config_changed).
+	CHECK(conv_host_proxy_rebind(fx.host, "another-binary", false));
+	CHECK(conv_host_get_load_failure(fx.host) == 0);
+}
+
+TEST_CASE("proxy: a declined probe clears when the retry comes up; other exit codes keep their meaning (#2798)",
+          "[conv_proxy]")
+{
+	SECTION("declined once, then up")
+	{
+		const std::string marker = temp_marker() + ".declined";
+		std::remove(marker.c_str());
+		Fixture fx({"--fake-decline-once", marker});
+		REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 20000));
+		CHECK(conv_host_get_load_failure(fx.host) == CONV_HOST_EXIT_PROBE_DECLINED);
+		// The user enabled it (`conv set <id> ENABLE 1`): the service's rescan
+		// clears the load-failure gate and the describe spawn goes again.
+		conv_host_proxy_config_changed(fx.host);
+		REQUIRE(wait_until([&] { return fx.row_state() != XRT_CONV_STATE_UNKNOWN; }, 40000));
+		CHECK(conv_host_get_load_failure(fx.host) == 0);
+		CHECK(fx.sup().state == CONV_SUP_RUNNING);
+		CHECK(fx.sup().spawns == 2u);
+		CHECK(fx.sup().restarts == 0u);
+		std::remove(marker.c_str());
+	}
+	SECTION("an ABI reject (10) is a load failure, not a declined probe")
+	{
+		Fixture fx({"--fake-exit-at-start", "10"});
+		REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 20000));
+		CHECK(conv_host_get_load_failure(fx.host) == CONV_HOST_EXIT_ABI_REJECT);
+		CHECK_FALSE(conv_host_exit_is_probe_declined(conv_host_get_load_failure(fx.host)));
+	}
+	SECTION("a crash loop is not a load failure")
+	{
+		Fixture fx({"--fake-exit-at-start", "139"}, 0, 2);
+		REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 30000));
+		CHECK(fx.sup().restarts >= 2u);
+		CHECK(conv_host_get_load_failure(fx.host) == 0);
+	}
+	SECTION("a host that is up reports none")
+	{
+		Fixture fx({});
+		REQUIRE(wait_until([&] { return fx.row_state() != XRT_CONV_STATE_UNKNOWN; }, 40000));
+		CHECK(conv_host_get_load_failure(fx.host) == 0);
+	}
+}
+
 TEST_CASE("proxy: with a warm describe cache nothing spawns until a warm / create", "[conv_proxy]")
 {
 	std::vector<uint8_t> cache;
@@ -922,6 +1141,39 @@ job_bytes(CoreOps &fx)
 }
 
 } // namespace
+
+TEST_CASE("proxy: the real host with the sim provider as shipped (ENABLE unset) declines and says so (#2798)",
+          "[conv_proxy]")
+{
+	// The state of the bug report: sim-conversion registered, never enabled.
+	// The real displayxr-conversion-host loads it, its probe answers
+	// XRT_ERROR_PROBER_NOT_SUPPORTED, the host exits 16 before it is up.
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");   // the sim provider lives in the build tree (#952)
+	set_env("DXR_CONV_HOST_ALLOW_ELEVATED", "1"); // CI runners and this harness are elevated
+	set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "0");
+	set_env("DXR_CONV_SIM_CONVERSION_LATENCY_MS", "0");
+	Fixture fx({}, 0, 5, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH);
+	// A real host start costs seconds (its logger setup), more under a parallel ctest.
+	REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 60000));
+	const conv_supervisor_status st = fx.sup();
+	CHECK(st.last_exit == CONV_HOST_EXIT_PROBE_DECLINED);
+	CHECK(st.restarts == 0u);
+	CHECK(st.spawns == 1u);
+	CHECK(std::string(st.detail != nullptr ? st.detail : "") == "probe_declined");
+	CHECK(conv_host_exit_is_probe_declined(conv_host_get_load_failure(fx.host)));
+	sleep_ms(1500);
+	CHECK(fx.sup().spawns == 1u); // latched: no respawn loop
+
+	// `conv set sim-conversion ENABLE 1`: the host inherits the setting, the
+	// service's rescan clears the load-failure gate, the retry comes up.
+	set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "1");
+	conv_host_proxy_config_changed(fx.host);
+	REQUIRE(wait_until([&] { return fx.row_state(XRT_CONV_TASK_DEPTH_MONO) != XRT_CONV_STATE_UNKNOWN; }, 60000));
+	CHECK(conv_host_get_load_failure(fx.host) == 0);
+	CHECK(fx.sup().state == CONV_SUP_RUNNING);
+	CHECK(fx.sup().spawns == 2u);
+	CHECK(fx.sup().restarts == 0u);
+}
 
 TEST_CASE("proxy: the real displayxr-conversion-host with the sim provider matches in-service", "[conv_proxy]")
 {

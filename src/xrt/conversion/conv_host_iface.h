@@ -263,6 +263,17 @@ struct conv_host_ops
 	                 struct xrt_component_license_state *out_state,
 	                 char *err,
 	                 uint32_t err_cap);
+
+	/*! [C, never blocks] Why the provider did not come up in its host process:
+	 *  the exit code (conv_host_wire.h CONV_HOST_EXIT_*) of the last host
+	 *  start that ended in a terminal refusal before the host was up -- 16 =
+	 *  its probe declined, 10 = ABI reject, 11 = negotiate / describe failed,
+	 *  ... -- or 0 when there is none. It stays while a retry is on its way
+	 *  (so a reader never sees "not started" in between) and clears when a
+	 *  host comes up or the provider's registration is rebound to another
+	 *  binary. A crash loop is not a load failure and reads 0. NULL =
+	 *  in-service (the loader row carries the reason). #2798. */
+	int32_t (*get_load_failure)(struct conv_host *h);
 };
 
 /*! Base of every host. */
@@ -315,6 +326,27 @@ conv_host_get_license_state(struct conv_host *h, struct xrt_component_license_st
 		return XRT_COMPONENT_LICENSE_NOT_APPLICABLE;
 	}
 	return h->ops->get_license_state(h, out);
+}
+
+//! conv_host_ops::get_load_failure; 0 for a host without the op (in-service).
+static inline int32_t
+conv_host_get_load_failure(struct conv_host *h)
+{
+	if (h == NULL || h->ops->get_load_failure == NULL) {
+		return 0;
+	}
+	return h->ops->get_load_failure(h);
+}
+
+/*! Is host exit code @p code CONV_HOST_EXIT_PROBE_DECLINED (16)? The
+ *  provider's probe answered XRT_ERROR_PROBER_NOT_SUPPORTED: an opt-in
+ *  provider that is not enabled, or one with nothing to serve on this
+ *  machine. Status readers report it as `PROBE_DECLINED`, the word the
+ *  headless pass uses for the same answer. */
+static inline bool
+conv_host_exit_is_probe_declined(int32_t code)
+{
+	return code == 16;
 }
 
 static inline xrt_result_t

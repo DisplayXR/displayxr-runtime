@@ -36,6 +36,8 @@
  *    else it is terminated; that late exit is not a crash.
  *  - Every spawn (first, backoff expiry, update) waits while the maintenance
  *    mutex is held (an installer's Restart Manager session, §3.6).
+ *  - A SPAWN the owner withholds because the provider's registration changed
+ *    (conv_supervisor_spawn_withheld) never happened: no accounting.
  *
  * Reported readiness (conv_supervisor_get_status): while the host is down
  * after an abnormal exit or a kill, every task of the provider is
@@ -138,6 +140,8 @@ struct conv_supervisor
 	bool service_shutdown; //!< STOPPED once the host is down
 	uint32_t warming;      //!< CONV_SUP_WARMING_*: why the tasks report WARMING until RUNNING
 	bool pending_spawn_report; //!< SPAWN issued, spawned() not yet reported
+	enum conv_supervisor_state
+	    spawn_from; //!< the state the last SPAWN was issued from (conv_supervisor_spawn_withheld)
 
 	enum conv_supervisor_kill_reason kill_reason;
 	bool terminate_due;     //!< a TERMINATE action is owed
@@ -186,6 +190,20 @@ conv_supervisor_set_maintenance(struct conv_supervisor *s, bool held);
 //! Outcome of a SPAWN action. false = the process could not be started (abnormal).
 void
 conv_supervisor_spawned(struct conv_supervisor *s, uint64_t now_ns, bool ok);
+
+/*!
+ * The SPAWN action just issued was NOT performed, on purpose: the owner found
+ * the provider's registration changed or gone when it re-read it for the
+ * spawn (#2793, discovery spec §3.8.1). Not an exit: no backoff, no
+ * crash-loop accounting, the spawn is not counted. The supervisor is back in
+ * the state the SPAWN came from (IDLE, BACKOFF with its deadline, UPDATING),
+ * reporting what it reported, and issues the SPAWN again at the next tick
+ * that may spawn -- so the owner holds the maintenance gate
+ * (conv_supervisor_set_maintenance) until the row was re-read. A no-op unless
+ * a SPAWN is outstanding (conv_supervisor_spawned not yet reported).
+ */
+void
+conv_supervisor_spawn_withheld(struct conv_supervisor *s);
 
 //! The host's hello was checked: accepted (RUNNING) or rejected (the host should exit 10; killed if it does not).
 void

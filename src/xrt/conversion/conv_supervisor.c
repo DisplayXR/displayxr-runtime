@@ -171,6 +171,7 @@ begin_kill(struct conv_supervisor *s, enum conv_supervisor_kill_reason reason)
 static enum conv_supervisor_action
 issue_spawn(struct conv_supervisor *s, uint64_t now_ns)
 {
+	s->spawn_from = s->state;
 	s->state = CONV_SUP_STARTING;
 	s->start_ns = now_ns;
 	s->running_since_ns = 0;
@@ -225,6 +226,23 @@ conv_supervisor_spawned(struct conv_supervisor *s, uint64_t now_ns, bool ok)
 		// No process: exactly an immediate exit.
 		conv_supervisor_exited(s, now_ns, CONV_SUP_EXIT_SPAWN_FAILED);
 	}
+}
+
+void
+conv_supervisor_spawn_withheld(struct conv_supervisor *s)
+{
+	// KILLING with the report still owed: an event (service shutdown, a
+	// channel error) asked to kill a process that was never started.
+	if (!s->pending_spawn_report || (s->state != CONV_SUP_STARTING && s->state != CONV_SUP_KILLING)) {
+		return;
+	}
+	// issue_spawn changed nothing else that the source state reads: warming,
+	// detail, the backoff deadline and the crash history are as they were.
+	s->pending_spawn_report = false;
+	s->spawns--;
+	s->kill_reason = CONV_SUP_KILL_NONE;
+	s->terminate_due = false;
+	s->state = s->service_shutdown ? CONV_SUP_STOPPED : s->spawn_from;
 }
 
 void

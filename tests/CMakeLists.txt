@@ -62,6 +62,7 @@ set(tests
     tests_cli_dims_check
     tests_cli_metres_check
     tests_cli_conv_run_math
+    tests_cli_conv_warm_plan
     tests_cli_lever_catalog
     tests_cli_input_predict
     tests_cli_dp_predict
@@ -1507,6 +1508,10 @@ target_link_libraries(tests_cli_metres_check PRIVATE xrt-interfaces)
 
 # `conv run`: the input downscale and the given intrinsics that follow it. Header-only.
 target_include_directories(tests_cli_conv_run_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
+
+# `conv warm <id>`: one verdict per task, never one per row. Header-only.
+target_include_directories(tests_cli_conv_warm_plan PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
+target_link_libraries(tests_cli_conv_warm_plan PRIVATE xrt-interfaces)
 
 # perf-settings Phase 2A: the generated Tier 1/2 lever catalog behind
 # `perf list --all` (scripts/gen_lever_catalog.py). Header-only data; aux_util

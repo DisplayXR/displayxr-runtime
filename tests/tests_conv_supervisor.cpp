@@ -641,6 +641,109 @@ TEST_CASE("supervisor: service shutdown never respawns", "[conv][supervisor]")
 	}
 }
 
+TEST_CASE("supervisor: a withheld spawn never happened (#2793)", "[conv][supervisor]")
+{
+	// Discovery spec 3.8.1: the owner re-reads the provider's registration for
+	// every spawn; a row that changed or went away means the SPAWN action is
+	// not performed. No process, so no exit: no accounting of any kind.
+	SECTION("after a close for update: back to UPDATING, still WARMING(updating)")
+	{
+		rig r;
+		r.start();
+		conv_supervisor_set_maintenance(&r.s, true); // the uninstaller's session
+		conv_supervisor_exited(&r.s, r.now, CONV_HOST_EXIT_UPDATE);
+		REQUIRE(r.s.state == CONV_SUP_UPDATING);
+		const uint32_t spawns = r.status().spawns;
+		CHECK(r.tick() == CONV_SUP_ACTION_NONE); // held
+
+		// Released: the supervisor wants its respawn at once...
+		conv_supervisor_set_maintenance(&r.s, false);
+		REQUIRE(r.tick() == CONV_SUP_ACTION_SPAWN);
+		// ...and the owner finds the row gone.
+		conv_supervisor_spawn_withheld(&r.s);
+		conv_supervisor_set_maintenance(&r.s, true); // the owner's hold until the row is re-read
+		auto st = r.status();
+		CHECK(r.s.state == CONV_SUP_UPDATING);
+		CHECK(st.spawns == spawns);
+		CHECK(st.restarts == 0);
+		CHECK(st.conv_state == XRT_CONV_STATE_WARMING);
+		CHECK(std::string(st.detail) == "updating");
+		CHECK_FALSE(conv_supervisor_host_alive(&r.s));
+
+		// Nothing between the release and the rescan, however long that takes.
+		for (int i = 0; i < 100; i++) {
+			r.advance(1 * SEC);
+			CHECK(r.tick() == CONV_SUP_ACTION_NONE);
+		}
+		CHECK(r.status().spawns == spawns);
+
+		// The row was re-read (a rebind): one spawn, the normal way.
+		conv_supervisor_config_changed(&r.s, r.now);
+		conv_supervisor_set_maintenance(&r.s, false);
+		REQUIRE(r.tick() == CONV_SUP_ACTION_SPAWN);
+		conv_supervisor_spawned(&r.s, r.now, true);
+		conv_supervisor_hello(&r.s, r.now, true);
+		CHECK(r.s.state == CONV_SUP_RUNNING);
+		CHECK(r.status().spawns == spawns + 1);
+		CHECK(r.status().restarts == 0);
+	}
+	SECTION("from IDLE (first demand): back to IDLE")
+	{
+		rig r;
+		conv_supervisor_set_demand(&r.s, r.now, true);
+		REQUIRE(r.tick() == CONV_SUP_ACTION_SPAWN);
+		conv_supervisor_spawn_withheld(&r.s);
+		CHECK(r.s.state == CONV_SUP_IDLE);
+		CHECK(r.status().spawns == 0);
+		CHECK(r.status().conv_state == XRT_CONV_STATE_UNKNOWN);
+		// Not held by the owner: the next tick simply asks again.
+		CHECK(r.tick() == CONV_SUP_ACTION_SPAWN);
+		CHECK(r.status().spawns == 1);
+	}
+	SECTION("from BACKOFF: the crash accounting is untouched")
+	{
+		rig r;
+		r.start();
+		conv_supervisor_exited(&r.s, r.now, 139);
+		REQUIRE(r.s.state == CONV_SUP_BACKOFF);
+		const auto before = r.status();
+		r.advance(1 * SEC); // past the 0.5 s backoff
+		REQUIRE(r.tick() == CONV_SUP_ACTION_SPAWN);
+		conv_supervisor_spawn_withheld(&r.s);
+		conv_supervisor_set_maintenance(&r.s, true);
+		const auto st = r.status();
+		CHECK(r.s.state == CONV_SUP_BACKOFF);
+		CHECK(st.restarts == before.restarts);
+		CHECK(st.spawns == before.spawns);
+		CHECK(st.backoff_ns == before.backoff_ns);
+		CHECK(st.conv_state == XRT_CONV_STATE_WARMING);
+		CHECK(std::string(st.detail) == "restarting");
+		r.advance(1 * MIN);
+		CHECK(r.tick() == CONV_SUP_ACTION_NONE);
+	}
+	SECTION("the service shut down meanwhile: STOPPED, nothing to kill")
+	{
+		rig r;
+		conv_supervisor_set_demand(&r.s, r.now, true);
+		REQUIRE(r.tick() == CONV_SUP_ACTION_SPAWN);
+		conv_supervisor_service_shutdown(&r.s, r.now); // STARTING -> KILLING, no process yet
+		conv_supervisor_spawn_withheld(&r.s);
+		CHECK(r.s.state == CONV_SUP_STOPPED);
+		CHECK(r.tick() == CONV_SUP_ACTION_NONE);
+		CHECK(r.status().spawns == 0);
+	}
+	SECTION("a no-op once the spawn was reported, or with no spawn outstanding")
+	{
+		rig r;
+		conv_supervisor_spawn_withheld(&r.s);
+		CHECK(r.s.state == CONV_SUP_IDLE);
+		r.start();
+		conv_supervisor_spawn_withheld(&r.s);
+		CHECK(r.s.state == CONV_SUP_RUNNING);
+		CHECK(r.status().spawns == 1);
+	}
+}
+
 TEST_CASE("supervisor: stale events are ignored", "[conv][supervisor]")
 {
 	rig r;
