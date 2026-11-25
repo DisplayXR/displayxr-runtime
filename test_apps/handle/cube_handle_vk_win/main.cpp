@@ -22,6 +22,7 @@
 #include "hud_renderer.h"
 #include "text_overlay.h"
 #include "tracking_loss_director.h" // MANUAL eye-tracking demo (T + L)
+#include "dxr_mode_tracking.h" // does the ACTIVE rendering mode track the viewer?
 #include "atlas_capture.h"
 
 #include <atomic>
@@ -95,6 +96,7 @@ static std::atomic<bool> g_hwToggleRequested{false};
 // director itself lives on the render thread.
 static std::atomic<bool> g_lossPresetCycleRequested{false};
 static dxr_demo::TrackingLossDirector g_lossDirector;
+static dxr_demo::ModeTrackingWatch g_modeTracking; // the active mode's hasTracking
 static bool g_hwOverrideActive = false;       // render-thread only
 static bool g_hwOverride3D = false;           // render-thread only
 static uint32_t g_hwOverrideModeIndex = 0;    // render-thread only
@@ -763,6 +765,10 @@ static void RenderThreadFunc(
         // ipdFactor below; LENS_2D also asks for the lens.
         {
             bool lossCycle = g_lossPresetCycleRequested.exchange(false);
+            // A mode that advertises no viewer tracking has no face to lose: the bar
+            // says "No tracking" (decided from the runtime's per-mode hasTracking).
+            g_lossDirector.SetModeTracking(g_modeTracking.Update(xr->pfnEnumerateDisplayRenderingModesEXT, xr->session,
+                                                                 xr->currentModeIndex, perfStats.deltaTime));
             g_lossDirector.SetMode3D(xr->renderingModeCount == 0 || xr->renderingModeDisplay3D[xr->currentModeIndex]);
             dxr_demo::TrackingLossStep(
                 g_lossDirector, perfStats.deltaTime,

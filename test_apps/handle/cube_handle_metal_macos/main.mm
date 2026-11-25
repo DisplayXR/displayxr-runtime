@@ -57,6 +57,7 @@
 #include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
 #include "dxr_stylus.h"       // --stylus: the shared OpenXR half (ADR-034 Amendment 8)
 #include "tracking_loss_director.h" // T/L: MANUAL eye-tracking demo (director + status bar)
+#include "dxr_mode_tracking.h" // does the ACTIVE rendering mode track the viewer?
 #include "bar_label_font.h"          // the status bar's text label (5x7 bitmap font as rects)
 
 // ============================================================================
@@ -1169,6 +1170,7 @@ static void DrawCursorSprite(MetalRenderer &r, id<MTLRenderCommandEncoder> enc, 
 // bar + text label show the mode and phase. Same keys and log lines as
 // cube_handle_d3d11_win.
 static dxr_demo::TrackingLossDirector g_lossDirector;
+static dxr_demo::ModeTrackingWatch g_modeTracking; // the active mode's hasTracking
 static bool g_lossPresetCycleRequested = false;
 
 //! What RenderScene draws as the status bar (set by the frame loop).
@@ -3705,6 +3707,10 @@ int main(int argc, char **argv)
         // frame's per-frame tracking state.
         {
             const bool manualEt = app.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR;
+            // A mode that advertises no viewer tracking has no face to lose:
+            // the bar says "No tracking" (the runtime's per-mode hasTracking).
+            g_lossDirector.SetModeTracking(g_modeTracking.Update(app.pfnEnumerateDisplayRenderingModesEXT,
+                                                                 app.session, app.currentModeIndex, dt));
             dxr_demo::TrackingLossStep(
                 g_lossDirector, dt, manualEt, app.isEyeTracking, &g_lossPresetCycleRequested,
                 [](const char *line) { LOG_INFO("%s", line); },

@@ -1066,6 +1066,11 @@ struct TrackingLossDirector {
     bool capsManual = true;   // SetCaps: MANUAL bit (0x2)
     bool mode3D = true;       // SetMode3D: active mode lights the lens (LENS_2D owns it only then)
     void SetMode3D(bool hardware3D) { mode3D = hardware3D; }
+    //! The ACTIVE mode consumes viewer tracking (XrDisplayRenderingModeTrackingInfoDXR::
+    //! hasTracking; true while unknown). Mirrors TrackingLossDirector::SetModeTracking:
+    //! false = no face to lose, so the bar says "No tracking" and MANUAL stays idle.
+    bool modeTracking = true;
+    void SetModeTracking(bool hasTracking) { modeTracking = hasTracking; }
     //! Mirrors TrackingLossDirector::SetCaps (tracking_loss_director.h).
     void SetCaps(unsigned long long supportedModes) {
         capsTracking = supportedModes != 0;
@@ -1111,7 +1116,7 @@ struct TrackingLossDirector {
         const Phase before = phase;
         int lens = -1;
         if (!mode3D) lens2DRequested = false; // user chose 2D: recovery must not request 3D over it
-        if (!manual || preset == OFF) {
+        if (!manual || preset == OFF || !modeTracking) {
             u = u + dt / kRecoverS > 1.0f ? 1.0f : u + dt / kRecoverS;
             if (lens2DRequested) { lens = 1; lens2DRequested = false; }
             phase = IDLE;
@@ -1144,7 +1149,7 @@ struct TrackingLossDirector {
     //! Zero-disparity status bar: length = current depth, colour = state.
     void BarColor(bool manual, float rgb[3]) const {
         auto set = [&](float r, float g, float b) { rgb[0] = r; rgb[1] = g; rgb[2] = b; };
-        if (!capsTracking) { set(0.5f, 0.5f, 0.5f); return; }                                  // grey: no tracking
+        if (!capsTracking || !modeTracking) { set(0.5f, 0.5f, 0.5f); return; }                 // grey: display or mode does not track
         if (!manual) { tracked ? set(0.15f, 0.45f, 1.0f) : set(1.0f, 0.15f, 0.15f); return; }   // MANAGED: blue / red
         if (preset == OFF) { tracked ? set(0.7f, 0.3f, 1.0f) : set(1.0f, 0.15f, 0.15f); return; } // purple / red
         switch (phase) {
@@ -1155,13 +1160,18 @@ struct TrackingLossDirector {
         }
     }
     //! The bar's text label (mirrors TrackingLossDirector::BarLabel in
-    //! test_apps/common/tracking_loss_director.h): "MANAGED", "MANAGED - face
+    //! test_apps/common/tracking_loss_director.h): "NO EYE TRACKING", "No tracking"
+    //! (the active mode does not track), "MANAGED", "MANAGED - face
     //! lost", "MANUAL", "MANUAL [lens-2D] - face lost (collapse)", ...; the
     //! preset is named only when it is not the default (converge).
     const char* BarLabel(bool manual, char* buf, size_t n) const {
         if (buf == nullptr || n == 0) return "";
         if (!capsTracking) {
             snprintf(buf, n, "%s", "NO EYE TRACKING");
+            return buf;
+        }
+        if (!modeTracking) {
+            snprintf(buf, n, "%s", "No tracking");
             return buf;
         }
         if (!manual) {
@@ -2345,6 +2355,9 @@ struct AppXrSession {
     uint32_t currentModeIndex = 0;
     bool haveCurrentMode = false;
     XrDisplayRenderingModeInfoDXR modes[kMaxModes] = {};
+    //! modes[i] consumes viewer tracking (XrDisplayRenderingModeTrackingInfoDXR,
+    //! v14). Pre-set true, so a runtime that does not fill it keeps the old bar.
+    bool modeHasTracking[kMaxModes] = {};
 };
 
 // XR_DXR_cursor_depth (ADR-046): the app owns the depth - "ray -> first cube
@@ -2830,8 +2843,10 @@ static bool CreateVulkanDevice(AppXrSession& xr, VkPhysicalDevice physDevice, ui
     return true;
 }
 
-//! (Re)read the runtime's rendering-mode table and the active mode. Called once
-//! after xrCreateSession; the active mode then follows the mode-changed event.
+//! (Re)read the runtime's rendering-mode table and the active mode. Called after
+//! xrCreateSession and again on XrEventDataRenderingModeChangedDXR and
+//! XrEventDataRenderingModeTableChangedDXR (a mode's view count, layout or
+//! tracking can change with the table).
 static void EnumerateRenderingModes(AppXrSession& xr) {
     if (xr.pfnEnumerateDisplayRenderingModes == nullptr || xr.session == XR_NULL_HANDLE) {
         return;
@@ -2841,6 +2856,14 @@ static void EnumerateRenderingModes(AppXrSession& xr) {
         return;
     }
     std::vector<XrDisplayRenderingModeInfoDXR> modes(count, {XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR});
+    // Per-mode tracking (v14): chain the struct on every element before the fill.
+    std::vector<XrDisplayRenderingModeTrackingInfoDXR> tracking(count);
+    for (uint32_t i = 0; i < count; i++) {
+        tracking[i] = {};
+        tracking[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_DXR;
+        tracking[i].hasTracking = XR_TRUE;
+        modes[i].next = &tracking[i];
+    }
     if (XR_FAILED(xr.pfnEnumerateDisplayRenderingModes(xr.session, count, &count, modes.data()))) {
         return;
     }
@@ -2849,14 +2872,15 @@ static void EnumerateRenderingModes(AppXrSession& xr) {
     for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
         xr.modes[i] = modes[i];
         xr.modes[i].next = nullptr;
+        xr.modeHasTracking[i] = tracking[i].hasTracking == XR_TRUE;
         if (modes[i].isActive) {
             xr.currentModeIndex = modes[i].modeIndex;
             xr.haveCurrentMode = true;
         }
-        LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%s%s%s)", modes[i].modeIndex,
+        LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%s, tracked=%s%s%s)", modes[i].modeIndex,
                  modes[i].modeName, modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows,
                  modes[i].viewScaleX, modes[i].viewScaleY, modes[i].hardwareDisplay3D ? "yes" : "no",
-                 modes[i].isActive ? ", active" : "", modes[i].isRequestable ? "" : ", locked by workspace");
+                 xr.modeHasTracking[i] ? "yes" : "no", modes[i].isActive ? ", active" : "", modes[i].isRequestable ? "" : ", locked by workspace");
     }
 }
 
@@ -2871,6 +2895,12 @@ static const XrDisplayRenderingModeInfoDXR* ActiveRenderingMode(const AppXrSessi
         }
     }
     return nullptr;
+}
+
+//! Does the active mode consume viewer tracking? True while unknown.
+static bool ActiveModeHasTracking(const AppXrSession& xr) {
+    const XrDisplayRenderingModeInfoDXR* am = ActiveRenderingMode(xr);
+    return am == nullptr || xr.modeHasTracking[am - xr.modes];
 }
 
 /*!
@@ -3152,11 +3182,23 @@ static bool PollEvents(AppXrSession& xr) {
             break;
         case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
             auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
+            // Re-read the table first (it can change with the mode); the
+            // event's index stays authoritative.
+            EnumerateRenderingModes(xr);
             xr.currentModeIndex = modeEvent->currentModeIndex;
             xr.haveCurrentMode = true;
             const XrDisplayRenderingModeInfoDXR* m = ActiveRenderingMode(xr);
             LOG_INFO("Rendering mode changed: %u -> %u (%s)", modeEvent->previousModeIndex,
                      modeEvent->currentModeIndex, m ? m->modeName : "?");
+            break;
+        }
+        case XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR: {
+            // v27: the table changed under an unchanged active index.
+            auto* te = (XrEventDataRenderingModeTableChangedDXR*)&event;
+            EnumerateRenderingModes(xr);
+            xr.currentModeIndex = te->activeModeIndex;
+            xr.haveCurrentMode = true;
+            LOG_INFO("Rendering mode table changed (active %u)", te->activeModeIndex);
             break;
         }
         case XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
@@ -3786,6 +3828,8 @@ int main(int argc, char** argv) {
                         {
                             const XrDisplayRenderingModeInfoDXR* am = ActiveRenderingMode(xr);
                             g_lossDirector.SetMode3D(am == nullptr || am->hardwareDisplay3D);
+                            // No tracking in this mode = no face to lose ("No tracking").
+                            g_lossDirector.SetModeTracking(ActiveModeHasTracking(xr));
                         }
                         const int lens = g_lossDirector.Update(deltaTime, manual);
                         if (lens >= 0 && xr.pfnRequestDisplayMode != nullptr) {

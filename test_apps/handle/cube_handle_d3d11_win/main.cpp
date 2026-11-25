@@ -26,6 +26,7 @@
 #include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
 #include "text_overlay.h"
 #include "tracking_loss_director.h" // MANUAL eye-tracking demo (T + L)
+#include "dxr_mode_tracking.h" // does the ACTIVE rendering mode track the viewer?
 #include "xr_session.h"
 #include "dxr_stylus.h" // --stylus: the shared OpenXR half (test_apps/common)
 #include <d3d11_1.h>
@@ -618,6 +619,7 @@ static bool g_hwToggleRequested = false;
 // MANUAL eye-tracking demo (tracking_loss_director.h): L cycles the app's
 // tracker-loss preset (converge / lens-2D / off); P is parallax here.
 static dxr_demo::TrackingLossDirector g_lossDirector;
+static dxr_demo::ModeTrackingWatch g_modeTracking; // the active mode's hasTracking
 static bool g_lossPresetCycleRequested = false;
 
 // The status bar's text label (TrackingLossDirector::BarLabel), drawn just
@@ -1722,6 +1724,10 @@ static void RenderOneFrame(RenderState& rs) {
     // MANUAL eye-tracking demo: the app's own tracker-loss transition (the
     // display does nothing in MANUAL). Its depth factor multiplies the rig's
     // ipdFactor below; LENS_2D also asks for the lens.
+    // A mode that advertises no viewer tracking has no face to lose: the bar
+    // says "No tracking" (decided from the runtime's per-mode hasTracking).
+    g_lossDirector.SetModeTracking(g_modeTracking.Update(xr.pfnEnumerateDisplayRenderingModesEXT, xr.session,
+                                                         xr.currentModeIndex, rs.perfStats->deltaTime));
     g_lossDirector.SetMode3D(xr.renderingModeCount == 0 || xr.renderingModeDisplay3D[xr.currentModeIndex]);
     dxr_demo::TrackingLossStep(
         g_lossDirector, rs.perfStats->deltaTime,
