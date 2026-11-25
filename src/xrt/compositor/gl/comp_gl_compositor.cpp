@@ -2830,6 +2830,7 @@ xrt_format_to_gl_internal(int64_t fmt)
 	case 0x81A6: return GL_DEPTH_COMPONENT24;
 	case 0x8CAC: return GL_DEPTH_COMPONENT32F;
 	case 0x88F0: return GL_DEPTH24_STENCIL8;
+	case 0x8CAD: return GL_DEPTH32F_STENCIL8;
 	default:     return GL_RGBA8;
 	}
 }
@@ -2845,6 +2846,10 @@ gl_alloc_pixel_format(GLenum internal_format, GLenum *out_format, GLenum *out_ty
 	case GL_DEPTH_COMPONENT24: *out_format = GL_DEPTH_COMPONENT; *out_type = GL_UNSIGNED_INT; break;
 	case GL_DEPTH_COMPONENT32F: *out_format = GL_DEPTH_COMPONENT; *out_type = GL_FLOAT; break;
 	case GL_DEPTH24_STENCIL8: *out_format = GL_DEPTH_STENCIL; *out_type = GL_UNSIGNED_INT_24_8; break;
+	case GL_DEPTH32F_STENCIL8:
+		*out_format = GL_DEPTH_STENCIL;
+		*out_type = GL_FLOAT_32_UNSIGNED_INT_24_8_REV;
+		break;
 	default: *out_format = GL_RGBA; *out_type = GL_UNSIGNED_BYTE; break;
 	}
 }
@@ -3186,9 +3191,15 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 	 * decodes, so that app's content lands a stop dark and looks exactly like
 	 * a runtime bug. This line is the discriminator, with no rebuild.
 	 */
+	GLenum log_pix_format = GL_RGBA;
+	GLenum log_pix_type = GL_UNSIGNED_BYTE;
+	gl_alloc_pixel_format(internal_format, &log_pix_format, &log_pix_type);
+	const bool log_is_depth = log_pix_format == GL_DEPTH_COMPONENT || log_pix_format == GL_DEPTH_STENCIL;
 	U_LOG_W("Created GL swapchain: %ux%u, %u images, format 0x%x — %s",
 	         info->width, info->height, image_count, (unsigned)info->format,
-	         internal_format == GL_SRGB8_ALPHA8
+	         log_is_depth
+	             ? "depth: allocated for the app, not composed (no XR_KHR_composition_layer_depth)"
+	         : internal_format == GL_SRGB8_ALPHA8
 	             ? "sRGB: the runtime reads these bytes as ENCODED and decodes them on sample. An app "
 	               "RENDERING into this swapchain must glEnable(GL_FRAMEBUFFER_SRGB) (GL does not encode "
 	               "otherwise) or it stores scene-linear values the runtime will read as display-referred"
@@ -9593,7 +9604,7 @@ gl_compositor_set_formats(struct comp_gl_compositor *c)
 	// GL format enum values. Depth formats are advertised so apps that require
 	// a depth swapchain (Godot's OpenXR module fails to initialise without one)
 	// can create it; depth is not composed (no XR_KHR_composition_layer_depth).
-	c->base.base.info.format_count = 8;
+	c->base.base.info.format_count = 9;
 	c->base.base.info.formats[0] = 0x8058; // GL_RGBA8
 	c->base.base.info.formats[1] = 0x8C43; // GL_SRGB8_ALPHA8
 	c->base.base.info.formats[2] = 0x881A; // GL_RGBA16F
@@ -9602,6 +9613,7 @@ gl_compositor_set_formats(struct comp_gl_compositor *c)
 	c->base.base.info.formats[5] = 0x88F0; // GL_DEPTH24_STENCIL8
 	c->base.base.info.formats[6] = 0x81A6; // GL_DEPTH_COMPONENT24
 	c->base.base.info.formats[7] = 0x81A5; // GL_DEPTH_COMPONENT16
+	c->base.base.info.formats[8] = 0x8CAD; // GL_DEPTH32F_STENCIL8 (#2447)
 }
 
 
