@@ -300,6 +300,24 @@ u_file_read_content(FILE *file, size_t *out_file_size)
 	return buffer;
 }
 
+FILE *
+u_file_open_utf8_or_ansi(const char *path, const char *mode)
+{
+	if (path == NULL || mode == NULL) {
+		return NULL;
+	}
+#ifdef XRT_OS_WINDOWS
+	wchar_t wpath[1024];
+	wchar_t wmode[16];
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, (int)(sizeof(wpath) / sizeof(*wpath))) !=
+	        0 &&
+	    MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode, (int)(sizeof(wmode) / sizeof(*wmode))) != 0) {
+		return _wfopen(wpath, wmode);
+	}
+#endif
+	return fopen(path, mode);
+}
+
 char *
 u_file_read_content_from_path(const char *path, size_t *out_file_size)
 {

@@ -32,6 +32,7 @@
 // #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
 #include "util/u_color_encoding.h"
 #include "util/u_logging.h"
+#include "util/u_file.h"
 #include "util/u_window_visibility.h"
 #include "util/u_window_visibility_report.h"
 #include "util/u_setting.h"
@@ -41453,7 +41454,7 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
 	if (ok && mc != nullptr) {
 		char path[MCP_CAPTURE_PATH_MAX + 32];
 		snprintf(path, sizeof(path), "%s_windows.json", base);
-		FILE *jf = fopen(path, "wb");
+		FILE *jf = u_file_open_utf8_or_ansi(path, "wb"); // #2695: base is the caller's path
 		if (jf != nullptr) {
 			fprintf(jf, "{\n  \"atlas_width\": %u,\n  \"atlas_height\": %u,\n  \"windows\": [",
 			        cr.atlas_width, cr.atlas_height);
@@ -41481,7 +41482,7 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
 	{
 		char sentinel[MCP_CAPTURE_PATH_MAX + 32];
 		snprintf(sentinel, sizeof(sentinel), "%s_DONE.txt", base);
-		FILE *f = fopen(sentinel, "w");
+		FILE *f = u_file_open_utf8_or_ansi(sentinel, "w");
 		if (f) {
 			fprintf(f, "ok=%d\n", ok);
 			fclose(f);
