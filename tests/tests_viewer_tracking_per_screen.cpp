@@ -227,9 +227,10 @@ TEST_CASE("per-screen setting: 3d / always / off per screen, live, over the scri
 	CHECK(a.d.effective_setting == TARGET_VIEWER_SETTING_OFF);
 }
 
-//! A head device with a 2D entry (index 0) and one untracked 3D entry (index 1, slot 1).
+//! A head device with a 2D entry (index 0) and one untracked 3D entry (index 1, slot 1);
+//! @p passthrough makes slot 1 "Same as 2D" (one full-resolution view, 2D lens).
 static xrt_device *
-make_head()
+make_head(bool passthrough = false)
 {
 	xrt_device *head = new xrt_device();
 	head->rendering_mode_count = 2;
@@ -248,6 +249,16 @@ make_head()
 		m.atlas_width_pixels = 1920;
 		m.atlas_height_pixels = 1080;
 		m.mode_flags = 0;
+	}
+	if (passthrough) {
+		xrt_rendering_mode &m = head->rendering_modes[1];
+		std::snprintf(m.mode_name, sizeof(m.mode_name), "%s", "Same as 2D");
+		m.view_count = 1;
+		m.hardware_display_3d = false;
+		m.tile_columns = 1;
+		m.view_scale_x = 1.0f;
+		m.view_width_pixels = 1920;
+		m.mode_flags = XRT_RENDERING_MODE_FLAG_3D_PASSTHROUGH;
 	}
 	return head;
 }
@@ -292,6 +303,36 @@ TEST_CASE("per-screen setting: the first mode-table publish already carries each
 	CHECK(entry_tracked(0xA1, 1));
 	// Nothing moved since: no re-publish.
 	CHECK_FALSE(target_screen_modes_viewer_settings_changed(rig.list, rig.reg, head));
+
+	u_screen_modes_publish(nullptr, 0);
+	delete head;
+}
+
+TEST_CASE("per-screen setting: 'Same as 2D' counts as 2D for viewer tracking (decided 2026-11-24)",
+          "[viewer_tracking_per_screen][script]")
+{
+	// The rule (ADR-066 decision note 2026-11-24): unless the user turns on a 3D
+	// feature, the screen looks the same as 2D. The passthrough 3D entry is one
+	// full-resolution view at scale 1x1, like mode 0, so a screen set to "3d"
+	// does not track in it (camera closed); only "always" tracks there.
+	set_env("TST-A=3d;TST-B=always;TST-C=always");
+	Rig rig(false);
+	xrt_device *head = make_head(true);
+	target_screen_modes_publish_with_viewers(rig.list, rig.reg, head, true, false);
+
+	// A (3d): slot 1 is "Same as 2D" -> not tracked; nor is mode 0.
+	CHECK_FALSE(entry_tracked(0xA1, 1));
+	CHECK_FALSE(entry_tracked(0xA1, 0));
+	// What a session in that slot asks the viewer tracker: the passthrough
+	// entry keeps the lens in 2D, so the session's viewer mode is the 2D slot
+	// (oxr_session / ipc_server_handler: hardware_display_3d), which a "3d"
+	// screen never routes to the provider - the camera stays closed.
+	CHECK_FALSE(head->rendering_modes[1].hardware_display_3d);
+	CHECK(source(0xA1, XRT_VIEWER_MODE_2D) == XRT_VIEWER_SOURCE_NOMINAL);
+	// B (always): tracked in "Same as 2D" too, and the provider drives it.
+	CHECK(entry_tracked(0xB2, 1));
+	CHECK(entry_tracked(0xB2, 0));
+	CHECK(source(0xB2, XRT_VIEWER_MODE_2D) == XRT_VIEWER_SOURCE_PROVIDER);
 
 	u_screen_modes_publish(nullptr, 0);
 	delete head;

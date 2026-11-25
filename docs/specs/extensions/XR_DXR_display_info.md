@@ -1575,6 +1575,13 @@ the swapchain is still large enough and the app must not reallocate it.
 sharp full-resolution view. Apps decide "am I in 3D?" from the index, not from `viewCount` or
 `hardwareDisplay3D`.
 
+For viewer tracking a passthrough entry is **2D** (decided 2026-11-24): unless the user turns on a
+3D feature, the screen looks the same as 2D. It is one full-resolution view at scale 1x1, like
+slot 0, so it is untracked by default: the entry's tracked flag
+(`XRT_RENDERING_MODE_FLAG_HAS_TRACKING`) is clear, and no viewer is requested on a screen whose
+viewer-tracking setting is `3d`. Only a screen set to `always` tracks in it
+(`tracking-provider-discovery.md` §4c).
+
 **The located view count** of `PRIMARY_MULTIVIEW_DXR` is the maximum over the declared list (full
 view sets only: `floor(8 / max)` sets, at least one, at most the view-set capacity), fixed for the
 instance. A 3D-mode switch changes `XrViewActivityStateDXR.activeViewCount`, never the located

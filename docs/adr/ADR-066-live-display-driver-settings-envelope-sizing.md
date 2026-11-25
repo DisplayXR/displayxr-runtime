@@ -161,6 +161,18 @@ B5. **CLI, status and Dashboard: the contract agreed with the Dashboard owner.**
 - **Migration.** Today `sim-tracking ENABLE=1` means "serve every `EXTERNAL_OK` screen". Its reading
   becomes "always, for every screen with no per-screen value", so existing setups keep working.
 
+**Decision note (2026-11-24, project lead): "Same as 2D" is 2D for viewer tracking.** The
+principle: unless the user turns on some 3D feature, the appearance on screen is the same as 2D.
+Mode 0 ("2D") is scale 1x1 with no tracking, and the passthrough 3D entry in slot 1 (C1.2,
+sim-display's default "Same as 2D") is the same: one full-resolution view, scale 1x1, untracked
+by default. So the `3d` setting does not track while slot 1 is Same as 2D (no viewer is
+requested and the camera stays closed); tracking there happens only when the user chose `always`
+for that screen. Rejected: counting slot 1 as 3D whatever its content, which would open the
+camera and add look-around parallax to a screen that otherwise looks exactly like 2D. `always`
+is the setting for that. Kept as built (the tracked flag and the viewer mode both follow the
+entry's content: `target_screen_modes.c` `apply_tracked_modes`, the session's viewer mode from
+`hardware_display_3d`); pinned by `tests_viewer_tracking_per_screen`.
+
 ## Part C — stage B via the declared mode list
 
 ### C1. The declared list is the envelope (recommended design)

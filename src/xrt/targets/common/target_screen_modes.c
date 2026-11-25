@@ -201,6 +201,11 @@ list_source_str(uint32_t s)
  * an explicit `always` - the rule compose_mode_flags applies to the head
  * device. Where none does, the display's own per-entry flags stand (its DP's
  * tracker, sim-display's fake / webcam source).
+ *
+ * A passthrough 3D entry ("Same as 2D", XRT_RENDERING_MODE_FLAG_3D_PASSTHROUGH:
+ * one full-resolution view, 2D lens) counts as 2D here, deliberately (decided
+ * 2026-11-24, ADR-066): it looks the same as mode 0, so it tracks only under
+ * an explicit `always`, like mode 0.
  */
 static void
 apply_tracked_modes(struct u_screen_mode_table *tables, uint32_t n)
