@@ -93,9 +93,13 @@ jobs:
           # displayxr-browser: the Pages repo written to.
           # displayxr-browser-pvt: read-only use — the browser installer's declared
           # MIN_RUNTIME_VERSION (requires.runtime) lives in the private source repo.
+          # displayxr-shell-pvt: read-only use — the Shell installer's declared
+          # runtime floor (schema 2). Without it the read is a 404 and the Shell
+          # item is not listed.
           repositories: |
             displayxr-browser
             displayxr-browser-pvt
+            displayxr-shell-pvt
 
       - name: Checkout main
         uses: actions/checkout@v5
