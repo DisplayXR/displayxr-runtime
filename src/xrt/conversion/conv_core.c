@@ -210,6 +210,26 @@ declared_absent(const struct xrt_conv_state *st)
 	return st->retryable == 0 && (st->state == XRT_CONV_STATE_ABSENT || st->state == XRT_CONV_STATE_DISABLED);
 }
 
+/*! The provider reports the capability unusable for a reason a warm found:
+ *  FAILED, UNLICENSED or INCOMPATIBLE. A provider reports these only after it
+ *  tried (a cold one reports INSTALLED), so a cold row may follow them. */
+static bool
+provider_failed(const struct xrt_conv_state *st)
+{
+	return st->state == XRT_CONV_STATE_FAILED || st->state == XRT_CONV_STATE_UNLICENSED ||
+	       st->state == XRT_CONV_STATE_INCOMPATIBLE;
+}
+
+//! The reason a provider_failed() state is recorded with: its own, else the state's.
+static uint32_t
+provider_failed_reason(const struct xrt_conv_state *st)
+{
+	if (st->failure_reason != 0) {
+		return st->failure_reason;
+	}
+	return st->state == XRT_CONV_STATE_UNLICENSED ? XRT_CONV_FAIL_LICENCE : XRT_CONV_FAIL_LOAD;
+}
+
 //! ABSENT(policy) for a provider-side DISABLED (a kill switch), else the provider's reason (model).
 static uint32_t
 declared_reason(const struct xrt_conv_state *st)
@@ -707,6 +727,16 @@ sync_states_locked(struct conv_core *core, uint32_t provider)
 			// Terminal already (no timer); a re-describe that finds it lifts it.
 			struct conv_readiness_event ev = mk_ev(CONV_EV_DESCRIBE_FAILED, t);
 			ev.reason = st.failure_reason != 0 ? st.failure_reason : XRT_CONV_FAIL_MODEL;
+			apply_locked(core, i, &ev);
+		} else if (provider_failed(&st) &&
+		           (row->rd.state == XRT_CONV_STATE_INSTALLED || row->rd.state == XRT_CONV_STATE_EVICTED ||
+		            row->rd.state == XRT_CONV_STATE_READY)) {
+			// leia-conversion#11: the provider's module failed (licence refused,
+			// load failed) during a warm of a sibling capability; this row was
+			// never warmed, so nothing else would tell selection.
+			struct conv_readiness_event ev = mk_ev(CONV_EV_RUNTIME_FAILED, t);
+			ev.reason = provider_failed_reason(&st);
+			ev.retryable = st.retryable != 0;
 			apply_locked(core, i, &ev);
 		}
 	}
@@ -1628,7 +1658,11 @@ poll_providers_locked(struct conv_core *core, uint64_t t)
 			continue;
 		}
 		const uint32_t s = row->rd.state;
-		if (s != XRT_CONV_STATE_WARMING && s != XRT_CONV_STATE_DOWNLOADING && s != XRT_CONV_STATE_READY) {
+		// Cold rows too (leia-conversion#11): a provider failing a sibling's warm
+		// fails this row with it, and get_state is a [C] slot (a cached answer
+		// for a satellite host), so polling it costs nothing.
+		if (s != XRT_CONV_STATE_WARMING && s != XRT_CONV_STATE_DOWNLOADING && s != XRT_CONV_STATE_READY &&
+		    s != XRT_CONV_STATE_INSTALLED && s != XRT_CONV_STATE_EVICTED) {
 			continue;
 		}
 		struct xrt_conv_state st;
@@ -1648,6 +1682,14 @@ poll_providers_locked(struct conv_core *core, uint64_t t)
 			} else if (st.state == XRT_CONV_STATE_ABSENT && st.failure_reason == XRT_CONV_FAIL_POLICY) {
 				struct conv_readiness_event ev = mk_ev(CONV_EV_MODEL_ABSENT, t);
 				ev.reason = CONV_REASON_POLICY;
+				apply_locked(core, i, &ev);
+			} else if (provider_failed(&st)) {
+				// The warm's own completion normally reports this; a WARMING row
+				// whose warm is queued behind another (or lost) must not wait on
+				// a provider that already gave up.
+				struct conv_readiness_event ev = mk_ev(CONV_EV_RUNTIME_FAILED, t);
+				ev.reason = provider_failed_reason(&st);
+				ev.retryable = st.retryable != 0;
 				apply_locked(core, i, &ev);
 			} else if (st.progress >= 0.0f && st.progress != row->rd.progress) {
 				struct conv_readiness_event ev = mk_ev(CONV_EV_WARM_PROGRESS, t);
@@ -1675,9 +1717,12 @@ poll_providers_locked(struct conv_core *core, uint64_t t)
 				ev.progress = st.progress;
 				apply_locked(core, i, &ev);
 			}
-		} else if (st.state == XRT_CONV_STATE_FAILED) {
+		} else if (provider_failed(&st) &&
+		           !(s != XRT_CONV_STATE_READY && row->provider < CONV_REGISTRY_MAX_PROVIDERS &&
+		             core->retrying[row->provider])) {
+			// READY or cold: the provider says it can no longer serve this row.
 			struct conv_readiness_event ev = mk_ev(CONV_EV_RUNTIME_FAILED, t);
-			ev.reason = st.failure_reason;
+			ev.reason = provider_failed_reason(&st);
 			ev.retryable = st.retryable != 0;
 			apply_locked(core, i, &ev);
 		}
