@@ -44,6 +44,19 @@ int
 u_file_get_path_in_runtime_dir(const char *suffix, char *out_path, size_t out_path_size);
 
 /*!
+ * fopen() for a path that may be UTF-8 or the Windows ANSI code page (#2695).
+ *
+ * On Windows a path that is valid UTF-8 is opened as UTF-8 (`_wfopen`), so a
+ * non-ASCII path an app passes through OpenXR (UTF-8 by spec) works; anything
+ * else goes to the narrow fopen as before, so a path built from the CRT's
+ * narrow getenv("TEMP") keeps working on a non-ASCII user profile. An ASCII
+ * path is the same either way. Elsewhere it is plain fopen. The PNG writer
+ * (src/external/stb/stb_image_write.h) applies the same rule.
+ */
+FILE *
+u_file_open_utf8_or_ansi(const char *path, const char *mode);
+
+/*!
  * Copy a filesystem path into a unix socket address's `sun_path` (pass
  * `sizeof(addr.sun_path)`, 108 bytes on Linux). Returns false — writing an
  * empty string — when the path plus its terminator does not fit; a socket
