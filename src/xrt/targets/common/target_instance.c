@@ -819,21 +819,27 @@ publish_screens_locked(const struct xrt_system_compositor_info *info, bool initi
 	target_screens_system_from_info(info, &sys);
 	target_screens_build(&info->dp_registry, info->active_plugin_id, &sys, now);
 
-	// ADR-047 Amendment 10: every screen's own mode table, re-read on every
-	// publish (a hotplugged screen brings its list; a re-claim swaps it).
-	target_screen_modes_publish(now, &info->dp_registry, g_display_info_head, initial);
-
 	bool changed = false;
+	struct target_screens_change c;
+	if (!initial) {
+		changed = target_screens_compare(&g_published_screens, now, &c);
+	}
+	// ADR-054 N6 Part 2: the per-screen viewer sources of the new table (the
+	// as-created one, or a new topology: a hotplugged EXTERNAL_OK screen takes
+	// the provider, a tracking one keeps its own; the primary stays as
+	// created), THEN (ADR-047 Amendment 10) every screen's own mode table,
+	// re-read on every publish (a hotplugged screen brings its list; a
+	// re-claim swaps it), whose per-entry tracked flags read those decisions.
+	// Both before the generation moves, so a session that re-tables on the new
+	// generation reads the new tables.
+	target_screen_modes_publish_with_viewers(now, &info->dp_registry, g_display_info_head, initial, changed);
+
 	if (initial) {
 		g_published_screens = *now;
 		pthread_mutex_lock(&g_generation_lock);
 		g_display_generation = 1;
 		pthread_mutex_unlock(&g_generation_lock);
-		// ADR-054 N6 Part 2: the per-screen viewer sources of the as-created table.
-		target_viewer_tracking_update_screens(now, &info->dp_registry);
 	} else {
-		struct target_screens_change c;
-		changed = target_screens_compare(&g_published_screens, now, &c);
 		if (changed) {
 			char line[1024];
 			target_screens_change_format(&g_published_screens, now, line, sizeof(line));
@@ -879,10 +885,6 @@ publish_screens_locked(const struct xrt_system_compositor_info *info, bool initi
 				}
 				free(tbl);
 			}
-			// ADR-054 N6 Part 2: a new topology re-routes the viewer source
-			// per screen (a hotplugged EXTERNAL_OK screen takes the provider,
-			// a tracking one keeps its own; the primary stays as created).
-			target_viewer_tracking_update_screens(now, &info->dp_registry);
 		} else if (c.metadata_changed != 0) {
 			// Only an EDID physical size was refined (macOS: IOKit publishes
 			// the EDID blob ~0.5-1 s after CoreGraphics lists the monitor).
@@ -969,7 +971,9 @@ viewer_settings_recheck_locked(const struct xrt_system_compositor_info *info)
 	if (info == NULL || info != g_hotplug_info) {
 		return;
 	}
-	(void)target_viewer_tracking_settings_changed(&g_published_screens, &info->dp_registry);
+	// The mode tables' per-entry tracked flags follow the new decisions.
+	(void)target_screen_modes_viewer_settings_changed(&g_published_screens, &info->dp_registry,
+	                                                  g_display_info_head);
 }
 
 /*!

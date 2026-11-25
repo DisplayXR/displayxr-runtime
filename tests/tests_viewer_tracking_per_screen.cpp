@@ -18,6 +18,7 @@
 
 #include "catch_amalgamated.hpp"
 
+#include "target_screen_modes.h"
 #include "target_viewer_tracking.h"
 
 #include "xrt/xrt_compositor.h"
@@ -26,6 +27,7 @@
 #include "xrt/xrt_viewer_tracking.h"
 
 #include "os/os_time.h"
+#include "util/u_screen_modes.h"
 #include "util/u_setting.h"
 
 #include <chrono>
@@ -96,7 +98,8 @@ struct Rig
 	xrt_dp_factory_registry *reg = new xrt_dp_factory_registry();
 	xrt_system_compositor_info *info = new xrt_system_compositor_info();
 
-	Rig()
+	//! @p first_publish false: only the apply, the caller runs the first publish.
+	explicit Rig(bool first_publish = true)
 	{
 		add_screen(*list, *reg, 0xA1, "TST-A", 0, true, false);
 		add_screen(*list, *reg, 0xB2, "TST-B", 1920, false, false);
@@ -108,8 +111,10 @@ struct Rig
 		pdi.display_height_m = 0.225f;
 		pdi.nominal_viewer_z_m = 0.6f;
 		target_viewer_tracking_apply(info, nullptr, &g_iface, &pdi);
-		target_viewer_tracking_update_screens(list, reg);
-		target_viewer_tracking_recompose(info, nullptr);
+		if (first_publish) {
+			target_viewer_tracking_update_screens(list, reg);
+			target_viewer_tracking_recompose(info, nullptr);
+		}
 	}
 	~Rig()
 	{
@@ -220,6 +225,76 @@ TEST_CASE("per-screen setting: 3d / always / off per screen, live, over the scri
 	target_viewer_screen_decision a = rig.decision(0xA1);
 	CHECK(a.d.setting == TARGET_VIEWER_SETTING_DEFAULT);
 	CHECK(a.d.effective_setting == TARGET_VIEWER_SETTING_OFF);
+}
+
+//! A head device with a 2D entry (index 0) and one untracked 3D entry (index 1, slot 1).
+static xrt_device *
+make_head()
+{
+	xrt_device *head = new xrt_device();
+	head->rendering_mode_count = 2;
+	for (uint32_t i = 0; i < 2; i++) {
+		xrt_rendering_mode &m = head->rendering_modes[i];
+		m.mode_index = i;
+		std::snprintf(m.mode_name, sizeof(m.mode_name), "%s", i == 0 ? "2D" : "3D");
+		m.view_count = i == 0 ? 1 : 2;
+		m.hardware_display_3d = i != 0;
+		m.tile_columns = i == 0 ? 1 : 2;
+		m.tile_rows = 1;
+		m.view_scale_x = i == 0 ? 1.0f : 0.5f;
+		m.view_scale_y = 1.0f;
+		m.view_width_pixels = i == 0 ? 1920 : 960;
+		m.view_height_pixels = 1080;
+		m.atlas_width_pixels = 1920;
+		m.atlas_height_pixels = 1080;
+		m.mode_flags = 0;
+	}
+	return head;
+}
+
+static bool
+entry_tracked(uint64_t screen_id, uint32_t entry)
+{
+	u_screen_mode_table *t = new u_screen_mode_table();
+	const bool have = u_screen_modes_get(screen_id, t);
+	REQUIRE(have);
+	REQUIRE(entry < t->count);
+	const bool tracked = (t->modes[entry].mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) != 0;
+	delete t;
+	return tracked;
+}
+
+TEST_CASE("per-screen setting: the first mode-table publish already carries each screen's tracked flags",
+          "[viewer_tracking_per_screen][script]")
+{
+	// The mode tables' per-entry tracked flags read the per-screen viewer
+	// decisions: system creation publishes both in one step, decisions first, so
+	// the first table is right (it used to wait for the next re-probe).
+	set_env("TST-A=3d;TST-B=always;TST-C=always");
+	Rig rig(false);
+	xrt_device *head = make_head();
+	target_screen_modes_publish_with_viewers(rig.list, rig.reg, head, true, false);
+
+	// A (3d): the 3D entry is tracked, the 2D one is not.
+	CHECK(entry_tracked(0xA1, 1));
+	CHECK_FALSE(entry_tracked(0xA1, 0));
+	// B (always, not the primary — the screen a stale table got wrong): both.
+	CHECK(entry_tracked(0xB2, 1));
+	CHECK(entry_tracked(0xB2, 0));
+	// C tracks the viewer itself: its own (head-copied, untracked) flags stand.
+	CHECK_FALSE(entry_tracked(0xC3, 1));
+
+	// Live: B goes off. The re-check re-publishes the tables with the new flags.
+	set_env("TST-A=3d;TST-B=off;TST-C=always");
+	CHECK(target_screen_modes_viewer_settings_changed(rig.list, rig.reg, head));
+	CHECK_FALSE(entry_tracked(0xB2, 1));
+	CHECK_FALSE(entry_tracked(0xB2, 0));
+	CHECK(entry_tracked(0xA1, 1));
+	// Nothing moved since: no re-publish.
+	CHECK_FALSE(target_screen_modes_viewer_settings_changed(rig.list, rig.reg, head));
+
+	u_screen_modes_publish(nullptr, 0);
+	delete head;
 }
 
 TEST_CASE("per-screen setting: no per-screen value and no opt-in advertises nothing",

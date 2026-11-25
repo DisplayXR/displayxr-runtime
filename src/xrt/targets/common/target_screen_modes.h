@@ -75,6 +75,33 @@ target_screen_modes_publish(const struct xrt_screen_list *list,
                             bool initial);
 
 /*!
+ * ADR-066 Part B x ADR-047 Amendment 10: publish @p list's per-screen
+ * viewer-tracking decisions (target_viewer_tracking_update_screens; only with
+ * @p initial or @p topology_changed, as the screen table only moves then) and
+ * THEN its mode tables (target_screen_modes_publish), whose per-entry tracked
+ * flags read those decisions. The other order publishes the previous
+ * topology's flags (at start-up: none) until the next re-probe.
+ */
+void
+target_screen_modes_publish_with_viewers(const struct xrt_screen_list *list,
+                                         const struct xrt_dp_factory_registry *reg,
+                                         struct xrt_device *head,
+                                         bool initial,
+                                         bool topology_changed);
+
+/*!
+ * A per-screen viewer-tracking setting may have moved: re-run the per-screen
+ * arbitration (target_viewer_tracking_settings_changed) and, when any screen's
+ * decision changed, re-publish the mode tables so their tracked flags follow.
+ *
+ * @return true when the decisions (and so the tables) were re-published.
+ */
+bool
+target_screen_modes_viewer_settings_changed(const struct xrt_screen_list *list,
+                                            const struct xrt_dp_factory_registry *reg,
+                                            struct xrt_device *head);
+
+/*!
  * The resolver the registry calls for a screen's stored choice (the per-screen
  * 3D-mode store, `u_setting_get_mode_3d_for_screen`).
  */

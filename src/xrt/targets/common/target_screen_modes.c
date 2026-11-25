@@ -273,6 +273,34 @@ target_screen_modes_publish(const struct xrt_screen_list *list,
 }
 
 void
+target_screen_modes_publish_with_viewers(const struct xrt_screen_list *list,
+                                         const struct xrt_dp_factory_registry *reg,
+                                         struct xrt_device *head,
+                                         bool initial,
+                                         bool topology_changed)
+{
+	// The viewer decisions first: apply_tracked_modes reads them, so a table
+	// published before them carries the previous topology's (at start-up:
+	// none) until the next re-probe.
+	if (initial || topology_changed) {
+		target_viewer_tracking_update_screens(list, reg);
+	}
+	target_screen_modes_publish(list, reg, head, initial);
+}
+
+bool
+target_screen_modes_viewer_settings_changed(const struct xrt_screen_list *list,
+                                            const struct xrt_dp_factory_registry *reg,
+                                            struct xrt_device *head)
+{
+	if (!target_viewer_tracking_settings_changed(list, reg)) {
+		return false;
+	}
+	target_screen_modes_publish(list, reg, head, false);
+	return true;
+}
+
+void
 target_screen_modes_fill_status(const struct xrt_screen_list *list,
                                 const struct xrt_dp_factory_registry *reg,
                                 struct xrt_device *head,
