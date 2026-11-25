@@ -1441,9 +1441,10 @@ static void RenderThreadFunc(
                         // of them (the sum is activeViewCount), each set's local
                         // view j into tile j at that display's segment rect (placed
                         // below once the tile size is known). The D3D11 cube's
-                        // logic, unchanged.
+                        // logic, unchanged — a 2D mode routes too (one view
+                        // per display, each framed for its part of the window).
                         const bool routedViews =
-                            !monoMode && xr->viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR &&
+                            xr->viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR &&
                             viewBindings.bindingCountOutput > 0 && viewBindings.bindingCountOutput <= 4;
                         if (routedViews) {
                             int routedEyes = 0;
@@ -1454,6 +1455,8 @@ static void RenderThreadFunc(
                             if (routedEyes > (int)locatedCount) routedEyes = (int)locatedCount;
                             if (routedEyes > 0) eyeCount = routedEyes;
                         }
+                        // 2D with ONE view for the whole window (not routed).
+                        const bool monoOneView = monoMode && !routedViews;
                         {
                             // Log the bindings when they change (one line, never per frame).
                             static std::string lastBindings;
@@ -1636,10 +1639,10 @@ static void RenderThreadFunc(
 
                                 XMMATRIX viewMatrix, projMatrix;
                                 if (useAppProjection) {
-                                    int vi = monoMode ? 0 : eye;
+                                    int vi = monoOneView ? 0 : eye;
                                     viewMatrix = ColumnMajorToXMMatrix(stereoViews[vi].view_matrix);
                                     projMatrix = ColumnMajorToXMMatrix(stereoViews[vi].projection_matrix);
-                                } else if (monoMode) {
+                                } else if (monoOneView) {
                                     viewMatrix = monoViewMatrix;
                                     projMatrix = monoProjMatrix;
                                 } else {
@@ -1670,10 +1673,10 @@ static void RenderThreadFunc(
                                     (int32_t)vpW, (int32_t)vpH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 int rawIdx = (eye < (int)viewCount) ? eye : 0;
-                                projectionViews[eye].pose = monoMode ? monoPose : rawViews[rawIdx].pose;
+                                projectionViews[eye].pose = monoOneView ? monoPose : rawViews[rawIdx].pose;
                                 projectionViews[eye].fov = useAppProjection ?
-                                    stereoViews[monoMode ? 0 : eye].fov :
-                                    (monoMode ? rawViews[0].fov : rawViews[rawIdx].fov);
+                                    stereoViews[monoOneView ? 0 : eye].fov :
+                                    (monoOneView ? rawViews[0].fov : rawViews[rawIdx].fov);
                             }
 
                             // ADR-041: point the inactive tail
