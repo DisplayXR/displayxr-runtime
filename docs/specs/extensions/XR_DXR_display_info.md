@@ -2124,6 +2124,45 @@ if (frameState.shouldRender) {
 }
 ```
 
+### Proposed, not implemented: the mode table can change under a running session
+
+> **Status: proposed, not implemented.** Design:
+> [ADR-047 Amendment 10](../../adr/ADR-047-multi-screen-segments-and-per-screen-views.md#amendment-10-2026-11-23-the-view-size-follows-the-windows-screen)
+> and [ADR-066](../../adr/ADR-066-live-display-driver-settings-envelope-sizing.md). Nothing below
+> is in the current header (`SPEC_VERSION` 26). Each item takes the next `SPEC_VERSION` when it
+> lands, and the numbers are not reserved.
+
+- **A new event, `XrEventDataRenderingModeTableChangedDXR`** (working name; `session`,
+  `activeModeIndex`, `flags`), meaning "the rendering-mode table this session sees changed:
+  re-read `xrEnumerateDisplayRenderingModesDXR` and retile; the active index is unchanged". The
+  runtime will send it when:
+  - the window moves to a screen whose display renders the app's current mode at a different view
+    size (ADR-047 Amendment 10);
+  - the user switches the screen's 3D mode in the Dashboard or the CLI (ADR-066 C1);
+  - the active slot's tracked flag changes.
+
+  It is queued after the enumerate already answers the new table, at most once per session per
+  second (coalesced to the latest table). It is never the answer to `xrRequestDisplayRenderingModeDXR`:
+  that answer stays `XrEventDataRenderingModeChangedDXR` or a denial. When both events are due at
+  once, the mode-changed event is queued first. `XrEventDataRenderingModeChangedDXR` keeps meaning
+  exactly "the active index changed" and is never sent with an unchanged index.
+
+  An app that ignores the new event keeps its old tile size, and the runtime resamples what it
+  submits.
+- **One flag bit, `XR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR`**, set only when a
+  change falls outside every mode the display drivers declare, for example a display driver installed
+  while the app runs (ADR-066 C2). It is the only case in which an app may call `xrCreateSwapchain`
+  from an event. Without the bit the swapchain is still large enough (INV-4.9). An app that does not
+  answer a set bit keeps its old swapchain, and the runtime resamples into the new mode.
+- **A read-only worst-case statement**: the atlas size and view count over every mode the display
+  drivers of all claimed screens declare. Apps size their swapchain from it instead of from the
+  session screen's pixel size × the two enumerated modes (ADR-066 C1.6). Its placement, chained on
+  the enumerate or on `XrSystemProperties`, is open.
+
+Unchanged: `PRIMARY_MULTIVIEW_DXR`'s view count stays fixed for the instance, and a session submits
+the located count with the inactive tail aliased (v21). A stereo session facing a mode it cannot
+fill is floored to 2D with the existing denial (v20).
+
 ---
 
 ## 6. Interactions and External Dependencies

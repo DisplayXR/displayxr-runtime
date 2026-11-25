@@ -692,3 +692,208 @@ period from their own surface); a window straddling two adapters at two rates be
 "the majority screen's period" — it is not paced per segment; variable-refresh pacing; the workspace
 compose path's presenter set (ADR-052), whose period follows once B gives each presenter its
 screen; the `CLIENT_TEXTURE` and legacy per-client weaves, which keep the primary's period.
+
+## Amendment 10 (2026-11-23): the view size follows the window's screen
+
+**Status: proposed, not implemented.** The project lead approved the direction; it is open for
+cross-box review. Companion to [ADR-066](ADR-066-live-display-driver-settings-envelope-sizing.md),
+which makes display-driver settings apply while apps run. Roadmap: ADR-066 § *Roadmap*, stages 1
+and 3.
+
+Decisions 2 and 3 gave every screen of a window its own DP, eyes and frustum (#2757 does the same
+for an off-panel window on in-process native Wayland). One value still comes from the session DP
+alone: the **view size**. `xrEnumerateDisplayRenderingModesDXR` reports the head device's two modes
+([ADR-065](ADR-065-two-runtime-rendering-modes.md)), so `viewScaleX/Y` is the session screen's,
+whichever screen the window is on, and so is the tile an app renders (window × scale,
+`docs/guides/displayxr-app-rules.md` INV-4.3). Suppose a window moves from a 3D panel, whose 3D mode
+renders two half-resolution views, onto a laptop screen that could show full-resolution views. It
+keeps the panel's half-resolution tiles. The per-screen display info carries one scale pair per
+screen (`xrt_screen_info::recommended_view_scale_x/y`, `xrt/xrt_screen.h:97-98`) but never that
+screen's mode table, and nothing tells an app that its screen changed.
+
+### Principle
+
+**The app owns its 2D/3D state.** Each screen's DP renders the part of the window on its screen in
+the app's current mode. The runtime never switches the app's mode because the window moved. The lens
+already works this way: a screen's lens wish is `session_3d && covered` (#2256,
+`comp_segments_lens_wish`, `docs/specs/runtime/multiview-tiling.md` § *Multi-screen segments*).
+Coverage decides whether a screen shows the window at all, and the app's mode decides how.
+
+The per-DP 1:1 hold is kept. A DP that needs 1:1 pixels (it does not set
+`XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE`; see `xrt_display_processor_vk_tolerates_resample`) goes
+flat on a screen that resamples the window (#1595, #1654). A DP that tolerates resampling draws the
+mode. Both are how a screen renders the app's mode; neither is a mode change.
+
+### Decisions
+
+1. **Swapchain sizing is the worst case over every claimed screen.** ADR-065 decision 4 sizes over
+   the session DP's two modes. This amendment applies the same rule to every screen the registry has
+   claimed at instance creation. The system atlas is the per-dimension maximum of tile count × view
+   scale × screen pixel size, taken over every claimed screen's DP and every mode it declares
+   (ADR-066 C1: the runtime keeps the full declared list and shows apps two slots of it), each mode
+   against its own screen in its current orientation (`u_tiling_compute_system_atlas` over the union
+   of the lists). `maxImageRect*` uses the same union (`oxr_system.c:509-576`; today it is the
+   session screen's `display_pixel_width/height`), and so do the runtime's own worst-case buffers.
+
+   ADR-010 stands as written: size once, never recreate. Each screen's 2D mode is its full pixel
+   size, so the union is at least the per-dimension maximum of the screens' pixel sizes. The cost:
+
+   | screens | union | RGBA8 per image | vs the session screen alone |
+   |---|---|---|---|
+   | ds1-linux: 3D panel 3840 × 2160 + laptop 2880 × 1800 | 3840 × 2160 | 33 MB | ×1.0 |
+   | 4K 3840 × 2160 + super-ultrawide 5120 × 1440 | 5120 × 2160 | 44 MB | ×1.33 |
+   | 4K landscape + 4K portrait (2160 × 3840) | 3840 × 3840 | 59 MB | ×1.78 |
+
+   Apps typically hold three swapchain images, and the runtime's renderer atlases and egress ring
+   follow the same size.
+   - **Zero-copy.** On the Windows vendor path the one shipping zero-copy case is a full-screen 2D
+     submission that exactly fills the swapchain (ADR-030). When another screen makes the union
+     larger than the panel in either dimension, the panel's full-screen 2D frame no longer fills the
+     swapchain, so it takes the crop copy, one blit per frame. `u_tiling_can_zero_copy()` stays the
+     sole gate; nothing is special-cased.
+   - **A plain 2D monitor counts.** A screen whose DP has only full-resolution one-view entries
+     (sim_display's "Same as 2D" on an ordinary monitor) still counts toward the union. Otherwise a
+     window moved there would be resampled up from the smaller size. The cost is the table above. A
+     per-screen opt-out ("do not size for this screen") lets a user trade sharpness on that screen for
+     memory. A window on an opted-out screen is resampled from the union. Its CLI and Dashboard form
+     is an open question; it extends the contract in ADR-066 C1.3.
+   - **Later screens.** A screen claimed **after** instance creation (hotplug, Amendment 8) whose
+     modes fit inside the union joins with no change. One that does not fit, including a screen
+     rotated after instance creation into a larger extent, takes ADR-066's recreation path (C2), and
+     until the app answers, the DP resamples (C3).
+2. **The per-frame view size depends on the screens the window covers.**
+   - A window wholly on one screen uses that screen's DP's view size for the app's current mode:
+     window px × that mode's scale.
+   - A window straddling screens uses the **per-dimension maximum** over the screens it covers. Each
+     segment DP crops its part and resamples it to its own view size. Cropping before the DP stays
+     the law ([ADR-030](ADR-030-crop-before-dp-zero-copy-only-when-swapchain-equals-atlas.md)).
+   - **Axes.** View scales are declared in each panel's own axes, but the maximum is taken in
+     **window** axes. For a screen rotated by 90° or 270°, its `view_scale_x/y` are swapped into
+     window axes before the maximum. The tile grid is the app's atlas layout and is not rotated. A
+     screen's mode without `XRT_RENDERING_MODE_FLAG_CAN_ROTATE`, on a screen whose current orientation
+     differs from the panel's native one, is shown flat on that screen, under the same rule as the
+     1:1 hold. Whether every DP treats a rotated screen this way is to be checked in stage 1b.
+   - **Different DPI.** Window px are the window's own pixels. Where the screens' scales differ
+     (100 % next to 150 %), each segment is cut in that screen's pixel space (the #2791 Wayland
+     defect is this class) and resampled to its own view size.
+
+   This holds for one view set framed from the majority segment (a `PRIMARY_STEREO` session,
+   decision 3, and every displayxr-common demo today, ADR-066 stage 1b) and for per-segment view sets.
+   With per-segment sets every tile is the same size, so the atlas stays a uniform grid. For a
+   **one-set** app, a straddling window is continuous across the seam **in position, not in
+   sharpness**: its part on the screen with the smaller view scale is resampled, so a step in
+   sharpness at the seam is expected. The 2D mode is window px × 1.0 on every display today, so in
+   practice only the 3D mode's scale moves.
+3. **The hysteresis is Amendment 2's.** The covered set that decision 2 reads changes only after the
+   new set has held continuously for 0.5 s (`COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS`, the dwell that
+   the HWND hand-off and the lens dead band already share). Dragging back and forth across a seam
+   faster than that changes nothing. Some answers are majority decisions: for example, which
+   screen's table `xrEnumerateDisplayRenderingModesDXR` describes for a straddling window
+   (decision 4). Those also take the 20 % margin (`comp_segments_owner_*`). On top of that, the
+   signal is coalesced to at most one per second (decision 4).
+4. **The signal is ADR-066's `XrEventDataRenderingModeTableChangedDXR`.** When the effective view
+   size changes because the window changed screens, the runtime does two things, in this order:
+   1. It updates what `xrEnumerateDisplayRenderingModesDXR` reports for this session to describe the
+      window's current screen: `viewScaleX/Y`, `viewWidthPixels/HeightPixels`, `tileColumns/Rows`,
+      `modeName` and `hardwareDisplay3D`. For a straddling window, that is the majority screen with
+      the per-dimension maximum scale.
+   2. It queues the table-changed event, without the recreate bit, coalesced to at most one per
+      session per second.
+
+   This draft first proposed re-issuing `XrEventDataRenderingModeChangedDXR` with an unchanged index.
+   That was rejected after review (ADR-066 C1.6 and § *Alternatives considered*): most consumers
+   store only the index, Unity and the browser would pass a spurious same-mode event to scripts and
+   pages, and an unsolicited mode-changed event could be read as the answer to a pending request.
+
+   The live `recommendedImageRect*` (#1488, `oxr_views_change_*`) moves at the same time, so an app
+   that enabled `XR_EXT_view_configuration_views_change` also gets that event, under the extension's
+   own 1 Hz coalescing (`docs/specs/extensions/XR_EXT_view_configuration_views_change.md` §5).
+   - **displayxr-common needs one `case`.** It already re-reads the table on the mode-changed event
+     (`common/xr_session_common.cpp` ~558, since v2.34.0), and `ModeTable::refresh` counts a
+     `viewScaleX/Y` change at the same index as a change (`common/mode_table.h:62-66`). The new event
+     calls the same refresh. It must also size from ADR-066's worst-case statement: today it sizes
+     from the session screen's `displayPixelWidth/Height` × the enumerated modes
+     (`xr_session_common.cpp:270-300`), which a move to a larger screen would overflow. Both ship in
+     the stage that ships this amendment. ADR-066 C1.6 lists every other consumer and what each needs.
+   - **An app that ignores the event keeps the old size**, and the segment DP resamples what it is
+     given. The picture is softer but never broken.
+5. **The view count stays fixed per instance.** Moving a window never changes the
+   `PRIMARY_MULTIVIEW_DXR` count or the number of views a session locates
+   ([ADR-041](ADR-041-fixed-view-count-with-per-frame-activity.md)).
+   - If a screen's 3D mode has fewer views than the session renders, that screen gets the first
+     ones, and the inactive tail aliases as it does today.
+   - If a screen's 3D mode needs more views than the session can fill, that screen shows the window
+     in 2D. This is ADR-065 decision 6's floor, applied per screen. The app's own mode does not
+     change, and no denial event is sent, because the app requested nothing.
+   - **The clamp.** The located count is limited by `XRT_MAX_VIEWS` (8, `xrt/xrt_limits.h:27`) and
+     the view-set capacity by `XRT_MAX_SEGMENTS` (2, `xrt_display_metrics.h:231`). The number of
+     full per-segment view sets is `floor(XRT_MAX_VIEWS / max_view_count)`, at least 1 and at most
+     the capacity. Segments beyond that number (a window covering three screens, or any straddle with
+     an 8-view entry) are fed from the one-view-set path: the majority screen's set, cropped per
+     segment (#2791). ADR-066 C1.5 has the examples.
+6. **Kooima, legacy apps and zero-copy.**
+   - **Eyes and framing are already per screen**: decision 2, the Amendment 4 addendum for zone
+     elements, and #2757 for in-process native Wayland. This amendment changes only the size the
+     views are rendered at.
+   - **Legacy apps** (no `XR_DXR_display_info`) never see the table or the event. Their size stays
+     the compromise computed at system fill-in, and each segment DP resamples it. The compromise
+     comes from `oxr_system_fill_in`, `legacy_app_tile_scaling`,
+     `oxr_legacy_compromise_mode_index` and #2641's adopted-window size. Whether it should be taken
+     over decision 1's union instead of the session screen is open question 2.
+   - **Zero-copy:** `u_tiling_can_zero_copy()` stays the sole gate (ADR-030). See decision 1 for the
+     cost on the Windows vendor path. A segmented window already withholds zero-copy (#2223, #2228).
+     No per-call-site proxy is added.
+7. **`sim_display`'s default 3D mode is "Same as 2D"** (decided). sim_display declares one more
+   entry: one full-screen view at `view_scale` 1.0 × 1.0, untracked, `hardware_display_3d` false,
+   flagged `XRT_RENDERING_MODE_FLAG_3D_PASSTHROUGH` (ADR-066 C1.2). It is sim_display's default 3D
+   mode, in slot 1 next to the full-screen 2D entry in slot 0. Most apps request 3D at start, and an
+   anaglyph on a regular screen reads as broken. A laptop screen claimed by sim_display therefore
+   stays sharp while the app is in 3D, and its lens state does not change. With ADR-066 Part B's
+   viewer tracking on for that screen, the one view follows the viewer's head. The entry's name must
+   not collide with #2576's `sbs_full`, which is a stereo-compositor output.
+
+   The entry's atlas is the 2D size, so it does not grow decision 1's union. Worked straddle case
+   on ds1-linux: a 3D app with its window across the 3D panel (two half-resolution views) and the
+   laptop ("Same as 2D", one full view). The tile is the per-dimension maximum, which is full
+   resolution. The session renders the panel's two views, and the laptop's segment DP shows the
+   first one (decision 5). A one-view slot 1 that counts as 3D needs the change to ADR-065's trim
+   rule that ADR-066 C1.2 spells out.
+
+### What has to exist
+
+- **A per-screen mode table.** For each claimed screen, the runtime needs that screen's declared
+  mode list (view count, tiles, view scale, name, flags) from the plug-in that owns the screen, plus
+  that screen's 3D mode (ADR-066 C1.2), which picks slot 1. Today a plug-in describes another
+  screen only through `get_display_info_for_monitor` → `xrt_plugin_display_info`. That struct
+  carries one `recommended_view_scale_x/y` pair, which is not a list. The list can be either an
+  append under `struct_size` on that struct or a new optional slot (ADR-020 append-only, no ABI
+  bump). If a plug-in answers neither, the runtime reads that screen's list as the head device's
+  list, which is today's behaviour. This generalises #2218 item 14 (the default screen's metadata
+  follows its per-screen DP) to every screen.
+- **The effective table per session**, computed where the segment table is computed:
+  - in-process, by the compositor's segment manager;
+  - for an IPC client, by the service, which already sends the segment table by value
+    (`compositor_get_segment_metrics`). The IPC client copies the head's modes once at connect
+    (`ipc/client/ipc_client_hmd.c:362-366`). Its enumerate must answer from the effective table
+    instead, refreshed together with the segment table.
+- **The emit**, from the frame path next to the #1488 views-change edge
+  (`oxr_session_frame_end.c`), and only on a real change. A frame where nothing changed must produce
+  no write and no event (the LÖVR hazard, views-change spec §6).
+- **ADR-066's worst-case statement**, in the same stage (decision 4).
+
+### Open questions
+
+1. **Which table a straddling window reports.** Decision 4 says the majority screen's table with the
+   maximum scale. That mixes two screens in one row: one screen's name and `hardwareDisplay3D`,
+   another screen's scale. The alternative is to report the maximum only in
+   `viewWidthPixels/HeightPixels` and leave the scale as the majority screen's. This needs a review
+   from the engine side.
+2. **The legacy compromise.** Should it be taken over the union, or stay on the session screen with
+   the DP resampling?
+3. **A screen whose 3D mode needs more views than the instance** (decision 5). Is "2D on that
+   screen" right? The alternative is to take the first N views and tell the DP to synthesise the
+   rest. The runtime synthesises no pixels today.
+4. **The per-screen sizing opt-out** (decision 1): how is it spelled in the CLI and the Dashboard,
+   and is it per user or per machine?
+5. **Rotation** (decision 2): does every DP flatten a non-`CAN_ROTATE` mode on a rotated screen, or
+   do some weave in the rotated orientation correctly? Stage 1b's rotated-screen runs answer it.
