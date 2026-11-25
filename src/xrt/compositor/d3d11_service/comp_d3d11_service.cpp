@@ -1551,6 +1551,14 @@ struct d3d11_service_compositor
 	bool zc_last_logged_set;
 	bool zc_last_logged_value;
 	const char *zc_last_logged_reason;
+	//! The (reason, decision) pairs this client has already logged at WARN.
+	//! A decision that oscillates (a routed frame, then an unrouted one, while a
+	//! window straddles two screens) re-logs each flip at INFO only, so the WARN
+	//! breadcrumb stays one line per distinct reason. The reasons are string
+	//! literals, so pointer identity is the key.
+	const char *zc_warned_reason[16] = {};
+	bool zc_warned_value[16] = {};
+	uint32_t zc_warned_count = 0;
 
 	//! Phase 1 diagnostic — `[MUTEX]` rate-limited (1× / 10 s) per-client
 	//! summary of KeyedMutex acquire health on the service render thread.
@@ -15656,6 +15664,7 @@ svc_view_size_follow_table(struct d3d11_service_system *sys,
 		}
 		*next = *c->view_size;
 	}
+	const struct xrt_effective_mode_table prev_eff = next->eff;
 	const uint64_t now = os_monotonic_get_ns();
 	// No view cap (0): the client lays its views out from what it enumerates;
 	// the instance's worst case clamps.
@@ -15671,7 +15680,7 @@ svc_view_size_follow_table(struct d3d11_service_system *sys,
 		c->view_eff_ns = (int64_t)now;
 	}
 	if (changed) {
-		comp_segments_view_size_log_change(&next->eff);
+		comp_segments_view_size_log_change(&next->eff, &prev_eff);
 	}
 	free(next);
 }
@@ -26788,11 +26797,30 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		    (c->zc_last_logged_reason != nullptr &&
 		     zc_reason != nullptr &&
 		     strcmp(c->zc_last_logged_reason, zc_reason) != 0)) {
-			U_LOG_W("[ZC] client=%p views=%u zero_copy=%c reason=%s",
-			        (void *)c,
-			        proj_view_count,
-			        zero_copy ? 'Y' : 'N',
-			        zc_reason ? zc_reason : "?");
+			// Change-only per client AND per reason: the first time a reason is
+			// seen it is a WARN; a later flip back to it is INFO (a straddling
+			// window flips routed/unrouted several times a second).
+			bool zc_first = true;
+			for (uint32_t k = 0; k < c->zc_warned_count; k++) {
+				if (c->zc_warned_reason[k] == zc_reason && c->zc_warned_value[k] == zero_copy) {
+					zc_first = false;
+					break;
+				}
+			}
+			if (zc_first && c->zc_warned_count < ARRAY_SIZE(c->zc_warned_reason)) {
+				c->zc_warned_reason[c->zc_warned_count] = zc_reason;
+				c->zc_warned_value[c->zc_warned_count] = zero_copy;
+				c->zc_warned_count++;
+			} else {
+				zc_first = false;
+			}
+			if (zc_first) {
+				U_LOG_W("[ZC] client=%p views=%u zero_copy=%c reason=%s", (void *)c, proj_view_count,
+				        zero_copy ? 'Y' : 'N', zc_reason ? zc_reason : "?");
+			} else {
+				U_LOG_I("[ZC] client=%p views=%u zero_copy=%c reason=%s", (void *)c, proj_view_count,
+				        zero_copy ? 'Y' : 'N', zc_reason ? zc_reason : "?");
+			}
 			c->zc_last_logged_set = true;
 			c->zc_last_logged_value = zero_copy;
 			c->zc_last_logged_reason = zc_reason;

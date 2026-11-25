@@ -651,6 +651,8 @@ struct multi_compositor
 		bool hw_2d_confirmed;
 
 		uint64_t window_id;   //!< Present-owner window id from bind (future phase use).
+		bool window_bound;    //!< A bind has happened (first-bind WARN; repeats are silent).
+		uint32_t overlay_imports_logged; //!< Overlay imports logged at WARN (capped at 16).
 		uint64_t fence_value; //!< Monotonic; completion is synchronous on macOS.
 
 		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
@@ -852,6 +854,9 @@ struct multi_compositor
 		struct xrt_display_processor *dp;
 
 		uint64_t window_id;   //!< Present-owner window id from bind (opaque on Android).
+		bool window_bound;    //!< A bind has happened (first-bind WARN; repeats are silent).
+		int rect_fed_logged;  //!< Last DP phase-slot verdict logged at WARN (0 none, 1 fed, 2 refused).
+		uint32_t out_allocs_logged; //!< Outputs allocated (the first is a WARN, re-allocations INFO).
 		uint64_t fence_value; //!< Monotonic; completion is synchronous.
 
 		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
@@ -1023,6 +1028,8 @@ struct multi_compositor
 		bool pf_logged_first;    //!< the one-time WARN for the first accepted report
 		uint64_t pf_last_log_ns; //!< throttle of the periodic summary
 		uint64_t pf_last_bad_ns; //!< last out-of-bounds horizon logged (not published)
+		bool pf_bad;             //!< the residual is out of bounds now (WARN on the good->bad edge only)
+		bool sync_import_warned; //!< the acquire sync_file import failure WARN was logged
 		//! @}
 
 		/*!
@@ -1147,6 +1154,7 @@ struct multi_compositor
 		struct xrt_display_processor *dp;
 
 		uint64_t window_id;   //!< Present-owner window id from bind (an XID; recorded only).
+		uint32_t out_allocs_logged; //!< Outputs allocated (the first is a WARN, re-allocations INFO).
 		bool window_bound;    //!< A bind has happened (first-bind WARN; repeats are silent).
 		uint64_t fence_value; //!< Monotonic; completion is synchronous in stage A.
 

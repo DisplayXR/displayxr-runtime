@@ -1157,11 +1157,13 @@ weave_create_output_dmabuf(struct vk_bundle *vk, struct multi_compositor *mc, ui
 	mc->weave.out_w = w;
 	mc->weave.out_h = h;
 	mc->weave.out_is_dmabuf = true;
-	U_LOG_W("weave(#1699): output %ux%u is a dma-buf: fourcc 0x%08x modifier 0x%016" PRIx64
-	        " (%s from %u), %u plane(s), plane0 offset %u stride %u, %" PRIu64 " bytes",
-	        w, h, desc.drm_fourcc, desc.drm_modifier,
-	        force_linear ? "DXR_WEAVE_OUTPUT_LINEAR" : (mod_count > 0 ? "driver-picked" : "LINEAR fallback"),
-	        mod_count, desc.plane_count, desc.offsets[0], desc.strides[0], desc.size);
+	// The first output is a WARN; a re-allocation follows every resize step.
+	U_LOG_IFL(mc->weave.out_allocs_logged == 0 ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+	          "weave(#1699): output %ux%u is a dma-buf: fourcc 0x%08x modifier 0x%016" PRIx64
+	          " (%s from %u), %u plane(s), plane0 offset %u stride %u, %" PRIu64 " bytes",
+	          w, h, desc.drm_fourcc, desc.drm_modifier,
+	          force_linear ? "DXR_WEAVE_OUTPUT_LINEAR" : (mod_count > 0 ? "driver-picked" : "LINEAR fallback"),
+	          mod_count, desc.plane_count, desc.offsets[0], desc.strides[0], desc.size);
 	return weave_create_output_view_fb(vk, mc, w, h);
 }
 
@@ -1664,10 +1666,15 @@ weave_feed_dp_geometry(struct multi_compositor *mc)
 	const bool fed =
 	    xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)mc->weave.dp, ox, oy);
 	if (mc->weave.geometry_dirty || panel_moved || !mc->weave.have_panel_frame) {
+		// The first resolve and a panel change are lifecycle events (WARN);
+		// an origin-only change follows every step of a drag (INFO), as the
+		// macOS engine does.
+		const bool lifecycle = !mc->weave.have_panel_frame || panel_moved;
 		mc->weave.geometry_dirty = false;
 		mc->weave.panel_frame = panel;
 		mc->weave.have_panel_frame = true;
-		U_LOG_W(
+		U_LOG_IFL(
+		    lifecycle ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
 		    "weave(#1699): present origin (%d,%d) panel-relative (from %s; window %d,%d, panel X11 origin "
 		    "(%d,%d) %ux%u, device %ux%u @ %.4f) %s the DP phase slot%s",
 		    ox, oy, u_weave_origin_source_str(src), mc->weave.win_x, mc->weave.win_y, panel.screen_left,
@@ -2831,9 +2838,12 @@ weave_run_frame(struct vk_bundle *vk,
 			mc->weave.sbs_h = want_h;
 			mc->weave.sbs_first_use = true;
 		}
-		U_LOG_W("weave(#1699): output %ux%u (%s layout), exported %s %" PRIu64 " bytes", want_w, want_h,
-		        nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"),
-		        want_dmabuf_out ? "dma-buf" : "OPAQUE_FD", (uint64_t)mc->weave.out_size);
+		// The first output is a WARN; a re-allocation follows every resize step.
+		U_LOG_IFL(mc->weave.out_allocs_logged == 0 ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+		          "weave(#1699): output %ux%u (%s layout), exported %s %" PRIu64 " bytes", want_w, want_h,
+		          nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"),
+		          want_dmabuf_out ? "dma-buf" : "OPAQUE_FD", (uint64_t)mc->weave.out_size);
+		mc->weave.out_allocs_logged++;
 	}
 
 	// v6 crop staging: (re)create when the packed region is smaller than the
@@ -3777,6 +3787,7 @@ comp_multi_weave_set_window_geometry_logical(struct xrt_compositor *xc,
 	                     mc->weave.win_w != client_w || mc->weave.win_h != client_h ||
 	                     mc->weave.win_display_id != display_id;
 	const bool logical_first = lo.valid && !mc->weave.win_logical.valid;
+	const bool geometry_lifecycle = !mc->weave.have_geometry || mc->weave.win_display_id != display_id;
 	mc->weave.have_geometry = true;
 	mc->weave.win_x = origin_x;
 	mc->weave.win_y = origin_y;
@@ -3787,10 +3798,12 @@ comp_multi_weave_set_window_geometry_logical(struct xrt_compositor *xc,
 	mc->weave.geometry_dirty = mc->weave.geometry_dirty || changed;
 	os_mutex_unlock(&mc->weave.mutex);
 	if (changed) {
-		// Lifecycle event (the window moved / resized); the caller may
-		// re-publish every frame, so log only on change.
-		U_LOG_W("weave(#1699): present-owner window %d,%d %ux%u on display %d", origin_x, origin_y, client_w,
-		        client_h, display_id);
+		// The caller re-publishes every frame and a drag / resize changes the
+		// rect on every one: WARN for the first geometry and a display change,
+		// INFO for a move or resize.
+		U_LOG_IFL(geometry_lifecycle ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+		          "weave(#1699): present-owner window %d,%d %ux%u on display %d", origin_x, origin_y, client_w,
+		          client_h, display_id);
 	}
 	if (logical_first) {
 		// One-off per transition (not per move): the caller now reports its
