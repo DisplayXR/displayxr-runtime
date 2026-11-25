@@ -1541,7 +1541,17 @@ d3d11_lift_glue_import_input_cpu(
 		blit_dst dst = {rkm, rtv};
 		ok = snapshot_blit(l, dst, gs->imp_srv, gs->imp_w, gs->imp_h, 0, 0, w, h, w, h);
 		if (ok) {
-			l->svc_context->CopyResource(st, rt);
+			// snapshot_blit released the target's keyed mutex. A keyed-mutex
+			// texture read without it is not a valid read: the copy below came
+			// back all zeros, so every GAUSSIANS job was handed a black photo.
+			HRESULT hr = rkm->AcquireSync(0, 4);
+			ok = SUCCEEDED(hr) && hr != (HRESULT)WAIT_TIMEOUT;
+			if (ok) {
+				l->svc_context->CopyResource(st, rt);
+				rkm->ReleaseSync(0);
+			}
+		}
+		if (ok) {
 			D3D11_MAPPED_SUBRESOURCE m = {};
 			ok = SUCCEEDED(l->svc_context->Map(st, 0, D3D11_MAP_READ, 0, &m));
 			if (ok) {

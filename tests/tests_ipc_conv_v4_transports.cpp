@@ -862,3 +862,31 @@ TEST_CASE("spec-4 transports on WARP reproduce the pinned SBS bytes", "[ipc_conv
 		rel(t);
 	}
 }
+
+/*
+ * The GAUSSIANS facade's Windows input: the caller's texture read back to CPU
+ * pixels (d3d11_lift_glue_import_input_cpu). Every other test plugs in a fake
+ * for this hook, so the real one had never run under a test: it copied its
+ * snapshot target out without that target's keyed mutex, the copy came back
+ * all zeros, and every photo -> splats job on Windows was handed a black
+ * picture (the splat scene rendered black).
+ */
+TEST_CASE("the GAUSSIANS input readback returns the caller's pixels", "[ipc_conv_v4_transports]")
+{
+	Service svc;
+	if (!svc.init()) {
+		SKIP("no WARP D3D11 device");
+	}
+	const std::vector<uint32_t> want = make_input();
+	for (const bool keyed_mutex : {true, false}) {
+		ID3D11Texture2D *t = svc.texture(kW, kH, 0, 0, keyed_mutex);
+		REQUIRE(t != nullptr);
+		uint8_t *px = nullptr;
+		const uint64_t wire = keyed_mutex ? 0x7001u : 0x7002u;
+		REQUIRE(d3d11_lift_glue_import_input_cpu(svc.l, wire, nt_handle(t), false, kW, kH, &px) == XRT_SUCCESS);
+		REQUIRE(px != nullptr);
+		CHECK(memcmp(px, want.data(), (size_t)kW * kH * 4u) == 0);
+		free(px);
+		rel(t);
+	}
+}
