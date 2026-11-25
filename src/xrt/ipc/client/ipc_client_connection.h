@@ -166,11 +166,20 @@ ipc_client_connection_disable_service_launch(void);
 
 /*!
  * Process-wide: bound the connect + handshake of every following
- * ipc_client_connection_init() to about @p timeout_ms per socket call (#2515);
- * 0 (the default) blocks forever, as every app client does. Meant for
- * diagnostics (displayxr-cli), which must not hang on a wedged service that
- * still holds its listening socket. Only the handshake is bounded: the
- * timeouts are cleared once it succeeds. Desktop Linux only; a no-op elsewhere.
+ * ipc_client_connection_init() to about @p timeout_ms per socket call / pipe
+ * read; 0 blocks forever. Only the handshake is bounded: the timeouts are
+ * cleared once it succeeds.
+ *
+ * Desktop Linux (#2515): 0 is the default, as every app client does (systemd's
+ * watchdog restarts a wedged service); displayxr-cli sets a bound.
+ *
+ * Windows (browser#205): every client is bounded by default (5000 ms, or
+ * DXR_IPC_HANDSHAKE_TIMEOUT_MS; 0 = forever) because nothing supervises a
+ * wedged service there; calling this overrides that. Reads only — the pipe
+ * open and the service launch have deadlines of their own, and a handshake
+ * write lands in the service's pipe buffer whether or not it reads.
+ *
+ * A no-op elsewhere.
  *
  * @ingroup ipc_client
  */

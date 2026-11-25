@@ -191,6 +191,11 @@ endif()
 if(TARGET ipc_shared)
 	list(APPEND tests tests_workspace_screens_ipc)
 endif()
+# browser#205 -- a bounded Windows IPC read gives up on a pipe peer that
+# accepted and never answers (the client handshake's wedged-service case).
+if(WIN32 AND TARGET ipc_shared)
+	list(APPEND tests tests_ipc_pipe_read_timeout)
+endif()
 # #1727 -- the X11 qwerty front-end's edge logic (one click = one select edge).
 if(XRT_BUILD_DRIVER_QWERTY AND XRT_HAVE_XCB AND NOT ANDROID)
 	list(APPEND tests tests_qwerty_xcb)
@@ -1749,6 +1754,10 @@ if(TARGET ipc_shared)
 		${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 		)
 	target_link_libraries(tests_workspace_screens_ipc PRIVATE xrt-interfaces aux_util ipc_shared xrt-external-openxr)
+endif()
+
+if(TARGET tests_ipc_pipe_read_timeout)
+	target_link_libraries(tests_ipc_pipe_read_timeout PRIVATE xrt-interfaces aux_util ipc_shared)
 endif()
 
 # XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): a present-owner's weave rects

@@ -43,6 +43,18 @@ struct ipc_message_channel
 	 * the integrity-level check — see `ipc_server_peer_declaration_allowed`.
 	 */
 	long dup_target_pid;
+
+	/*!
+	 * browser#205, Windows only: when non-zero, `ipc_receive` gives up with
+	 * XRT_ERROR_IPC_FAILURE (and sets @ref read_timed_out) if no message
+	 * arrives within this many milliseconds, instead of blocking in ReadFile
+	 * forever. 0 (the default) blocks, as every steady-state call does. Set by
+	 * the client only for the duration of its connect handshake.
+	 */
+	uint32_t read_timeout_ms;
+
+	//! Set when a read gave up on @ref read_timeout_ms; cleared by nobody.
+	bool read_timed_out;
 };
 
 /*!

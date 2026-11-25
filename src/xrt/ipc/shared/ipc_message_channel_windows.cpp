@@ -19,6 +19,8 @@
 
 #include "util/u_windows.h"
 #include "util/u_logging.h"
+#include "util/u_time.h"
+#include "os/os_time.h"
 
 #include "shared/ipc_utils.h"
 #include "shared/ipc_protocol.h"
@@ -124,9 +126,52 @@ ipc_send(struct ipc_message_channel *imc, const void *data, size_t size)
 	return XRT_SUCCESS;
 }
 
+/*!
+ * browser#205: wait for a message to be readable, bounded by
+ * imc->read_timeout_ms. The client's pipe handle is synchronous (opened without
+ * FILE_FLAG_OVERLAPPED, or adopted from a broker that opened it, browser#103),
+ * so ReadFile itself cannot time out; PeekNamedPipe never blocks and reports a
+ * queued message, so poll it instead. Only the connect handshake sets a bound,
+ * and it reads three replies at most, so the 1 ms poll costs nothing that
+ * matters (the instance raised the timer resolution with timeBeginPeriod(1)).
+ *
+ * Returns false only when the bound expired. Any other outcome — data queued,
+ * the pipe broken, Peek failing — returns true and lets ReadFile produce the
+ * result (and its error log) exactly as before.
+ */
+static bool
+wait_readable_bounded(struct ipc_message_channel *imc)
+{
+	const uint64_t start_ns = os_monotonic_get_ns();
+	const uint64_t bound_ns = (uint64_t)imc->read_timeout_ms * U_TIME_1MS_IN_NS;
+	for (;;) {
+		DWORD avail = 0;
+		if (!PeekNamedPipe(imc->ipc_handle, NULL, 0, NULL, &avail, NULL)) {
+			return true; // Broken / closed: ReadFile reports it.
+		}
+		if (avail > 0) {
+			return true;
+		}
+		if (os_monotonic_get_ns() - start_ns >= bound_ns) {
+			return false;
+		}
+		Sleep(1);
+	}
+}
+
 xrt_result_t
 ipc_receive(struct ipc_message_channel *imc, void *out_data, size_t size)
 {
+	// A zero-size read is the empty "no handles" message, which follows its
+	// data message at once; Peek cannot tell it from no message, so it is not
+	// bounded.
+	if (imc->read_timeout_ms > 0 && size > 0 && !wait_readable_bounded(imc)) {
+		imc->read_timed_out = true;
+		IPC_ERROR(imc, "ReadFile from pipe %p: no reply within %u ms (browser#205)", imc->ipc_handle,
+		          (unsigned)imc->read_timeout_ms);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
 	DWORD len;
 	if (!ReadFile(imc->ipc_handle, out_data, DWORD(size), &len, NULL)) {
 		DWORD err = GetLastError();
