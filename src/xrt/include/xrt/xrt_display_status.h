@@ -497,7 +497,7 @@ struct xrt_status_mode_3d_choice
 	bool tracked;     //!< The entry follows the viewer (HAS_TRACKING).
 	bool passthrough; //!< One full-resolution view serving as the 3D slot (lens stays 2D).
 	uint32_t applies; //!< `enum xrt_status_mode_3d_applies`.
-	char reason[96];  //!< Why, when not NOW ("" otherwise).
+	char reason[96];  //!< Why, when not NOW, or a NOW caveat ("" otherwise; always "" for the active entry).
 };
 
 /*!
@@ -512,8 +512,9 @@ struct xrt_status_mode_3d
 	uint32_t source;  //!< `enum xrt_status_mode_3d_source`.
 	uint32_t choice_count;
 	struct xrt_status_mode_3d_choice choices[XRT_STATUS_MAX_MODE_3D_CHOICES];
-	//! Why there are no choices ("" = none): a stored choice for a screen whose
-	//! driver declares no 3D modes now (JSON top-level `reason`, else null).
+	//! Why the stored choice is not honoured ("" = it is, or none is stored): a
+	//! name the driver's table does not list, a `not_supported` entry, or a
+	//! screen whose driver declares no 3D modes now (JSON top-level `reason`).
 	char reason[96];
 };
 

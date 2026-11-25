@@ -795,31 +795,55 @@ target_status_snapshot_fill_mode_3d_setting(struct xrt_status_snapshot *out)
 			continue;
 		}
 		(void)snprintf(sc->mode_3d.setting, sizeof(sc->mode_3d.setting), "%s", name);
-		bool known = !sc->mode_3d.valid; // a screen with no table: shown as stored
-		bool applies_now = false;
-		for (uint32_t k = 0; k < sc->mode_3d.choice_count; k++) {
-			if (strcmp(sc->mode_3d.choices[k].name, name) == 0) {
-				known = true;
-				applies_now = sc->mode_3d.choices[k].applies == XRT_STATUS_MODE_3D_APPLIES_NOW;
-			}
-		}
+		const enum xrt_status_mode_3d_source stored_in = src == U_SETTING_SOURCE_MACHINE
+		                                                     ? XRT_STATUS_MODE_3D_SOURCE_MACHINE
+		                                                     : XRT_STATUS_MODE_3D_SOURCE_USER;
 		if (!sc->mode_3d.valid) {
 			// ADR-047 Amendment 10: keep a stored choice visible on a screen
 			// whose driver declares no 3D modes now (driver changed, unclaimed).
 			sc->mode_3d.active[0] = '\0';
 			sc->mode_3d.choice_count = 0;
+			sc->mode_3d.source = stored_in;
 			(void)snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
 			               "this display's driver declares no 3D modes now");
+			continue;
 		}
-		if (known) {
-			sc->mode_3d.source = src == U_SETTING_SOURCE_MACHINE ? XRT_STATUS_MODE_3D_SOURCE_MACHINE
-			                                                     : XRT_STATUS_MODE_3D_SOURCE_USER;
-			// Headless: no live remap ran in this process; the choice is what a
-			// session would get - unless it applies only at the next start
-			// (restart_app): then `active` stays what is drawn now.
-			if (out->source == XRT_STATUS_SOURCE_HEADLESS && sc->mode_3d.valid && applies_now) {
-				(void)snprintf(sc->mode_3d.active, sizeof(sc->mode_3d.active), "%s", name);
+		const struct xrt_status_mode_3d_choice *row = NULL;
+		for (uint32_t k = 0; k < sc->mode_3d.choice_count && k < XRT_STATUS_MAX_MODE_3D_CHOICES; k++) {
+			if (strcmp(sc->mode_3d.choices[k].name, name) == 0) {
+				row = &sc->mode_3d.choices[k];
 			}
+		}
+		// The stored choice is reported where it is stored, whether or not it
+		// is honoured: `source` says which store a reset must clear.
+		sc->mode_3d.source = stored_in;
+		if (row == NULL) {
+			// A name the driver's table does not list (an entry it no longer
+			// declares, a hand-written typo): never honoured, the default is
+			// drawn. Say so, so a reader can offer the reset.
+			sc->mode_3d.reason[0] = '\0';
+			const int w = snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
+			                       "the chosen 3D mode '%s' is not offered by this display's driver; the "
+			                       "default is used",
+			                       name);
+			if (w < 0 || (size_t)w >= sizeof(sc->mode_3d.reason)) {
+				(void)snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
+				               "chosen 3D mode '%.31s' not offered by the driver; default used", name);
+			}
+			continue;
+		}
+		if (row->applies == XRT_STATUS_MODE_3D_APPLIES_NOT_SUPPORTED) {
+			(void)snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
+			               "the chosen 3D mode '%.24s' cannot apply here; the default is used", name);
+			continue;
+		}
+		// Headless: no live remap ran in this process; the choice is what a
+		// session would get - unless it applies only at the next start
+		// (restart_app): then `active` stays what is drawn now, and
+		// `setting` != `active` reads "chosen, waiting for a restart".
+		if (out->source == XRT_STATUS_SOURCE_HEADLESS && row->applies == XRT_STATUS_MODE_3D_APPLIES_NOW) {
+			(void)snprintf(sc->mode_3d.active, sizeof(sc->mode_3d.active), "%s", name);
+			u_status_mode_3d_mark_active(&sc->mode_3d);
 		}
 	}
 }

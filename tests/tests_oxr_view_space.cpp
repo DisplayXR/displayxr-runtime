@@ -3283,6 +3283,33 @@ TEST_CASE("ADR-047 A10: a stored start-up-only 3D mode (Quad) is declared at the
 	CHECK(std::string(after[1].modeName) == "Quad");
 	CHECK(after[1].viewCount == 4);
 	CHECK(rt2.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) >= 4);
+
+	// In the instance Quad started, every other entry is a LIVE switch (the
+	// status rows say `applies: now`): Quad is declared, the located view
+	// count stays 4 (C1), and leaving Quad and coming back both remap live.
+	auto write_choice = [&](const char *name) {
+		FILE *f = fopen((dirpath + "/settings.json").c_str(), "w");
+		REQUIRE(f != nullptr);
+		fprintf(f, "{\"mode_3d_per_screen\": {\"%s\": \"%s\"}}\n", key.c_str(), name);
+		fclose(f);
+	};
+	auto wait_slot1 = [&](const char *want) {
+		for (int i = 0; i < 60; i++) { // 3 s
+			(void)rt2.drain_events();
+			const std::vector<XrDisplayRenderingModeInfoDXR> m = rt2.rendering_modes();
+			if (m.size() == 2 && std::string(m[1].modeName) == want) {
+				return true;
+			}
+			sleep_ms(50);
+		}
+		return false;
+	};
+	(void)rt2.drain_events();
+	write_choice("anaglyph");
+	CHECK(wait_slot1("Anaglyph"));
+	CHECK(rt2.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) >= 4);
+	write_choice("quad");
+	CHECK(wait_slot1("Quad"));
 	tear_down(rt2);
 	remove((dirpath + "/settings.json").c_str());
 	rmdir(dirpath.c_str());

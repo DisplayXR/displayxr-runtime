@@ -10,6 +10,7 @@
 #include "util/u_screen_modes.h"
 #include "util/u_logging.h"
 #include "util/u_setting.h"
+#include "util/u_status_snapshot.h"
 
 #include "xrt/xrt_display_status.h"
 
@@ -309,4 +310,5 @@ u_screen_modes_fill_status(const struct u_screen_mode_table *t, bool fits_instan
 			c->applies = XRT_STATUS_MODE_3D_APPLIES_NOW;
 		}
 	}
+	u_status_mode_3d_mark_active(out);
 }

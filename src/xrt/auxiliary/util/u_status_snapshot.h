@@ -301,6 +301,17 @@ cJSON *
 u_status_mode_3d_to_cjson(const struct xrt_status_mode_3d *m3);
 
 /*!
+ * ADR-066 C1: the choice that IS the active entry reads `applies: now` with no
+ * reason - choosing it changes nothing, whatever it needed to become active (a
+ * start-up-only entry declared at this start, a screen sized late). Every other
+ * live (`now`) choice of more than two views carries the stereo-apps caveat.
+ * Called by every builder of a `mode_3d` and after anything that moves
+ * `active`, so the rows describe the active entry the object names.
+ */
+void
+u_status_mode_3d_mark_active(struct xrt_status_mode_3d *m3);
+
+/*!
  * @name Stable enum spellings (as serialised)
  * @{
  */
