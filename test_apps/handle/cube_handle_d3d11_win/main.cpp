@@ -2053,9 +2053,12 @@ static void RenderOneFrame(RenderState& rs) {
                     // of them (the sum is activeViewCount), each set's local
                     // view j into tile j at that display's segment rect (placed
                     // below once the tile size is known). Tiled layout only;
-                    // the array layout keeps its two slices.
+                    // the array layout keeps its two slices. A 2D mode routes
+                    // too: one view per display, each framed for that
+                    // display's part of the window (rendering only view 0
+                    // would put display 0's framing on every display).
                     const bool routedViews =
-                        !ArrayLayoutEnabled() && !monoMode &&
+                        !ArrayLayoutEnabled() &&
                         xr.viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR &&
                         viewBindings.bindingCountOutput > 0 && viewBindings.bindingCountOutput <= 4;
                     if (routedViews) {
@@ -2067,6 +2070,9 @@ static void RenderOneFrame(RenderState& rs) {
                         if (routedEyes > (int)locatedCount) routedEyes = (int)locatedCount;
                         if (routedEyes > 0) eyeCount = routedEyes;
                     }
+                    // 2D with ONE view for the whole window (not routed): the
+                    // centre-eye view drawn once. Routed 2D draws each view.
+                    const bool monoOneView = monoMode && !routedViews;
                     {
                         // Log the bindings when they change (one line, never per frame).
                         static std::string lastBindings;
@@ -2489,10 +2495,10 @@ static void RenderOneFrame(RenderState& rs) {
 
                             XMMATRIX viewMatrix, projMatrix;
                             if (useAppProjection) {
-                                int vi = monoMode ? 0 : eye;
+                                int vi = monoOneView ? 0 : eye;
                                 viewMatrix = ColumnMajorToXMMatrix(stereoViews[vi].view_matrix);
                                 projMatrix = ColumnMajorToXMMatrix(stereoViews[vi].projection_matrix);
-                            } else if (monoMode) {
+                            } else if (monoOneView) {
                                 viewMatrix = monoViewMatrix;
                                 projMatrix = monoProjMatrix;
                             } else {
@@ -2690,10 +2696,10 @@ static void RenderOneFrame(RenderState& rs) {
                             projectionViews[eye].subImage.imageArrayIndex = arrayLayout ? (uint32_t)eye : 0;
 
                             int safeIdx = (eye < (int)viewCount) ? eye : 0;
-                            projectionViews[eye].pose = monoMode ? monoPose : rawViews[safeIdx].pose;
+                            projectionViews[eye].pose = monoOneView ? monoPose : rawViews[safeIdx].pose;
                             projectionViews[eye].fov = useAppProjection ?
-                                stereoViews[monoMode ? 0 : eye].fov :
-                                (monoMode ? monoFov : rawViews[safeIdx].fov);
+                                stereoViews[monoOneView ? 0 : eye].fov :
+                                (monoOneView ? monoFov : rawViews[safeIdx].fov);
 
                             // #1956: the depth this view was rendered into — same
                             // rect + array index as its colour subimage.
