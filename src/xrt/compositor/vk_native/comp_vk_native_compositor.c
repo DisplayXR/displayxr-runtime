@@ -10403,7 +10403,13 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 #endif
 
 	if (xret != XRT_SUCCESS) {
-		U_LOG_E("Failed to present");
+		// Once the device is latched lost every weave fails, app frame and
+		// repaint alike, at panel rate: the latch already logged why, so do
+		// not add one error per frame until the app tears the session down.
+		if (!comp_vk_native_renderer_is_device_lost(c->renderer) &&
+		    !(c->target != NULL && comp_vk_native_target_is_device_lost(c->target))) {
+			U_LOG_E("Failed to present");
+		}
 		return xret;
 	}
 
