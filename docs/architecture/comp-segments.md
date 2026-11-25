@@ -136,7 +136,7 @@ the owning plug-in's `get_rendering_modes_for_monitor` list and that screen's ow
 in (one tile for a one-view entry or for one the atlas cannot fill, else the entry's own tiles,
 filled with the session's first views), and the segment DP is told which entry to draw through
 `set_output_entry` slot of its API's DP vtable (`xrt_display_processor_vk` / `_d3d11` / `_d3d12` /
-`_gl`) on change. The primary segment keeps the session's
+`_gl` / `_metal`) on change. The primary segment keeps the session's
 grid.
 
 The window's **effective table** — what its app enumerates — is held by the manager
@@ -157,7 +157,11 @@ D3D12 slot 27, GL slot 25, VK slot 20). Under the #918 weave-on-scanout split th
 (`comp_hub_d3d11`, which segments for the D3D11, D3D12, GL and Vulkan sessions it serves) does the same,
 switched by its owner through `comp_hub_d3d11_set_view_size_policy` (off for a legacy app). Every
 manager logs the same change-only WARN (`comp_segments_view_size_log_change`, "view size: ...").
-The D3D11 service, the Metal compositor and the service weave engines are covered separately.
+The in-process Metal compositor on macOS does the same (`comp_metal_segments_update_view_size` /
+`_get_effective_table`, Metal DP slot 21; see § macOS / Metal): its table is cut in points, so it
+evaluates the effective table against the drawable's backing px rather than through
+`comp_segments_view_size_update_for_window`. The in-process Vulkan and GL compositors do not segment
+on macOS. The D3D11 service and the service weave engines are covered separately.
 
 **Out of process.** An IPC client is told its OWN table: the service computes it from where that
 client's window is and keeps it in the client's shared memory (`ipc_shared_memory.hmd.effective_table`,
@@ -165,7 +169,9 @@ its generation written last, beside the head's table that ADR-066 C1 syncs there
 tracker reads it at every locate and every `xrPollEvent`, so the enumerate and the table-changed
 event behave as in-process. Sources: the desktop-Linux and macOS (vk backend) weave engines follow a
 present-owner's bound window with the same manager (`comp_vk_native_segments_update_view_size`) and
-draw each other screen's entry for the session's confirmed 2D/3D slot; the D3D11 service follows a
+draw each other screen's entry for the session's confirmed 2D/3D slot; the macOS **metal** backend
+does the same with the Metal manager (`comp_metal_segments_update_view_size`, the window in backing
+px at its own scale, the output as the drawable); the D3D11 service follows a
 direct client's app window, a present-owner's bound window and a workspace tile's footprint over the
 presenter screens (ADR-052 D2). A session that weaves nothing — the DisplayXR Browser enumerates
 from its browser process and weaves from its GPU process — is told the table of the session weaving
@@ -394,6 +400,21 @@ buffer, in order). What differs on macOS:
   `comp_metal_compositor_set_view_routing`, and the projection pass paints each segment's views at
   its rect inside every tile. Quads and equirect layers are NOT routed on Metal yet (drawn once per
   tile with the tile's camera, as unsegmented).
+- **The view size follows the window's screen (ADR-047 Amendment 10)** on Metal as on vk_native:
+  `comp_metal_segments_update_view_size` advances the manager's `comp_segments_view_size` from the
+  point table of every weave of a placed window (split or not, zero-copy included), the effective
+  table rides `xrt_segment_metrics::table`, the commit overlays it on the frame's mode (atlas tiles
+  and view scale), and each non-primary segment is cropped in its own screen's entry, its DP told
+  the entry through `xrt_display_processor_metal::set_output_entry` (appended slot, sim_display
+  implements it). The effective table is evaluated against the **drawable's backing px**, never
+  the window's points: on a 2x panel the points would halve what the atlas needs and the clamp to
+  the instance's worst case would pass a window that overflows it. The pure part (cut in points →
+  canvas in drawable px → view-size step) is `metal/comp_metal_segments_geom.h`, pinned for a 2x +
+  1x pair by `tests_comp_metal_segments_geom`. The atlas grows once to the instance's worst case
+  (`xrt_system_compositor_info::atlas_*_pixels`, every claimed screen) when the screen list arrives.
+  The change-only WARN is `comp_segments_view_size_log_change` ("view size: ..."), one grep on every
+  platform; the frame-mode overlay and the per-view crop map are the shared
+  `comp_segments_view_size_overlay_mode` / `_tile_map`.
 - **sim_display** implements both slots on Metal (a bound DP loads the target and scissors to its
   canvas; every Metal sim output tolerates a resample, since INTERLACED falls back to anaglyph on
   this backend, #817), so a two-display Mac with no vendor hardware exercises the split path.

@@ -10,7 +10,7 @@ if(APPLE AND XRT_HAVE_METAL)
 	# service's XR_DXR_weave Metal engine (comp_multi, #2218 item 6) links it
 	# without the whole in-process compositor — the comp_vk_segs /
 	# comp_d3d11_segs pattern. MRR like the rest of the library.
-	add_library(comp_metal_segs STATIC comp_metal_segments.m comp_metal_segments.h)
+	add_library(comp_metal_segs STATIC comp_metal_segments.m comp_metal_segments.h comp_metal_segments_geom.h)
 	target_link_libraries(
 		comp_metal_segs
 		PUBLIC xrt-interfaces

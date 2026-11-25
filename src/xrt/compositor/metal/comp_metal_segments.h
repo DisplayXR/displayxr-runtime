@@ -56,6 +56,8 @@
 #include "xrt/xrt_screen.h"
 #include "util/comp_segments.h"
 
+#include "comp_metal_segments_geom.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -112,29 +114,9 @@ bool
 comp_metal_segments_enabled(const struct comp_metal_segments *segs);
 
 /*!
- * Where the window is this frame.
+ * Where the window is this frame: struct comp_metal_seg_window, in
+ * comp_metal_segments_geom.h (the pure, unit-tested part of this manager).
  */
-struct comp_metal_seg_window
-{
-	//! The content view in top-down global POINTS (origin = the main
-	//! display's top-left, the CGDisplayBounds space), rounded to whole points.
-	//! With @ref px_per_pt set: in that many px per point instead (see there).
-	struct comp_seg_rect frame_pt;
-	//! The drawable (the target), px.
-	uint32_t drawable_w;
-	uint32_t drawable_h;
-	/*!
-	 * 0 (the in-process compositor): @ref frame_pt is in points. > 0 (the
-	 * macOS service's weave, #2218 item 6): @ref frame_pt is the window in
-	 * global CG BACKING px at this scale (its windowOriginOnScreen and client
-	 * size, unrounded to points), and the table is cut in that px frame — each
-	 * screen's point rect x this scale, edges rounded like the engine rounds a
-	 * display's backing origin — so a present origin is exact even for a
-	 * window at a half-point position (util/comp_weave_screens.h,
-	 * comp_weave_screens_project_cg, is the same placement).
-	 */
-	double px_per_pt;
-};
 
 /*!
  * One metric update: recompute the table, run the DP lifecycle (create /
@@ -171,6 +153,11 @@ struct comp_metal_segments_frame
 	//! primary DP falls back to polling its NSView, which mid-drag still
 	//! reports the pre-move position until the CA transaction commits.
 	bool primary_present_origin;
+	//! The app's run-time slot this frame (0 = 2D, 1 = the 3D mode): each
+	//! non-primary segment is cropped and drawn as ITS screen's entry for it
+	//! (ADR-047 Amendment 10). Only read when
+	//! @ref comp_metal_segments_update_view_size has run (screens' tables known).
+	uint32_t active_slot;
 };
 
 /*!
@@ -183,6 +170,37 @@ struct comp_metal_segments_frame
  */
 bool
 comp_metal_segments_record(struct comp_metal_segments *segs, const struct comp_metal_segments_frame *f);
+
+/*!
+ * ADR-047 Amendment 10: advance the view-size state with the last
+ * @ref comp_metal_segments_update's table (it runs on every weave of a placed
+ * window while segmentation is enabled — also on frames that do not split, so
+ * the size follows the window back) and recompute the effective table the app
+ * is told: the session display's table while the window is on the session
+ * screen (invalid), else the covered screens' tables after a 0.5 s dwell
+ * (majority with Amendment 2's 20 % dead band), evaluated against the
+ * DRAWABLE's size in backing px. One WARN per change, worded like vk_native's.
+ * Weave thread, after the update.
+ *
+ * @param head_modes, head_count  The head device's presented table.
+ * @param max_views    The most views one view set of the session carries (0 = no limit).
+ * @param cap_w, cap_h The instance's worst-case atlas (0 = no clamp).
+ * @return true when the effective table changed.
+ */
+bool
+comp_metal_segments_update_view_size(struct comp_metal_segments *segs,
+                                     const struct xrt_rendering_mode *head_modes,
+                                     uint32_t head_count,
+                                     uint32_t max_views,
+                                     uint32_t cap_w,
+                                     uint32_t cap_h);
+
+/*!
+ * ADR-047 Amendment 10: the effective table (see
+ * @ref comp_metal_segments_update_view_size). Any thread. Returns its validity.
+ */
+bool
+comp_metal_segments_get_effective_table(struct comp_metal_segments *segs, struct xrt_effective_mode_table *out);
 
 /*!
  * The session-wide hardware 2D/3D mode. Each segment DP's lens wish follows
