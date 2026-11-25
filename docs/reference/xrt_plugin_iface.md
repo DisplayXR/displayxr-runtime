@@ -701,6 +701,11 @@ for a DP made by `create_dp_d3d11_for_screen` / `_d3d12_` / `_gl_`; each gated b
 announced by `XRT_DP_{VK,D3D11,D3D12,GL}_HAS_OUTPUT_ENTRY`), in THIS list's numbering, before the
 `process_atlas` that hands it an atlas laid out as that entry's tiles.
 
+On macOS a DP made by your `create_dp_metal_for_screen` factory is told the same through
+`xrt_display_processor_metal::set_output_entry` (appended after `get_eye_positions_at`, gated by
+`struct_size`, `#ifdef XRT_DP_METAL_HAS_OUTPUT_ENTRY`). A DP without the slot draws its default for
+the atlas it is handed.
+
 **NULL is allowed**: the screen's list is then the head device's (the behaviour before the slot).
 Appended per ADR-020 after `get_setting_status` (`offsetof == 304`, `sizeof(struct
 xrt_plugin_iface) == 312` on 64-bit; gated by `struct_size`, no API bump):

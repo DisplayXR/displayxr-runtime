@@ -500,6 +500,32 @@ struct xrt_display_processor_metal
 	bool (*get_eye_positions_at)(struct xrt_display_processor_metal *xdp,
 	                             int64_t target_ns,
 	                             struct xrt_eye_positions *out);
+
+	/*!
+	 * Which declared rendering-mode entry this DP draws (ADR-047 Amendment
+	 * 10) — the Metal twin of xrt_display_processor_vk::set_output_entry.
+	 * @p mode_index is an index of the list the owning plug-in answered
+	 * through `xrt_plugin_iface::get_rendering_modes_for_monitor` for this
+	 * DP's screen, in that list's own order (0 = the flat 2D entry). The
+	 * runtime calls it on a segment DP made by a `create_dp_metal_for_screen`
+	 * factory whenever that screen's entry for the app's current slot
+	 * changes (the app moved between 2D and 3D, or the user picked another
+	 * per-screen 3D mode), before the next `process_atlas`, which then hands
+	 * the DP an atlas laid out as that entry's `tile_columns` x `tile_rows`.
+	 * A DP with this slot set draws that entry whatever the process-wide
+	 * state of its plug-in says, so two screens of one plug-in can show two
+	 * different 3D modes at once.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * DP draws what it always drew for the atlas it is handed. Appended
+	 * after @ref get_eye_positions_at per ADR-020 (append-only within a
+	 * major; no version bump — gated by @ref XRT_DP_HAS_SLOT), announced by
+	 * XRT_DP_METAL_HAS_OUTPUT_ENTRY.
+	 *
+	 * @param xdp         Pointer to self.
+	 * @param mode_index  The entry to draw, in the plug-in's per-monitor numbering.
+	 */
+	void (*set_output_entry)(struct xrt_display_processor_metal *xdp, uint32_t mode_index);
 };
 
 
@@ -561,7 +587,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_background_pr
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, set_present_origin)     == XRT_DP_METAL_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, snap_window_rect)       == XRT_DP_METAL_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_eye_positions_at)   == XRT_DP_METAL_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, set_output_entry)       == XRT_DP_METAL_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 22 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the set_present_origin slot (multi-screen
@@ -592,6 +619,14 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                    
  * additive (ADR-020).
  */
 #define XRT_DP_METAL_HAS_EYE_POSITIONS_AT 1
+
+/*!
+ * Defined when this header carries the set_output_entry slot (ADR-047
+ * Amendment 10, a screen's own rendering-mode entry), so a plug-in built
+ * against an older runtime can #ifdef-guard its implementation. Purely
+ * additive (ADR-020).
+ */
+#define XRT_DP_METAL_HAS_OUTPUT_ENTRY 1
 // clang-format on
 
 /*!
@@ -1029,6 +1064,24 @@ xrt_display_processor_metal_get_eye_positions_at(struct xrt_display_processor_me
 		return xrt_display_processor_metal_get_predicted_eye_positions(xdp, out);
 	}
 	return xdp->get_eye_positions_at(xdp, target_ns, out);
+}
+
+/*!
+ * @copydoc xrt_display_processor_metal::set_output_entry
+ *
+ * Returns false if not supported (absent slot or NULL): the DP then draws what
+ * it always drew for the atlas it is handed.
+ *
+ * @public @memberof xrt_display_processor_metal
+ */
+static inline bool
+xrt_display_processor_metal_set_output_entry(struct xrt_display_processor_metal *xdp, uint32_t mode_index)
+{
+	if (xdp == NULL || !XRT_DP_HAS_SLOT(xdp, set_output_entry) || xdp->set_output_entry == NULL) {
+		return false;
+	}
+	xdp->set_output_entry(xdp, mode_index);
+	return true;
 }
 
 /*!

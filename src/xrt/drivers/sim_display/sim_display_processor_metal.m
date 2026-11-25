@@ -13,6 +13,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_modes.h"
 #include "sim_display_settings.h"
 #include "sim_display_zone_common.h"
 #include "sim_display_scanout_common.h"
@@ -208,6 +209,10 @@ struct sim_display_processor_metal
 	//! the process-wide panel and the pre-segments full-target clear.
 	bool screen_bound;
 	uint64_t screen_monitor_id;
+	//! ADR-047 Amendment 10: the declared entry the runtime told this DP to
+	//! draw (set_output_entry), as a kind; -1 = never told (the process-wide
+	//! output, as before). Two sim screens can then show two 3D modes.
+	int32_t entry_kind;
 	int32_t screen_left, screen_top;   //!< the screen's desktop origin (points)
 	uint32_t screen_px_w, screen_px_h; //!< its native backing px
 	float screen_w_m, screen_h_m;
@@ -276,6 +281,12 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
 	// Single-view input (tile_columns * tile_rows == 1) forces passthrough —
 	// 3D shaders (anaglyph, SBS, blend) need ≥2 views.
 	enum sim_display_output_mode mode = sim_display_output_for_tiles(tile_columns * tile_rows);
+	if (sdp->entry_kind >= 0) {
+		// ADR-047 Amendment 10: this screen's own entry, whatever the
+		// process-wide state says (another vendor may own the head device).
+		mode = tile_columns * tile_rows <= 1 ? SIM_DISPLAY_OUTPUT_PASSTHROUGH
+		                                     : (enum sim_display_output_mode)sdp->entry_kind;
+	}
 	// #817: no phase-sensitive interlace on this backend yet — see the helper.
 	if (sim_interlaced_fallback_to_anaglyph(mode, "Metal")) {
 		mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
@@ -424,6 +435,28 @@ sim_dp_metal_set_present_origin(struct xrt_display_processor_metal *xdp, int32_t
  * displacement from the gesture-start origin to whole periods; y passes
  * through (a vertical lenticular's phase does not depend on y).
  */
+/*!
+ * ADR-047 Amendment 10: draw declared entry @p mode_index of the list
+ * sim_display answers for this screen (get_rendering_modes_for_monitor, the
+ * same list as the head device's). Entry 0 is the 2D entry (passthrough). The
+ * Metal twin of the VK DP's set_output_entry.
+ */
+static void
+sim_dp_metal_set_output_entry(struct xrt_display_processor_metal *xdp, uint32_t mode_index)
+{
+	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
+	const uint32_t n = (uint32_t)(sizeof(sim_display_declared_order) / sizeof(sim_display_declared_order[0]));
+	const int32_t kind =
+	    (int32_t)(mode_index < n ? sim_display_declared_order[mode_index] : SIM_DISPLAY_OUTPUT_PASSTHROUGH);
+	if (kind != sdp->entry_kind) {
+		U_LOG_W("sim_display: DP %p (screen 0x%016llx) draws entry %u ('%s') (ADR-047 Amendment 10)",
+		        (void *)sdp, (unsigned long long)sdp->screen_monitor_id, mode_index,
+		        mode_index == 0 ? "2D"
+		                        : sim_display_kind_desc_get((enum sim_display_output_mode)kind).mode_name);
+	}
+	sdp->entry_kind = kind;
+}
+
 static bool
 sim_dp_metal_snap_window_rect(struct xrt_display_processor_metal *xdp,
                               int32_t origin_x,
@@ -798,6 +831,8 @@ sim_display_processor_metal_create_bound(enum sim_display_output_mode mode,
 	sdp->base.clear_local_zone_mask = sim_dp_metal_clear_local_zone_mask;     // #224 / ADR-027
 	sdp->base.get_scanout_caps = sim_dp_metal_get_scanout_caps;
 	sdp->base.set_present_origin = sim_dp_metal_set_present_origin; // multi-screen (macOS)
+	sdp->base.set_output_entry = sim_dp_metal_set_output_entry;     // ADR-047 Amendment 10
+	sdp->entry_kind = -1;
 	// ADR-050: NULL unless the test double is asked for — sim's Metal
 	// backend has no lens lattice, so by default a drag is atomic but unsnapped.
 	if (debug_get_num_option_sim_display_metal_snap_period() > 1) {

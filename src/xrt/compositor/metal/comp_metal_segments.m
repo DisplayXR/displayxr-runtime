@@ -76,6 +76,9 @@ struct seg_screen_state
 	int mode_sent;                          //!< last 2D/3D mode sent, -1 = none.
 	bool uncovered;                         //!< #2247: the window had wholly left this screen.
 	bool tolerates_resample;
+	//! ADR-047 Amendment 10: the entry last told to @ref dp through
+	//! set_output_entry, plus one (0 = never told).
+	int32_t entry_sent_plus1;
 	id<MTLTexture> crop; //!< retained; the atlas tiles cut down to one segment
 	uint32_t crop_w, crop_h;
 };
@@ -134,6 +137,17 @@ struct comp_metal_segments
 	bool have_logged_table;
 	bool logged_split;
 	struct comp_segment_table logged_table;
+
+	/*!
+	 * ADR-047 Amendment 10: the view size follows the window's screen — the
+	 * covered screens after the dwell, each screen's own table, and the
+	 * effective table the app is told. Written on the weave thread
+	 * (comp_metal_segments_update_view_size) under @ref dp_mutex, read by
+	 * comp_metal_segments_get_effective_table under it.
+	 */
+	struct comp_segments_view_size vs;
+	//! The view size has seen a placed window since the last set_screens.
+	bool have_view_size;
 };
 
 
@@ -204,6 +218,7 @@ dp_release(struct comp_metal_segments *segs, uint32_t i)
 	st->mode_sent = -1;
 	st->uncovered = false;
 	st->tolerates_resample = false;
+	st->entry_sent_plus1 = 0;
 	crop_destroy(st);
 }
 
@@ -242,6 +257,7 @@ dp_create(struct comp_metal_segments *segs, uint32_t i)
 	st->configured = false;
 	st->mode_sent = -1;
 	st->uncovered = false;
+	st->entry_sent_plus1 = 0;
 	// Lifecycle event (hysteresis-gated), not per frame.
 	U_LOG_W(
 	    "segments: created a segment DP for screen 0x%016llx ('%s', plug-in '%s') via "
@@ -293,20 +309,6 @@ blit_ensure(struct comp_metal_segments *segs)
 	return segs->sampler != nil;
 }
 
-//! Round a point edge to drawable px, clamped to [0, max].
-static int32_t
-edge_px(double pt, double scale, uint32_t max)
-{
-	double v = floor(pt * scale + 0.5);
-	if (v < 0.0) {
-		v = 0.0;
-	}
-	if (v > (double)max) {
-		v = (double)max;
-	}
-	return (int32_t)v;
-}
-
 static int32_t
 round_i(double v)
 {
@@ -333,12 +335,11 @@ convert_table(struct comp_metal_segments *segs)
 		// Table unit -> that screen's backing px.
 		const double s_unit = s_scr / segs->tu;
 
-		// Window rect (pt, relative to the window) -> drawable px.
-		const int32_t x0 = edge_px((double)g->window_rect.x, sx, segs->win.drawable_w);
-		const int32_t x1 = edge_px((double)g->window_rect.x + g->window_rect.w, sx, segs->win.drawable_w);
-		const int32_t y0 = edge_px((double)g->window_rect.y, sy, segs->win.drawable_h);
-		const int32_t y1 = edge_px((double)g->window_rect.y + g->window_rect.h, sy, segs->win.drawable_h);
-		p->window_px = (struct comp_seg_rect){x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0)};
+		// Window rect (table units, relative to the window) -> the DRAWABLE's
+		// px (comp_metal_segments_geom.h: never this screen's own scale).
+		p->window_px = comp_metal_seg_window_rect_px(&segs->win, &g->window_rect);
+		const int32_t x0 = p->window_px.x;
+		const int32_t y0 = p->window_px.y;
 
 		// Screen rect (table units, relative to the screen) -> that screen's backing px.
 		const int32_t s0x = round_i((double)g->screen_rect.x * s_unit);
@@ -472,6 +473,7 @@ comp_metal_segments_create(void *mtl_device, void *command_queue)
 	os_mutex_init(&segs->dp_mutex);
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
 	comp_segments_cover_dwell_init(&segs->cover, 0);
+	comp_segments_view_size_init(&segs->vs);
 	segs->mode_index = UINT32_MAX;
 	segs->tu = 1.0;
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
@@ -569,6 +571,10 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
 
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
 	comp_segments_cover_dwell_init(&segs->cover, 0);
+	os_mutex_lock(&segs->dp_mutex);
+	comp_segments_view_size_init(&segs->vs); // new screens: re-read every table
+	segs->have_view_size = false;
+	os_mutex_unlock(&segs->dp_mutex);
 	segs->enabled = false;
 	segs->session_owns = true;
 	segs->screen_count = 0;
@@ -851,24 +857,10 @@ comp_metal_segments_update(struct comp_metal_segments *segs, const struct comp_m
 	segs->sy = (double)win->drawable_h / (double)win->frame_pt.h;
 	segs->tu = win->px_per_pt > 0.0 ? win->px_per_pt : 1.0;
 
-	if (win->px_per_pt > 0.0) {
-		// The service's px frame (#2218 item 6): every screen's point rect at
-		// the window's scale, edges rounded independently (a shared seam stays
-		// shared), lround like the engine's display backing origin.
-		struct comp_segments_screen px[COMP_SEGMENTS_MAX_SCREENS];
-		for (uint32_t i = 0; i < segs->screen_count; i++) {
-			const struct comp_seg_rect *d = &segs->screens[i].desktop;
-			const int32_t x0 = (int32_t)lround((double)d->x * segs->tu);
-			const int32_t y0 = (int32_t)lround((double)d->y * segs->tu);
-			const int32_t x1 = (int32_t)lround((double)(d->x + (int32_t)d->w) * segs->tu);
-			const int32_t y1 = (int32_t)lround((double)(d->y + (int32_t)d->h) * segs->tu);
-			px[i] = segs->screens[i];
-			px[i].desktop = (struct comp_seg_rect){x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0)};
-		}
-		comp_segments_compute(&win->frame_pt, NULL, px, segs->screen_count, &segs->table_pt);
-	} else {
-		comp_segments_compute(&win->frame_pt, NULL, segs->screens, segs->screen_count, &segs->table_pt);
-	}
+	// In points, or the service's px frame (#2218 item 6): every screen's
+	// point rect at the window's scale, edges rounded independently (a shared
+	// seam stays shared), lround like the engine's display backing origin.
+	comp_metal_seg_cut(win, segs->screens, segs->screen_count, &segs->table_pt);
 	// #2247: advance each screen's lens dead band (the hand-off's dwell).
 	(void)comp_segments_cover_dwell_update(&segs->cover, &segs->table_pt, segs->screens, segs->screen_count,
 	                                       os_monotonic_get_ns());
@@ -965,12 +957,20 @@ comp_metal_segments_record(struct comp_metal_segments *segs, const struct comp_m
 	bool weave[COMP_SEGMENTS_MAX] = {0};
 	struct comp_seg_rect tile[COMP_SEGMENTS_MAX];
 	bool have_tile[COMP_SEGMENTS_MAX] = {0};
+	// ADR-047 Amendment 10: each non-primary segment's DP input is laid out
+	// as ITS screen's entry for the app's slot (the primary keeps the
+	// session grid, which is the head device's entry).
+	struct comp_segments_segment_grid grid[COMP_SEGMENTS_MAX];
 	memset(tile, 0, sizeof(tile));
 
 	for (uint32_t k = 0; k < t->count; k++) {
 		const struct comp_segment *g = &t->seg[k];
-		have_tile[k] = comp_segments_tile_rect(&g->window_rect, &canvas, f->view_width, f->view_height, &tile[k]);
 		const uint32_t i = g->screen_index;
+		const struct xrt_rendering_mode *entry =
+		    (g->is_primary || !segs->have_view_size) ? NULL
+		                                             : comp_segments_view_size_entry(&segs->vs, i, f->active_slot);
+		have_tile[k] = comp_metal_seg_crop_plan(&g->window_rect, &canvas, f->view_width, f->view_height,
+		                                        f->tile_columns, f->tile_rows, entry, &tile[k], &grid[k]);
 		st_of[k] = i < segs->screen_count ? &segs->st[i] : NULL;
 		if (g->is_primary) {
 			dp_of[k] = f->primary_dp;
@@ -1009,8 +1009,8 @@ comp_metal_segments_record(struct comp_metal_segments *segs, const struct comp_m
 			if (!weave[k]) {
 				continue;
 			}
-			const uint32_t cw = tile[k].w * f->tile_columns;
-			const uint32_t ch = tile[k].h * f->tile_rows;
+			const uint32_t cw = tile[k].w * grid[k].cols;
+			const uint32_t ch = tile[k].h * grid[k].rows;
 			if (!crop_ensure(segs, st_of[k], cw, ch)) {
 				weave[k] = false; // no input image: flat 2D instead
 				continue;
@@ -1018,23 +1018,25 @@ comp_metal_segments_record(struct comp_metal_segments *segs, const struct comp_m
 			if (blit == nil) {
 				blit = [cmd blitCommandEncoder];
 			}
-			for (uint32_t row = 0; row < f->tile_rows; row++) {
-				for (uint32_t col = 0; col < f->tile_columns; col++) {
-					const NSUInteger sx = col * f->view_width + (NSUInteger)tile[k].x;
-					const NSUInteger sy = row * f->view_height + (NSUInteger)tile[k].y;
-					if (sx + tile[k].w > src.width || sy + tile[k].h > src.height) {
-						continue;
-					}
-					[blit copyFromTexture:src
-					          sourceSlice:0
-					          sourceLevel:0
-					         sourceOrigin:MTLOriginMake(sx, sy, 0)
-					           sourceSize:MTLSizeMake(tile[k].w, tile[k].h, 1)
-					            toTexture:st_of[k]->crop
-					     destinationSlice:0
-					     destinationLevel:0
-					    destinationOrigin:MTLOriginMake(col * tile[k].w, row * tile[k].h, 0)];
+			// Segment tile v takes the session's view v: the first grid[k].views
+			// views, laid out in the segment's own grid (ADR-047 Amendment 10).
+			for (uint32_t v = 0; v < grid[k].views; v++) {
+				uint32_t scol, srow, dcol, drow;
+				comp_segments_view_size_tile_map(&grid[k], f->tile_columns, v, &scol, &srow, &dcol, &drow);
+				const NSUInteger sx = scol * f->view_width + (NSUInteger)tile[k].x;
+				const NSUInteger sy = srow * f->view_height + (NSUInteger)tile[k].y;
+				if (sx + tile[k].w > src.width || sy + tile[k].h > src.height) {
+					continue;
 				}
+				[blit copyFromTexture:src
+				          sourceSlice:0
+				          sourceLevel:0
+				         sourceOrigin:MTLOriginMake(sx, sy, 0)
+				           sourceSize:MTLSizeMake(tile[k].w, tile[k].h, 1)
+				            toTexture:st_of[k]->crop
+				     destinationSlice:0
+				     destinationLevel:0
+				    destinationOrigin:MTLOriginMake(dcol * tile[k].w, drow * tile[k].h, 0)];
 			}
 		}
 		if (blit != nil) {
@@ -1070,6 +1072,18 @@ comp_metal_segments_record(struct comp_metal_segments *segs, const struct comp_m
 					xrt_display_processor_metal_set_present_origin(dp, g->present_origin_x,
 					                                               g->present_origin_y);
 				}
+				// ADR-047 Amendment 10: which of its screen's entries to
+				// draw, on change only (the app moved 2D <-> 3D, or the
+				// user picked another 3D mode for this screen).
+				if (grid[k].entry >= 0 && st->entry_sent_plus1 != grid[k].entry + 1) {
+					st->entry_sent_plus1 = grid[k].entry + 1;
+					if (!xrt_display_processor_metal_set_output_entry(dp, (uint32_t)grid[k].entry)) {
+						U_LOG_I(
+						    "segments: screen 0x%016llx's DP has no set_output_entry slot - it "
+						    "draws its default for a %ux%u atlas",
+						    (unsigned long long)g->screen_id, grid[k].cols, grid[k].rows);
+					}
+				}
 			} else if (f->primary_present_origin && g->screen_1to1 != COMP_SEG_1TO1_NO) {
 				// ADR-050: the primary DP gets the applied origin too, in its
 				// screen's backing px relative to its CGDisplayBounds, so that
@@ -1092,8 +1106,8 @@ comp_metal_segments_record(struct comp_metal_segments *segs, const struct comp_m
 				}
 			}
 			xrt_display_processor_metal_process_atlas(
-			    dp, (__bridge void *)cmd, (__bridge void *)st->crop, tile[k].w, tile[k].h, f->tile_columns,
-			    f->tile_rows, (uint32_t)MTLPixelFormatBGRA8Unorm, (__bridge void *)target, f->target_width,
+			    dp, (__bridge void *)cmd, (__bridge void *)st->crop, tile[k].w, tile[k].h, grid[k].cols,
+			    grid[k].rows, (uint32_t)MTLPixelFormatBGRA8Unorm, (__bridge void *)target, f->target_width,
 			    f->target_height, g->window_rect.x, g->window_rect.y, g->window_rect.w, g->window_rect.h);
 			any_woven = true;
 		}
@@ -1202,6 +1216,61 @@ comp_metal_segments_set_display_mode(struct comp_metal_segments *segs, bool enab
 			xrt_display_processor_metal_request_display_mode(st->dp, want);
 		}
 	}
+}
+
+bool
+comp_metal_segments_update_view_size(struct comp_metal_segments *segs,
+                                     const struct xrt_rendering_mode *head_modes,
+                                     uint32_t head_count,
+                                     uint32_t max_views,
+                                     uint32_t cap_w,
+                                     uint32_t cap_h)
+{
+	// The last update's table: comp_metal_segments_update runs on every weave
+	// of a placed window while enabled, split or not (also zero-copy frames on
+	// the session screen), so the size follows the window back.
+	if (segs == NULL || !segs->enabled || segs->win.drawable_w == 0 || segs->win.drawable_h == 0) {
+		return false;
+	}
+	// Not comp_segments_view_size_update_for_window: it cuts the table from a
+	// desktop rect and takes the window size in the SAME units, but on macOS
+	// the table is cut in points (or the service's px frame) while the size
+	// the effective table is evaluated against is the drawable's backing px
+	// (comp_metal_seg_view_size_step). Computed on the weave thread's own
+	// copy; published under the lock.
+	struct comp_segments_view_size *next = malloc(sizeof(*next));
+	if (next == NULL) {
+		return false;
+	}
+	*next = segs->vs;
+	const bool changed =
+	    comp_metal_seg_view_size_step(next, &segs->win, &segs->table_pt, segs->screens, segs->screen_count,
+	                                  head_modes, head_count, max_views, cap_w, cap_h, os_monotonic_get_ns());
+	os_mutex_lock(&segs->dp_mutex);
+	segs->vs = *next;
+	segs->have_view_size = true;
+	os_mutex_unlock(&segs->dp_mutex);
+	if (changed) {
+		comp_segments_view_size_log_change(&next->eff); // the one wording on every platform
+	}
+	free(next);
+	return changed;
+}
+
+bool
+comp_metal_segments_get_effective_table(struct comp_metal_segments *segs, struct xrt_effective_mode_table *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (segs == NULL) {
+		return false;
+	}
+	os_mutex_lock(&segs->dp_mutex);
+	*out = segs->vs.eff;
+	os_mutex_unlock(&segs->dp_mutex);
+	return out->valid;
 }
 
 const struct comp_segment_table *

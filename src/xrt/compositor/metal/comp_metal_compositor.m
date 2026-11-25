@@ -1566,6 +1566,60 @@ create_atlas_texture(struct comp_metal_compositor *c,
 	return true;
 }
 
+/*!
+ * ADR-047 Amendment 10: the atlas (and its depth) cover the INSTANCE's worst
+ * case — every claimed screen's full list (xrt_system_compositor_info::
+ * atlas_*_pixels, computed by the target layer) — not only the head
+ * display's modes it was sized from at create: a window moved to a larger or
+ * denser screen lays out that screen's table. Grows once, when the screen
+ * list (and with it the instance's worst case) first reaches the compositor;
+ * never shrinks. Commit thread, before the atlas is used this frame.
+ */
+static void
+metal_atlas_fit_instance_worst_case(struct comp_metal_compositor *c)
+{
+	if (c->seg_sys_info == NULL || c->atlas_texture == nil) {
+		return;
+	}
+	const uint32_t want_w = c->seg_sys_info->atlas_width_pixels;
+	const uint32_t want_h = c->seg_sys_info->atlas_height_pixels;
+	if (want_w <= c->atlas_width && want_h <= c->atlas_height) {
+		return;
+	}
+	const uint32_t w = want_w > c->atlas_width ? want_w : c->atlas_width;
+	const uint32_t h = want_h > c->atlas_height ? want_h : c->atlas_height;
+	const uint32_t old_w = c->atlas_width, old_h = c->atlas_height;
+	// Frames in flight retain the textures they encoded (retained-reference
+	// command buffers), so releasing ours here is safe.
+	id<MTLTexture> old_atlas = c->atlas_texture;
+	id<MTLTexture> old_srgb = c->atlas_srgb_view;
+	id<MTLTexture> old_depth = c->depth_texture;
+	c->atlas_texture = nil;
+	c->atlas_srgb_view = nil;
+	c->depth_texture = nil;
+	if (!create_atlas_texture(c, w, h, c->view_width, c->view_height)) {
+		// Keep the old allocation rather than none.
+		[c->atlas_texture release];
+		[c->atlas_srgb_view release];
+		[c->depth_texture release];
+		c->atlas_texture = old_atlas;
+		c->atlas_srgb_view = old_srgb;
+		c->depth_texture = old_depth;
+		c->atlas_width = old_w;
+		c->atlas_height = old_h;
+		U_LOG_E("view size: could not grow the atlas to the instance's worst case %ux%u - kept %ux%u "
+		        "(ADR-047 Amendment 10)",
+		        w, h, old_w, old_h);
+		return;
+	}
+	[old_srgb release]; // a view: released before the atlas it aliases
+	[old_atlas release];
+	[old_depth release];
+	U_LOG_W("view size: the atlas grew from %ux%u to the instance's worst case %ux%u (every claimed screen, "
+	        "ADR-047 Amendment 10)",
+	        old_w, old_h, w, h);
+}
+
 /*
  *
  * Window management
@@ -5344,6 +5398,26 @@ metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync
 			frame_mode = &c->xdev->rendering_modes[idx];
 		}
 	}
+	/*
+	 * ADR-047 Amendment 10: the view size follows the window's screen. When
+	 * the window is on (or across) other screens, the atlas is laid out and
+	 * sized from the table its app was told (the effective table) - the
+	 * session's tiles and view scale are the head screen's only while the
+	 * window is on it. The lens state stays the app's (its slot's): only the
+	 * geometry is overlaid.
+	 */
+	struct xrt_rendering_mode frame_mode_eff;
+	if (frame_mode != NULL && c->segments != NULL && !c->legacy_app_tile_scaling) {
+		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		struct xrt_effective_mode_table eff;
+		if (comp_metal_segments_get_effective_table(c->segments, &eff) &&
+		    comp_segments_view_size_overlay_mode(frame_mode, &eff, idx, &frame_mode_eff)) {
+			frame_mode = &frame_mode_eff;
+		}
+	}
+	// The instance's worst case (every claimed screen, ADR-047 Amendment 10)
+	// may exceed the head display's, which sized the atlas at create.
+	metal_atlas_fit_instance_worst_case(c);
 
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
 	// from the frame's active mode.
@@ -6527,6 +6601,19 @@ metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync
 				seg_split = comp_metal_segments_update(c->segments, &seg_win, mode_index);
 				// Every segment DP follows the session's 2D/3D mode, like the primary.
 				comp_metal_segments_set_display_mode(c->segments, c->hardware_display_3d);
+				// ADR-047 Amendment 10: the view size follows the window's
+				// screen. Runs on every weave with a placed window - also the
+				// ones that do not split (zero-copy on the session screen) - so
+				// the size follows the window back. Evaluated against the
+				// drawable in backing px (comp_metal_segments_geom.h). Legacy
+				// apps never see the table (their size is the compromise).
+				if (!c->legacy_app_tile_scaling && c->xdev != NULL) {
+					const uint32_t cap_w = c->seg_sys_info != NULL ? c->seg_sys_info->atlas_width_pixels : 0;
+					const uint32_t cap_h = c->seg_sys_info != NULL ? c->seg_sys_info->atlas_height_pixels : 0;
+					(void)comp_metal_segments_update_view_size(c->segments, c->xdev->rendering_modes,
+					                                           c->xdev->rendering_mode_count,
+					                                           c->mode_fill_views, cap_w, cap_h);
+				}
 			}
 		}
 
@@ -6539,6 +6626,11 @@ metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync
 			memset(&m, 0, sizeof(m));
 			if (seg_split) {
 				(void)comp_metal_segments_get_metrics(c->segments, c->display_processor != NULL, &m);
+			}
+			// ADR-047 Amendment 10: the table the window's app is told
+			// (invalid on the session screen: the head's table stands).
+			if (!c->legacy_app_tile_scaling) {
+				(void)comp_metal_segments_get_effective_table(c->segments, &m.table);
 			}
 			os_mutex_lock(&c->seg_pub_mutex);
 			m.generation = c->seg_pub.generation;
@@ -6566,6 +6658,9 @@ metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync
 			sf.transparent_background = c->transparent_background;
 			sf.primary_dp = c->display_processor;
 			sf.primary_present_origin = c->placement_frame_valid;
+			sf.active_slot = (c->xdev != NULL && c->xdev->hmd != NULL)
+			                     ? c->xdev->hmd->active_rendering_mode_index
+			                     : 0;
 			comp_metal_segments_record(c->segments, &sf);
 		} else {
 		// Runtime-owned placement (ADR-050): the DP is told the APPLIED
@@ -7894,7 +7989,11 @@ comp_metal_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_
 		}
 	}
 	os_mutex_unlock(&c->seg_pub_mutex);
-	return out->count > 0;
+	// ADR-047 Amendment 10: a valid effective table is an answer too - the
+	// window wholly back on the session screen keeps the covered screens'
+	// table for the dwell, and the app must be told the table the atlas is
+	// laid out from.
+	return out->count > 0 || out->table.valid;
 }
 
 void

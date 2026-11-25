@@ -123,6 +123,7 @@ set(tests
     tests_aux_tracking_any
     tests_comp_rear_budget
     tests_comp_segments
+    tests_comp_metal_segments_geom
     tests_comp_texture_target
     tests_comp_texture_target_screens
     tests_comp_weave_screens
@@ -1655,6 +1656,11 @@ target_include_directories(tests_u_screen_modes PRIVATE ${PROJECT_SOURCE_DIR}/sr
 target_sources(tests_u_screen_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
 target_include_directories(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_link_libraries(tests_comp_segments PRIVATE xrt-interfaces aux_util)
+# ADR-047 Amendment 10 on macOS: the in-process Metal compositor's segment
+# geometry on a 2x + 1x desktop (comp_metal_segments_geom.h, header-only, no Metal).
+target_sources(tests_comp_metal_segments_geom PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
+target_include_directories(tests_comp_metal_segments_geom PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_comp_metal_segments_geom PRIVATE xrt-interfaces aux_util)
 
 # #2370: the windowless D3D11 DP rule shared by the native texture tier and the
 # hub's client-presents strategy (header-only).

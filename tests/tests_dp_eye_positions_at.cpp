@@ -73,6 +73,8 @@ static_assert(offsetof(xrt_display_processor_gl, set_output_entry) + sizeof(void
 static_assert(offsetof(xrt_display_processor_metal, get_eye_positions_at) ==
               offsetof(xrt_display_processor_metal, snap_window_rect) + sizeof(void *));
 static_assert(offsetof(xrt_display_processor_metal, get_eye_positions_at) + sizeof(void *) ==
+              offsetof(xrt_display_processor_metal, set_output_entry)); // ADR-047 Amendment 10 appended it
+static_assert(offsetof(xrt_display_processor_metal, set_output_entry) + sizeof(void *) ==
               sizeof(xrt_display_processor_metal));
 // Vulkan: on the VARIANT (the base is embedded by value; a base append would
 // move every variant slot), after set_weave_sync.
