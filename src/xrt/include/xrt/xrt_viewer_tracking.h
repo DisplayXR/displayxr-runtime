@@ -53,13 +53,35 @@ enum xrt_viewer_source
  */
 #define XRT_VIEWER_SCREEN_PRIMARY ((uint64_t)0)
 
+/*!
+ * The rendering mode a view request is made in (ADR-066 Part B): a screen's
+ * viewer-tracking setting `3d` routes the views to a provider only in the 3D
+ * slot, `always` in both. UNKNOWN reads as 3D (a caller that cannot say).
+ */
+enum xrt_viewer_mode
+{
+	XRT_VIEWER_MODE_UNKNOWN = 0,
+	XRT_VIEWER_MODE_2D = 1, //!< the 2D slot (one view, `hardware_display_3d` false)
+	XRT_VIEWER_MODE_3D = 2, //!< the 3D slot
+};
+
+//! Which modes of a screen a viewer-tracking provider drives (@ref xrt_viewer_tracking::get_tracked_modes).
+struct xrt_viewer_tracked_modes
+{
+	bool provider;   //!< a provider serves this screen at all (false: keep the display's own per-mode flags)
+	bool tracked_2d; //!< the 2D slot's views follow the provider
+	bool tracked_3d; //!< the 3D slot's views follow the provider
+};
+
 struct xrt_viewer_tracking
 {
 	/*!
 	 * The source the arbitration picked for @p screen_id
-	 * (@ref XRT_VIEWER_SCREEN_PRIMARY or a monitor id). The primary's is
-	 * static per instance; another screen's follows the display topology
-	 * (re-evaluated on hotplug). A screen the arbitration does not know reads
+	 * (@ref XRT_VIEWER_SCREEN_PRIMARY or a monitor id), in any mode. Every
+	 * screen follows the display topology (re-evaluated on hotplug) and its
+	 * per-screen viewer-tracking setting (ADR-066 Part B, re-evaluated when the
+	 * service re-reads the store); the primary keeps the instance's decision
+	 * until its setting moves. A screen the arbitration does not know reads
 	 * as DP: the caller keeps the display processor's answer.
 	 */
 	enum xrt_viewer_source (*get_source)(struct xrt_viewer_tracking *vt, uint64_t screen_id);
@@ -77,12 +99,54 @@ struct xrt_viewer_tracking
 	                    uint64_t screen_id,
 	                    int64_t target_ns,
 	                    struct xrt_eye_positions *out);
+
+	/*!
+	 * @ref get_source for a request made in @p mode (ADR-066 Part B): a screen
+	 * routed to a provider whose viewer-tracking setting is `3d` answers
+	 * PROVIDER only for the 3D slot (NOMINAL in 2D: the views keep the
+	 * display processor's answer and no viewer is requested, so the provider
+	 * can idle-stop and close its camera). Optional (NULL = @ref get_source).
+	 */
+	enum xrt_viewer_source (*get_source_mode)(struct xrt_viewer_tracking *vt,
+	                                          uint64_t screen_id,
+	                                          enum xrt_viewer_mode mode);
+
+	/*!
+	 * Which modes of @p screen_id a provider drives: the seam the rendering
+	 * mode code reads to set each slot's tracked flag (ADR-066 Part B). False
+	 * (and @p out all false) when the screen is unknown. Optional.
+	 */
+	bool (*get_tracked_modes)(struct xrt_viewer_tracking *vt,
+	                          uint64_t screen_id,
+	                          struct xrt_viewer_tracked_modes *out);
 };
 
 static inline enum xrt_viewer_source
 xrt_viewer_tracking_get_source(struct xrt_viewer_tracking *vt, uint64_t screen_id)
 {
 	return vt != NULL && vt->get_source != NULL ? vt->get_source(vt, screen_id) : XRT_VIEWER_SOURCE_DP;
+}
+
+static inline enum xrt_viewer_source
+xrt_viewer_tracking_get_source_mode(struct xrt_viewer_tracking *vt, uint64_t screen_id, enum xrt_viewer_mode mode)
+{
+	if (vt != NULL && vt->get_source_mode != NULL) {
+		return vt->get_source_mode(vt, screen_id, mode);
+	}
+	return xrt_viewer_tracking_get_source(vt, screen_id);
+}
+
+//! @ref xrt_viewer_tracking::get_tracked_modes; false (all false) when @p vt has no answer.
+static inline bool
+xrt_viewer_tracking_get_tracked_modes(struct xrt_viewer_tracking *vt,
+                                      uint64_t screen_id,
+                                      struct xrt_viewer_tracked_modes *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	out->provider = out->tracked_2d = out->tracked_3d = false;
+	return vt != NULL && vt->get_tracked_modes != NULL && vt->get_tracked_modes(vt, screen_id, out);
 }
 
 static inline bool
@@ -146,6 +210,27 @@ xrt_viewer_tracking_splice(struct xrt_eye_positions *dp, bool have_dp, const str
  * @p inout untouched and return false. @p vt may be NULL (no arbitration in
  * this process).
  */
+static inline bool
+xrt_viewer_tracking_override_eyes_mode(struct xrt_viewer_tracking *vt,
+                                       uint64_t screen_id,
+                                       enum xrt_viewer_mode mode,
+                                       int64_t target_ns,
+                                       struct xrt_eye_positions *inout,
+                                       bool have_dp)
+{
+	if (inout == NULL || xrt_viewer_tracking_get_source_mode(vt, screen_id, mode) != XRT_VIEWER_SOURCE_PROVIDER) {
+		return false;
+	}
+	struct xrt_eye_positions pe;
+	pe.count = 0;
+	if (!xrt_viewer_tracking_get_eyes_at(vt, screen_id, target_ns, &pe) || pe.count < 2) {
+		return false;
+	}
+	xrt_viewer_tracking_splice(inout, have_dp, &pe);
+	return true;
+}
+
+//! @ref xrt_viewer_tracking_override_eyes_mode for a caller that cannot say the mode (read as 3D).
 static inline bool
 xrt_viewer_tracking_override_eyes(struct xrt_viewer_tracking *vt,
                                   uint64_t screen_id,

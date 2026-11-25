@@ -185,6 +185,76 @@ TEST_CASE("sim_tracking SOURCE=webcam: provider ABI end to end on a fake camera"
 		CHECK((info.tracks & XRT_TRACKING_TRACKS_CAMERA_SPACE) == 0);
 	}
 
+	SECTION("ADR-066 Part B: availability and probe enumerate only — the camera is never opened")
+	{
+		// Wrap the fake backend: count list_modes / open (either would touch a real device node).
+		static std::atomic<int> s_touches{0};
+		static u_stereo_uvc_backend s_inner;
+		s_inner = backend;
+		s_touches = 0;
+		u_stereo_uvc_backend counting = backend;
+		counting.list_modes = [](void *ctx, const char *id, u_stereo_uvc_mode *out, uint32_t cap) -> uint32_t {
+			s_touches++;
+			return s_inner.list_modes(ctx, id, out, cap);
+		};
+		counting.open = [](void *ctx, const char *id, const u_stereo_uvc_mode *mode, uint32_t w, uint32_t h,
+		                   void **out_handle) -> bool {
+			s_touches++;
+			return s_inner.open(ctx, id, mode, w, h, out_handle);
+		};
+		fake_estimator est{};
+		est.base.name = "fake";
+		est.base.estimate = fake_estimate;
+		est.base.destroy = fake_destroy;
+		sim_tracking_webcam_set_test_overrides(&counting, &est.base);
+
+		REQUIRE(XRT_TRACKING_PLUGIN_IFACE_HAS(iface, get_availability));
+		xrt_tracking_availability a{};
+		a.struct_size = sizeof(a);
+
+		// The legacy opt-in: available and serving every screen by default.
+		REQUIRE(iface->get_availability(&a) == XRT_SUCCESS);
+		CHECK(a.available == 1);
+		CHECK((a.flags & XRT_TRACKING_AVAILABILITY_SERVE_BY_DEFAULT) != 0);
+		CHECK(std::string(a.detail).find("webcam") == 0);
+
+		// No opt-in, SOURCE unset: the webcam source (a screen asking wants a real camera),
+		// still available, but serving only screens whose setting asks — and probe says yes.
+		g_settings.erase("ENABLE");
+		g_settings.erase("SOURCE");
+		a = {};
+		a.struct_size = sizeof(a);
+		REQUIRE(iface->get_availability(&a) == XRT_SUCCESS);
+		CHECK(a.available == 1);
+		CHECK((a.flags & XRT_TRACKING_AVAILABILITY_SERVE_BY_DEFAULT) == 0);
+		xrt_tracking_plugin_instance *inst = nullptr;
+		CHECK(iface->probe(&inst) == XRT_SUCCESS);
+
+		// No estimator: unavailable with the reason, still without touching the camera.
+		sim_tracking_webcam_set_test_overrides(&counting, nullptr);
+		g_settings["WEBCAM_ESTIMATOR"] = "none";
+		a = {};
+		a.struct_size = sizeof(a);
+		REQUIRE(iface->get_availability(&a) == XRT_SUCCESS);
+		CHECK(a.available == 0);
+		CHECK(a.reason == XRT_TRACKING_UNAVAILABLE_NO_ESTIMATOR);
+		CHECK(std::string(a.detail).find("no face estimator in this build") == 0);
+		CHECK(iface->probe(&inst) == XRT_ERROR_PROBER_NOT_SUPPORTED);
+
+		// No matching camera.
+		g_settings.erase("WEBCAM_ESTIMATOR");
+		sim_tracking_webcam_set_test_overrides(&counting, &est.base);
+		g_settings["WEBCAM_DEVICE"] = "no-such-camera";
+		a = {};
+		a.struct_size = sizeof(a);
+		REQUIRE(iface->get_availability(&a) == XRT_SUCCESS);
+		CHECK(a.available == 0);
+		CHECK(a.reason == XRT_TRACKING_UNAVAILABLE_NO_CAMERA);
+
+		CHECK(s_touches == 0); // enumeration only: no mode listing, no open (no LED)
+		sim_tracking_webcam_set_test_overrides(nullptr, nullptr);
+	}
+
 	SECTION("with an estimator: probe, describe, track the head, report the camera block, lose it, stop")
 	{
 		sim_webcam_config cfg;

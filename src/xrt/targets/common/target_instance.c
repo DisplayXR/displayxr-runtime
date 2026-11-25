@@ -607,6 +607,9 @@ static bool
 publish_screens_if_hotplug_info_locked(const struct xrt_system_compositor_info *info);
 
 static void
+viewer_settings_recheck_locked(const struct xrt_system_compositor_info *info);
+
+static void
 refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 {
 	refresh_display_processors_impl(info, false);
@@ -672,6 +675,7 @@ refresh_display_processors_impl(struct xrt_system_compositor_info *info, bool wo
 		// The scalars were just re-filled from the active plug-in.
 		apply_default_screen_preference(info);
 		if (locked) {
+			viewer_settings_recheck_locked(info);
 			os_mutex_unlock(&g_display_info_mutex);
 		}
 		return;
@@ -692,6 +696,7 @@ refresh_display_processors_impl(struct xrt_system_compositor_info *info, bool wo
 		(void)publish_screens_if_hotplug_info_locked(info);
 	}
 	if (locked) {
+		viewer_settings_recheck_locked(info);
 		os_mutex_unlock(&g_display_info_mutex);
 	}
 }
@@ -864,6 +869,23 @@ publish_screens_if_hotplug_info_locked(const struct xrt_system_compositor_info *
 }
 
 /*!
+ * ADR-066 Part B: a per-screen viewer-tracking setting may have been written
+ * since the last arbitration (`tracking set --screen`, whose DIAG re-probe
+ * reloaded the stores before this refresh): re-run the per-screen
+ * arbitration on the published table, so running sessions' views follow
+ * within a frame. Cheap when the stores were not reloaded. Caller holds
+ * g_display_info_mutex.
+ */
+static void
+viewer_settings_recheck_locked(const struct xrt_system_compositor_info *info)
+{
+	if (info == NULL || info != g_hotplug_info) {
+		return;
+	}
+	(void)target_viewer_tracking_settings_changed(&g_published_screens, &info->dp_registry);
+}
+
+/*!
  * Installed on @ref xrt_system_compositor_info::refresh_display_processors_world:
  * the service's display re-probe worker calls it for world events (Windows
  * WM_DISPLAYCHANGE / WM_DEVICECHANGE, desktop-Linux DRM hotplug, the fallback
@@ -945,6 +967,9 @@ display_hotplug_begin(struct xrt_system_compositor *xsysc)
 	os_mutex_lock(&g_display_info_mutex);
 	g_hotplug_info = &xsysc->info;
 	(void)publish_screens_locked(&xsysc->info, true);
+	// ADR-066 Part B: the primary's viewer-tracking setting is known now (its
+	// screen key): recompose its advertisement before any session reads it.
+	target_viewer_tracking_recompose(&xsysc->info, g_display_info_head);
 	os_mutex_unlock(&g_display_info_mutex);
 
 	if (g_hotplug == NULL && xsysc->destroy == t_syscomp_destroy_hook) {

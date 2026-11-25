@@ -217,10 +217,78 @@ enum u_setting_write_result
 enum u_setting_write_result
 u_setting_machine_set_preferred_plugin_for_screen(const char *key, const char *plugin_id);
 
+/*
+ *
+ * Per-screen viewer-tracking setting (ADR-066 Part B).
+ *
+ * The same chain and the same screen keys as the display-processor preference
+ * above, in its own stores:
+ *
+ *   1. environment   DXR_VIEWER_TRACKING_PER_SCREEN="<key>=<off|3d|always>;..."
+ *   2. per-user file "viewer_tracking_per_screen": { "<key>": "off" | "3d" | "always" }
+ *                    (what `displayxr-cli tracking set --screen` / the dashboard write)
+ *   3. machine       HKLM\Software\DisplayXR\ViewerTracking\Screens, value "<key>"
+ *                    (REG_SZ, admin; Windows only)
+ *
+ * `on` is read as `3d`. An unknown value is "not set". Cached and reloaded with
+ * the display-processor preference (@ref u_setting_per_screen_reload).
+ *
+ */
+
+//! Environment variable of the per-screen viewer-tracking setting (tier 1).
+#define U_SETTING_VIEWER_TRACKING_ENV "DXR_VIEWER_TRACKING_PER_SCREEN"
+//! Object name in the per-user settings file (tier 2).
+#define U_SETTING_VIEWER_TRACKING_JSON_KEY "viewer_tracking_per_screen"
+
+//! One screen's viewer-tracking setting.
+enum u_setting_viewer_tracking
+{
+	U_SETTING_VIEWER_TRACKING_UNSET = 0,  //!< no per-screen value: the default (off, unless a provider opts in)
+	U_SETTING_VIEWER_TRACKING_OFF = 1,    //!< never: the camera stays closed for this screen
+	U_SETTING_VIEWER_TRACKING_3D = 2,     //!< tracked only while the app's mode is the 3D slot
+	U_SETTING_VIEWER_TRACKING_ALWAYS = 3, //!< tracked in 2D and 3D (head-coupled look-around in 2D too)
+};
+
+//! "off" / "3d" (alias "on") / "always"; anything else is UNSET. Pure.
+enum u_setting_viewer_tracking
+u_setting_viewer_tracking_parse(const char *value);
+
+//! "off" / "3d" / "always" / "default".
+const char *
+u_setting_viewer_tracking_str(enum u_setting_viewer_tracking v);
+
+//! The setting for the screen @p key through the chain; UNSET with @p out_source DEFAULT when none.
+enum u_setting_viewer_tracking
+u_setting_get_viewer_tracking_for_screen(const char *key, enum u_setting_source *out_source);
+
+//! Set (UNSET removes) the per-user value for @p key. False on refusal or I/O failure.
+bool
+u_setting_user_set_viewer_tracking_for_screen(const char *key, enum u_setting_viewer_tracking value);
+
+//! Remove every per-user viewer-tracking value. Absent is success.
+bool
+u_setting_user_clear_viewer_tracking_per_screen(void);
+
+//! The machine-wide value for @p key (Windows HKLM; admin). @p key NULL removes every one.
+enum u_setting_write_result
+u_setting_machine_set_viewer_tracking_for_screen(const char *key, enum u_setting_viewer_tracking value);
+
+/*!
+ * A counter bumped every time the per-screen stores are reloaded: a process
+ * that keeps derived state (the viewer arbitration) re-derives it when the
+ * value moved.
+ */
+uint64_t
+u_setting_per_screen_generation(void);
+
 /*!
  * @name Pure helpers behind the chain (unit-tested)
  * @{
  */
+//! Look @p key up in the `viewer_tracking_per_screen` object of a settings-file text.
+bool
+u_setting_viewer_tracking_json_lookup(const char *json_text, const char *key, char *buf, size_t cap);
+
 //! Look @p key up in a `"<key>=<id>;..."` spec (whitespace trimmed, key case-insensitive).
 bool
 u_setting_per_screen_env_lookup(const char *spec, const char *key, char *buf, size_t cap);

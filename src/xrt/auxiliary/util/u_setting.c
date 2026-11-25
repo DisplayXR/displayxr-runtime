@@ -123,9 +123,10 @@ struct entry
 
 static struct entry s_entries[MANAGED_COUNT];
 static char s_written[32];
+//! Drop the per-screen map caches (bottom of this file). Caller holds the lock.
+static void
+screen_maps_invalidate_locked(void);
 static bool s_loaded = false;
-//! The per-screen preference cache (bottom of this file) is loaded.
-static bool s_screen_loaded;
 
 #ifdef XRT_OS_WINDOWS
 static CRITICAL_SECTION s_lock;
@@ -622,13 +623,19 @@ u_setting_user_clear_all(void)
 	}
 	// The per-screen display-processor preferences are a display assignment,
 	// not a tuning option: `perf reset` keeps them (`dp reset --screen all`
-	// clears them).
+	// clears them). The per-screen viewer-tracking settings likewise
+	// (`tracking reset --screen all` clears them).
 	cJSON *old = user_load_json();
 	cJSON *screens =
 	    old != NULL ? cJSON_DetachItemFromObjectCaseSensitive(old, U_SETTING_PER_SCREEN_JSON_KEY) : NULL;
+	cJSON *tracking =
+	    old != NULL ? cJSON_DetachItemFromObjectCaseSensitive(old, U_SETTING_VIEWER_TRACKING_JSON_KEY) : NULL;
 	cJSON_Delete(old);
 	if (screens != NULL) {
 		cJSON_AddItemToObject(root, U_SETTING_PER_SCREEN_JSON_KEY, screens);
+	}
+	if (tracking != NULL) {
+		cJSON_AddItemToObject(root, U_SETTING_VIEWER_TRACKING_JSON_KEY, tracking);
 	}
 	bool ok = user_save_json(root);
 	cJSON_Delete(root);
@@ -684,23 +691,24 @@ u_setting_reload(void)
 {
 	lock();
 	s_loaded = false;
-	s_screen_loaded = false;
+	screen_maps_invalidate_locked();
 	unlock();
 }
 
 
 /*
  *
- * Per-screen display-processor preference (display dashboard phase 7).
+ * Per-screen maps (display dashboard phase 7, ADR-066 Part B).
+ *
+ * Two maps of the same shape, each `<screen key> -> <string>` through one
+ * chain (environment > per-user file > machine):
+ *  - the display-processor preference (`dp use --screen`);
+ *  - the viewer-tracking setting (`tracking set --screen`).
  *
  */
 
 #define SCREEN_PREF_MAX 16
 #define SCREEN_ENV_MAX 1024
-
-#ifdef XRT_OS_WINDOWS
-#define SCREEN_MACHINE_KEY_PATH L"Software\\DisplayXR\\DisplayProcessors\\PreferredPlugin"
-#endif
 
 struct screen_pref
 {
@@ -708,10 +716,49 @@ struct screen_pref
 	char id[SETTING_VALUE_MAX];
 };
 
-static struct screen_pref s_screen_user[SCREEN_PREF_MAX];
-static uint32_t s_screen_user_count = 0;
-static struct screen_pref s_screen_machine[SCREEN_PREF_MAX];
-static uint32_t s_screen_machine_count = 0;
+//! One per-screen map: its three stores and its cache.
+struct screen_map
+{
+	const char *env;      //!< tier 1
+	const char *json_key; //!< tier 2: the object in the per-user settings file
+#ifdef XRT_OS_WINDOWS
+	const wchar_t *machine_path; //!< tier 3: HKLM subkey, one REG_SZ value per screen key
+#endif
+	bool loaded;
+	struct screen_pref user[SCREEN_PREF_MAX];
+	uint32_t user_count;
+	struct screen_pref machine[SCREEN_PREF_MAX];
+	uint32_t machine_count;
+};
+
+static struct screen_map s_map_dp = {
+    .env = U_SETTING_PER_SCREEN_ENV,
+    .json_key = U_SETTING_PER_SCREEN_JSON_KEY,
+#ifdef XRT_OS_WINDOWS
+    .machine_path = L"Software\\DisplayXR\\DisplayProcessors\\PreferredPlugin",
+#endif
+};
+
+static struct screen_map s_map_vt = {
+    .env = U_SETTING_VIEWER_TRACKING_ENV,
+    .json_key = U_SETTING_VIEWER_TRACKING_JSON_KEY,
+#ifdef XRT_OS_WINDOWS
+    // Not under TrackingProviders: every subkey there is a provider row.
+    .machine_path = L"Software\\DisplayXR\\ViewerTracking\\Screens",
+#endif
+};
+
+//! Bumped by every reload of the per-screen stores (a long-lived process re-reads them).
+static uint64_t s_screen_generation = 1;
+
+//! Caller holds the lock.
+static void
+screen_maps_invalidate_locked(void)
+{
+	s_map_dp.loaded = false;
+	s_map_vt.loaded = false;
+	s_screen_generation++;
+}
 
 static bool
 str_ieq(const char *a, const char *b)
@@ -801,14 +848,14 @@ u_setting_per_screen_env_lookup(const char *spec, const char *key, char *buf, si
 	return false;
 }
 
-//! The `preferred_plugin_per_screen` object of a parsed settings root, or NULL.
+//! The @p json_key object of a parsed settings root, or NULL.
 static const cJSON *
-screen_object(const cJSON *root)
+screen_object_named(const cJSON *root, const char *json_key)
 {
 	if (root == NULL || !cJSON_IsObject(root)) {
 		return NULL;
 	}
-	const cJSON *o = cJSON_GetObjectItemCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY);
+	const cJSON *o = cJSON_GetObjectItemCaseSensitive(root, json_key);
 	return cJSON_IsObject(o) ? o : NULL;
 }
 
@@ -830,16 +877,28 @@ screen_object_lookup(const cJSON *obj, const char *key, char *buf, size_t cap)
 	return false;
 }
 
-bool
-u_setting_per_screen_json_lookup(const char *json_text, const char *key, char *buf, size_t cap)
+static bool
+json_lookup_named(const char *json_text, const char *json_key, const char *key, char *buf, size_t cap)
 {
 	if (json_text == NULL || key == NULL || key[0] == '\0' || buf == NULL || cap == 0) {
 		return false;
 	}
 	cJSON *root = cJSON_Parse(json_text);
-	const bool ok = screen_object_lookup(screen_object(root), key, buf, cap);
+	const bool ok = screen_object_lookup(screen_object_named(root, json_key), key, buf, cap);
 	cJSON_Delete(root);
 	return ok;
+}
+
+bool
+u_setting_per_screen_json_lookup(const char *json_text, const char *key, char *buf, size_t cap)
+{
+	return json_lookup_named(json_text, U_SETTING_PER_SCREEN_JSON_KEY, key, buf, cap);
+}
+
+bool
+u_setting_viewer_tracking_json_lookup(const char *json_text, const char *key, char *buf, size_t cap)
+{
+	return json_lookup_named(json_text, U_SETTING_VIEWER_TRACKING_JSON_KEY, key, buf, cap);
 }
 
 const char *
@@ -872,17 +931,49 @@ u_setting_per_screen_resolve(const char *key,
 	return ret;
 }
 
+enum u_setting_viewer_tracking
+u_setting_viewer_tracking_parse(const char *value)
+{
+	if (value == NULL) {
+		return U_SETTING_VIEWER_TRACKING_UNSET;
+	}
+	char v[16];
+	copy_trim(v, sizeof(v), value, value + strlen(value));
+	if (str_ieq(v, "off") || str_ieq(v, "0") || str_ieq(v, "false") || str_ieq(v, "no")) {
+		return U_SETTING_VIEWER_TRACKING_OFF;
+	}
+	// "on" is an alias of "3d" (the first spelling of the toggle).
+	if (str_ieq(v, "3d") || str_ieq(v, "on") || str_ieq(v, "1") || str_ieq(v, "true") || str_ieq(v, "yes")) {
+		return U_SETTING_VIEWER_TRACKING_3D;
+	}
+	if (str_ieq(v, "always") || str_ieq(v, "2d3d") || str_ieq(v, "all")) {
+		return U_SETTING_VIEWER_TRACKING_ALWAYS;
+	}
+	return U_SETTING_VIEWER_TRACKING_UNSET;
+}
+
+const char *
+u_setting_viewer_tracking_str(enum u_setting_viewer_tracking v)
+{
+	switch (v) {
+	case U_SETTING_VIEWER_TRACKING_OFF: return "off";
+	case U_SETTING_VIEWER_TRACKING_3D: return "3d";
+	case U_SETTING_VIEWER_TRACKING_ALWAYS: return "always";
+	case U_SETTING_VIEWER_TRACKING_UNSET:
+	default: return "default";
+	}
+}
+
 #ifdef XRT_OS_WINDOWS
-//! Every value under the machine key, into @ref s_screen_machine. Caller holds the lock.
+//! Every value under @p m's machine key. Caller holds the lock.
 static void
-screen_machine_load_locked(void)
+screen_machine_load_locked(struct screen_map *m)
 {
 	HKEY hk = NULL;
-	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, SCREEN_MACHINE_KEY_PATH, 0, KEY_READ | KEY_WOW64_64KEY, &hk) !=
-	    ERROR_SUCCESS) {
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, m->machine_path, 0, KEY_READ | KEY_WOW64_64KEY, &hk) != ERROR_SUCCESS) {
 		return;
 	}
-	for (DWORD i = 0; s_screen_machine_count < SCREEN_PREF_MAX; i++) {
+	for (DWORD i = 0; m->machine_count < SCREEN_PREF_MAX; i++) {
 		wchar_t wname[U_SETTING_SCREEN_KEY_MAX];
 		wchar_t wval[SETTING_VALUE_MAX];
 		DWORD name_len = (DWORD)(sizeof(wname) / sizeof(wname[0]));
@@ -896,13 +987,13 @@ screen_machine_load_locked(void)
 			continue; // too long, or not a string: not set
 		}
 		wval[val_bytes / sizeof(wchar_t)] = L'\0';
-		struct screen_pref *e = &s_screen_machine[s_screen_machine_count];
+		struct screen_pref *e = &m->machine[m->machine_count];
 		if (WideCharToMultiByte(CP_UTF8, 0, wname, -1, e->key, (int)sizeof(e->key), NULL, NULL) <= 0 ||
 		    WideCharToMultiByte(CP_UTF8, 0, wval, -1, e->id, (int)sizeof(e->id), NULL, NULL) <= 0 ||
 		    e->key[0] == '\0' || e->id[0] == '\0') {
 			continue;
 		}
-		s_screen_machine_count++;
+		m->machine_count++;
 	}
 	RegCloseKey(hk);
 }
@@ -910,31 +1001,31 @@ screen_machine_load_locked(void)
 
 //! Caller holds the lock.
 static void
-screen_load_locked(void)
+screen_load_locked(struct screen_map *m)
 {
-	if (s_screen_loaded) {
+	if (m->loaded) {
 		return;
 	}
-	s_screen_loaded = true;
-	memset(s_screen_user, 0, sizeof(s_screen_user));
-	memset(s_screen_machine, 0, sizeof(s_screen_machine));
-	s_screen_user_count = 0;
-	s_screen_machine_count = 0;
+	m->loaded = true;
+	memset(m->user, 0, sizeof(m->user));
+	memset(m->machine, 0, sizeof(m->machine));
+	m->user_count = 0;
+	m->machine_count = 0;
 
 	cJSON *root = user_load_json();
-	const cJSON *obj = screen_object(root);
+	const cJSON *obj = screen_object_named(root, m->json_key);
 	const cJSON *it = NULL;
 	if (obj != NULL) {
 		cJSON_ArrayForEach(it, obj)
 		{
-			if (s_screen_user_count >= SCREEN_PREF_MAX) {
+			if (m->user_count >= SCREEN_PREF_MAX) {
 				break;
 			}
 			if (it->string == NULL || !screen_key_valid(it->string) || !cJSON_IsString(it) ||
 			    it->valuestring == NULL || it->valuestring[0] == '\0') {
 				continue;
 			}
-			struct screen_pref *e = &s_screen_user[s_screen_user_count++];
+			struct screen_pref *e = &m->user[m->user_count++];
 			snprintf(e->key, sizeof(e->key), "%s", it->string);
 			snprintf(e->id, sizeof(e->id), "%s", it->valuestring);
 		}
@@ -942,7 +1033,7 @@ screen_load_locked(void)
 	cJSON_Delete(root);
 
 #ifdef XRT_OS_WINDOWS
-	screen_machine_load_locked();
+	screen_machine_load_locked(m);
 #endif
 }
 
@@ -957,8 +1048,8 @@ screen_find(const struct screen_pref *arr, uint32_t n, const char *key)
 	return NULL;
 }
 
-const char *
-u_setting_get_preferred_plugin_for_screen(const char *key, char *buf, size_t cap, enum u_setting_source *out_source)
+static const char *
+map_get(struct screen_map *m, const char *key, char *buf, size_t cap, enum u_setting_source *out_source)
 {
 	if (out_source != NULL) {
 		*out_source = U_SETTING_SOURCE_DEFAULT;
@@ -969,8 +1060,7 @@ u_setting_get_preferred_plugin_for_screen(const char *key, char *buf, size_t cap
 
 	// 1. The environment always wins, as for every other option.
 	char env[SCREEN_ENV_MAX];
-	if (env_get_raw(env, sizeof(env), U_SETTING_PER_SCREEN_ENV) != NULL &&
-	    u_setting_per_screen_env_lookup(env, key, buf, cap)) {
+	if (env_get_raw(env, sizeof(env), m->env) != NULL && u_setting_per_screen_env_lookup(env, key, buf, cap)) {
 		if (out_source != NULL) {
 			*out_source = U_SETTING_SOURCE_ENV;
 		}
@@ -981,9 +1071,9 @@ u_setting_get_preferred_plugin_for_screen(const char *key, char *buf, size_t cap
 	const char *ret = NULL;
 	enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
 	lock();
-	screen_load_locked();
-	const char *user = screen_find(s_screen_user, s_screen_user_count, key);
-	const char *machine = screen_find(s_screen_machine, s_screen_machine_count, key);
+	screen_load_locked(m);
+	const char *user = screen_find(m->user, m->user_count, key);
+	const char *machine = screen_find(m->machine, m->machine_count, key);
 	if (user != NULL) {
 		snprintf(buf, cap, "%s", user);
 		src = U_SETTING_SOURCE_USER;
@@ -1000,32 +1090,65 @@ u_setting_get_preferred_plugin_for_screen(const char *key, char *buf, size_t cap
 	return ret;
 }
 
+const char *
+u_setting_get_preferred_plugin_for_screen(const char *key, char *buf, size_t cap, enum u_setting_source *out_source)
+{
+	return map_get(&s_map_dp, key, buf, cap, out_source);
+}
+
+enum u_setting_viewer_tracking
+u_setting_get_viewer_tracking_for_screen(const char *key, enum u_setting_source *out_source)
+{
+	char buf[SETTING_VALUE_MAX];
+	enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+	enum u_setting_viewer_tracking v = U_SETTING_VIEWER_TRACKING_UNSET;
+	if (map_get(&s_map_vt, key, buf, sizeof(buf), &src) != NULL) {
+		v = u_setting_viewer_tracking_parse(buf);
+		if (v == U_SETTING_VIEWER_TRACKING_UNSET) {
+			src = U_SETTING_SOURCE_DEFAULT; // a value nobody understands is "not set"
+		}
+	}
+	if (out_source != NULL) {
+		*out_source = src;
+	}
+	return v;
+}
+
 void
 u_setting_per_screen_reload(void)
 {
 	lock();
-	s_screen_loaded = false;
+	screen_maps_invalidate_locked();
 	unlock();
 }
 
-bool
-u_setting_user_set_preferred_plugin_for_screen(const char *key, const char *plugin_id)
+uint64_t
+u_setting_per_screen_generation(void)
 {
-	if (!screen_key_valid(key) || (plugin_id != NULL && strlen(plugin_id) >= SETTING_VALUE_MAX)) {
+	lock();
+	const uint64_t g = s_screen_generation;
+	unlock();
+	return g;
+}
+
+static bool
+map_user_set(struct screen_map *m, const char *key, const char *value)
+{
+	if (!screen_key_valid(key) || (value != NULL && strlen(value) >= SETTING_VALUE_MAX)) {
 		return false;
 	}
 	cJSON *root = user_load_json();
 	if (root == NULL) {
 		return false;
 	}
-	cJSON *obj = cJSON_GetObjectItemCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY);
+	cJSON *obj = cJSON_GetObjectItemCaseSensitive(root, m->json_key);
 	if (obj != NULL && !cJSON_IsObject(obj)) {
-		cJSON_DeleteItemFromObjectCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY);
+		cJSON_DeleteItemFromObjectCaseSensitive(root, m->json_key);
 		obj = NULL;
 	}
-	const bool set = plugin_id != NULL && plugin_id[0] != '\0';
+	const bool set = value != NULL && value[0] != '\0';
 	if (obj == NULL && set) {
-		obj = cJSON_AddObjectToObject(root, U_SETTING_PER_SCREEN_JSON_KEY);
+		obj = cJSON_AddObjectToObject(root, m->json_key);
 	}
 	if (obj != NULL) {
 		// Drop every spelling of the key, then add the new value.
@@ -1038,11 +1161,31 @@ u_setting_user_set_preferred_plugin_for_screen(const char *key, const char *plug
 			it = next;
 		}
 		if (set) {
-			cJSON_AddStringToObject(obj, key, plugin_id);
+			cJSON_AddStringToObject(obj, key, value);
 		} else if (obj->child == NULL) {
-			cJSON_DeleteItemFromObjectCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY);
+			cJSON_DeleteItemFromObjectCaseSensitive(root, m->json_key);
 		}
 	}
+	const bool ok = user_save_json(root);
+	cJSON_Delete(root);
+	if (ok) {
+		u_setting_per_screen_reload();
+	}
+	return ok;
+}
+
+static bool
+map_user_clear(struct screen_map *m)
+{
+	cJSON *root = user_load_json();
+	if (root == NULL) {
+		return false;
+	}
+	if (cJSON_GetObjectItemCaseSensitive(root, m->json_key) == NULL) {
+		cJSON_Delete(root);
+		return true; // nothing to do: do not touch the file
+	}
+	cJSON_DeleteItemFromObjectCaseSensitive(root, m->json_key);
 	const bool ok = user_save_json(root);
 	cJSON_Delete(root);
 	if (ok) {
@@ -1052,55 +1195,59 @@ u_setting_user_set_preferred_plugin_for_screen(const char *key, const char *plug
 }
 
 bool
-u_setting_user_clear_preferred_plugin_per_screen(void)
+u_setting_user_set_preferred_plugin_for_screen(const char *key, const char *plugin_id)
 {
-	cJSON *root = user_load_json();
-	if (root == NULL) {
-		return false;
-	}
-	if (cJSON_GetObjectItemCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY) == NULL) {
-		cJSON_Delete(root);
-		return true; // nothing to do: do not touch the file
-	}
-	cJSON_DeleteItemFromObjectCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY);
-	const bool ok = user_save_json(root);
-	cJSON_Delete(root);
-	if (ok) {
-		u_setting_per_screen_reload();
-	}
-	return ok;
+	return map_user_set(&s_map_dp, key, plugin_id);
 }
 
-enum u_setting_write_result
-u_setting_machine_set_preferred_plugin_for_screen(const char *key, const char *plugin_id)
+bool
+u_setting_user_clear_preferred_plugin_per_screen(void)
+{
+	return map_user_clear(&s_map_dp);
+}
+
+bool
+u_setting_user_set_viewer_tracking_for_screen(const char *key, enum u_setting_viewer_tracking value)
+{
+	return map_user_set(&s_map_vt, key,
+	                    value == U_SETTING_VIEWER_TRACKING_UNSET ? NULL : u_setting_viewer_tracking_str(value));
+}
+
+bool
+u_setting_user_clear_viewer_tracking_per_screen(void)
+{
+	return map_user_clear(&s_map_vt);
+}
+
+static enum u_setting_write_result
+map_machine_set(struct screen_map *m, const char *key, const char *value)
 {
 #ifdef XRT_OS_WINDOWS
 	if (key == NULL) {
-		// Every machine-tier preference: the whole subkey.
-		const LSTATUS rc = RegDeleteKeyExW(HKEY_LOCAL_MACHINE, SCREEN_MACHINE_KEY_PATH, KEY_WOW64_64KEY, 0);
+		// Every machine-tier value: the whole subkey.
+		const LSTATUS rc = RegDeleteKeyExW(HKEY_LOCAL_MACHINE, m->machine_path, KEY_WOW64_64KEY, 0);
 		if (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND) {
 			u_setting_per_screen_reload();
 			return U_SETTING_WRITE_OK;
 		}
 		return rc == ERROR_ACCESS_DENIED ? U_SETTING_WRITE_DENIED : U_SETTING_WRITE_FAILED;
 	}
-	if (!screen_key_valid(key) || (plugin_id != NULL && strlen(plugin_id) >= SETTING_VALUE_MAX)) {
+	if (!screen_key_valid(key) || (value != NULL && strlen(value) >= SETTING_VALUE_MAX)) {
 		return U_SETTING_WRITE_FAILED;
 	}
 	wchar_t wkey[U_SETTING_SCREEN_KEY_MAX];
 	if (MultiByteToWideChar(CP_UTF8, 0, key, -1, wkey, (int)(sizeof(wkey) / sizeof(wkey[0]))) <= 0) {
 		return U_SETTING_WRITE_FAILED;
 	}
-	const bool set = plugin_id != NULL && plugin_id[0] != '\0';
+	const bool set = value != NULL && value[0] != '\0';
 	HKEY hk = NULL;
 	LSTATUS rc;
 	if (set) {
 		// 64-bit view, matching every HKLM\Software\DisplayXR reader.
-		rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, SCREEN_MACHINE_KEY_PATH, 0, NULL, 0,
-		                     KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &hk, NULL);
+		rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, m->machine_path, 0, NULL, 0, KEY_SET_VALUE | KEY_WOW64_64KEY,
+		                     NULL, &hk, NULL);
 	} else {
-		rc =
-		    RegOpenKeyExW(HKEY_LOCAL_MACHINE, SCREEN_MACHINE_KEY_PATH, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hk);
+		rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, m->machine_path, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hk);
 		if (rc == ERROR_FILE_NOT_FOUND) {
 			return U_SETTING_WRITE_OK; // nothing to clear
 		}
@@ -1110,7 +1257,7 @@ u_setting_machine_set_preferred_plugin_for_screen(const char *key, const char *p
 	}
 	if (set) {
 		wchar_t wid[SETTING_VALUE_MAX];
-		if (MultiByteToWideChar(CP_UTF8, 0, plugin_id, -1, wid, (int)(sizeof(wid) / sizeof(wid[0]))) <= 0) {
+		if (MultiByteToWideChar(CP_UTF8, 0, value, -1, wid, (int)(sizeof(wid) / sizeof(wid[0]))) <= 0) {
 			RegCloseKey(hk);
 			return U_SETTING_WRITE_FAILED;
 		}
@@ -1129,8 +1276,22 @@ u_setting_machine_set_preferred_plugin_for_screen(const char *key, const char *p
 	u_setting_per_screen_reload();
 	return U_SETTING_WRITE_OK;
 #else
+	(void)m;
 	(void)key;
-	(void)plugin_id;
+	(void)value;
 	return U_SETTING_WRITE_UNSUPPORTED;
 #endif
+}
+
+enum u_setting_write_result
+u_setting_machine_set_preferred_plugin_for_screen(const char *key, const char *plugin_id)
+{
+	return map_machine_set(&s_map_dp, key, plugin_id);
+}
+
+enum u_setting_write_result
+u_setting_machine_set_viewer_tracking_for_screen(const char *key, enum u_setting_viewer_tracking value)
+{
+	return map_machine_set(&s_map_vt, key,
+	                       value == U_SETTING_VIEWER_TRACKING_UNSET ? NULL : u_setting_viewer_tracking_str(value));
 }

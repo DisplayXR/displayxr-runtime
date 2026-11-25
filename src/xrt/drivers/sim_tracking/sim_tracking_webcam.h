@@ -49,6 +49,17 @@ sim_tracking_webcam_set_test_overrides(const struct u_stereo_uvc_backend *backen
 bool
 sim_tracking_webcam_probe(const struct sim_webcam_settings *s);
 
+/*!
+ * The same question with the answer spelled out (ADR-066 Part B): fills
+ * @p out's `available`, `reason` and `detail` (struct_size preset by the
+ * caller). @p quiet logs a decline at INFO instead of WARN (the source was not
+ * asked for by name). Enumerates only, never opens a camera.
+ */
+bool
+sim_tracking_webcam_availability(const struct sim_webcam_settings *s,
+                                 bool quiet,
+                                 struct xrt_tracking_availability *out);
+
 //! Fill the provider description for the webcam source.
 void
 sim_tracking_webcam_describe(const struct sim_webcam_settings *s, struct xrt_tracking_provider_info *out);

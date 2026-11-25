@@ -14,6 +14,7 @@
 
 #include "target_component_loader.h"
 #include "target_viewer_tracking.h"
+#include "target_tracking_plugin_loader.h"
 
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_tracking_plugin.h"
@@ -21,6 +22,7 @@
 #include "sim_tracking_script.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -547,4 +549,220 @@ TEST_CASE("the shared splice: a routed screen takes the provider pair, others ke
 		xrt_eye_positions e = dp;
 		CHECK_FALSE(xrt_viewer_tracking_override_eyes(&f.base, 0x22, 0, &e, true));
 	}
+}
+
+
+/*
+ *
+ * ADR-066 Part B: the per-screen viewer-tracking setting (off / 3d / always).
+ *
+ */
+
+namespace {
+
+target_viewer_decision
+arbitrate_setting(uint32_t setting,
+                  bool provider,
+                  bool opt_in_only,
+                  bool dp_tracks = false,
+                  uint32_t policy = XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK)
+{
+	target_viewer_inputs in = {};
+	in.dp_tracks = dp_tracks;
+	in.dp_policy = policy;
+	in.hosted = true;
+	in.provider_usable = provider;
+	in.provider_id = provider ? "sim-tracking" : nullptr;
+	in.setting = setting;
+	in.provider_opt_in_only = opt_in_only;
+	target_viewer_decision d;
+	target_viewer_arbitrate(&in, &d);
+	return d;
+}
+
+} // namespace
+
+TEST_CASE("setting: default is off for an opt-in-only provider, always for a legacy one",
+          "[viewer_arbitration][setting]")
+{
+	// A provider with the availability slot whose own opt-in is off: nothing by default.
+	target_viewer_decision d = arbitrate_setting(TARGET_VIEWER_SETTING_DEFAULT, true, true);
+	CHECK(d.source == XRT_VIEWER_SOURCE_NOMINAL);
+	CHECK(d.effective_setting == TARGET_VIEWER_SETTING_OFF);
+	CHECK(std::string(d.reason).find("not turned on") != std::string::npos);
+	CHECK(target_viewer_provider_state_of(&d, false, false) == TARGET_VIEWER_PROVIDER_OFF);
+	CHECK(std::string(target_viewer_provider_state_str(TARGET_VIEWER_PROVIDER_OFF)) == "off");
+
+	// A legacy provider (no slot, or the old ENABLE=1 opt-in): every screen, every mode — as before.
+	d = arbitrate_setting(TARGET_VIEWER_SETTING_DEFAULT, true, false);
+	CHECK(d.source == XRT_VIEWER_SOURCE_PROVIDER);
+	CHECK(d.effective_setting == TARGET_VIEWER_SETTING_ALWAYS);
+	CHECK(d.tracked_2d);
+	CHECK(d.tracked_3d);
+
+	// No provider at all stays "no_source", not "off".
+	d = arbitrate_setting(TARGET_VIEWER_SETTING_DEFAULT, false, false);
+	CHECK(target_viewer_provider_state_of(&d, false, false) == TARGET_VIEWER_PROVIDER_NO_SOURCE);
+}
+
+TEST_CASE("setting: 3d drives only the 3D slot, always both, off neither", "[viewer_arbitration][setting]")
+{
+	target_viewer_decision d = arbitrate_setting(TARGET_VIEWER_SETTING_3D, true, true);
+	CHECK(d.source == XRT_VIEWER_SOURCE_PROVIDER);
+	CHECK(d.tracked_3d);
+	CHECK_FALSE(d.tracked_2d);
+	CHECK(target_viewer_source_for_mode(&d, XRT_VIEWER_MODE_3D) == XRT_VIEWER_SOURCE_PROVIDER);
+	CHECK(target_viewer_source_for_mode(&d, XRT_VIEWER_MODE_2D) == XRT_VIEWER_SOURCE_NOMINAL);
+	CHECK(target_viewer_source_for_mode(&d, XRT_VIEWER_MODE_UNKNOWN) == XRT_VIEWER_SOURCE_PROVIDER);
+
+	d = arbitrate_setting(TARGET_VIEWER_SETTING_ALWAYS, true, true);
+	CHECK(target_viewer_source_for_mode(&d, XRT_VIEWER_MODE_2D) == XRT_VIEWER_SOURCE_PROVIDER);
+	CHECK(target_viewer_source_for_mode(&d, XRT_VIEWER_MODE_3D) == XRT_VIEWER_SOURCE_PROVIDER);
+
+	// Off wins over a provider that opts in by itself.
+	d = arbitrate_setting(TARGET_VIEWER_SETTING_OFF, true, false);
+	CHECK(d.source == XRT_VIEWER_SOURCE_NOMINAL);
+	CHECK(std::string(d.reason) == "viewer tracking is off for this screen");
+	CHECK(target_viewer_source_for_mode(&d, XRT_VIEWER_MODE_3D) == XRT_VIEWER_SOURCE_NOMINAL);
+	CHECK(target_viewer_provider_state_of(&d, true, true) == TARGET_VIEWER_PROVIDER_OFF);
+
+	// Asked for, but nothing usable: nominal, "no source".
+	d = arbitrate_setting(TARGET_VIEWER_SETTING_ALWAYS, false, false);
+	CHECK(d.source == XRT_VIEWER_SOURCE_NOMINAL);
+	CHECK(std::string(d.reason) == "no source");
+}
+
+TEST_CASE("setting: a display that tracks (or is FIXED / OWN) never takes a provider, whatever the setting",
+          "[viewer_arbitration][setting]")
+{
+	for (uint32_t s : {(uint32_t)TARGET_VIEWER_SETTING_3D, (uint32_t)TARGET_VIEWER_SETTING_ALWAYS}) {
+		CAPTURE(s);
+		CHECK(arbitrate_setting(s, true, false, true).source == XRT_VIEWER_SOURCE_DP);
+		CHECK(arbitrate_setting(s, true, false, false, XRT_PLUGIN_VIEWER_POLICY_FIXED).source ==
+		      XRT_VIEWER_SOURCE_NOMINAL);
+		CHECK(arbitrate_setting(s, true, false, false, XRT_PLUGIN_VIEWER_POLICY_OWN).source ==
+		      XRT_VIEWER_SOURCE_DP);
+	}
+}
+
+TEST_CASE("setting: offered only on an EXTERNAL_OK screen with an available provider",
+          "[viewer_arbitration][setting][offered]")
+{
+	target_viewer_provider_in p = provider();
+	p.detail = "webcam 'Integrated Camera'";
+	char why[128];
+	target_viewer_screen_in s = screen(0x11, true, false, XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK, 0);
+	CHECK(target_viewer_screen_offered(&s, &p, why, sizeof(why)));
+	CHECK(std::string(why) == "webcam 'Integrated Camera'");
+
+	s.dp_tracks = true;
+	CHECK_FALSE(target_viewer_screen_offered(&s, &p, why, sizeof(why)));
+	CHECK(std::string(why) == "this display tracks the viewer itself");
+
+	s = screen(0x11, true, false, XRT_PLUGIN_VIEWER_POLICY_FIXED, 0);
+	CHECK_FALSE(target_viewer_screen_offered(&s, &p, why, sizeof(why)));
+	CHECK(std::string(why).find("FIXED") != std::string::npos);
+
+	s = screen(0x11, true, false, XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK, 0, false);
+	CHECK_FALSE(target_viewer_screen_offered(&s, &p, why, sizeof(why)));
+	CHECK(std::string(why) == "no display processor on this screen");
+
+	// The provider's own reason travels: the default build compiles the stub estimator.
+	s = screen(0x11, true, false, XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK, 0);
+	target_viewer_provider_in none = provider(false);
+	none.unavailable = "no face estimator in this build (built in: 'none')";
+	CHECK_FALSE(target_viewer_screen_offered(&s, &none, why, sizeof(why)));
+	CHECK(std::string(why).find("no face estimator in this build") == 0);
+	none.unavailable = nullptr;
+	CHECK_FALSE(target_viewer_screen_offered(&s, &none, why, sizeof(why)));
+	CHECK(std::string(why) == "no viewer-tracking provider available");
+}
+
+TEST_CASE("setting: per screen, a tracking panel keeps its own eyes beside a laptop set to 3d",
+          "[viewer_arbitration][setting][per_screen]")
+{
+	// The DS1-style box: the panel (primary) tracks; the laptop screen does not, and asks for 3d.
+	target_viewer_screen_in in[3] = {
+	    screen(0x11, true, true, XRT_PLUGIN_VIEWER_POLICY_OWN, 0),
+	    screen(0x22, false, false, XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK, 1920),
+	    screen(0x33, false, false, XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK, 3840),
+	};
+	in[0].setting = TARGET_VIEWER_SETTING_ALWAYS; // ignored: the panel tracks itself
+	in[1].setting = TARGET_VIEWER_SETTING_3D;
+	in[2].setting = TARGET_VIEWER_SETTING_DEFAULT;
+	target_viewer_provider_in p = provider();
+	p.opt_in_only = true;
+	target_viewer_screen_decision out[3];
+	REQUIRE(target_viewer_arbitrate_screens(in, 3, &p, out) == 3);
+
+	CHECK(out[0].d.source == XRT_VIEWER_SOURCE_DP);
+	CHECK_FALSE(out[0].offered);
+	CHECK(std::string(out[0].offer_reason) == "this display tracks the viewer itself");
+
+	CHECK(out[1].d.source == XRT_VIEWER_SOURCE_PROVIDER);
+	CHECK(out[1].offered);
+	CHECK(target_viewer_source_for_mode(&out[1].d, XRT_VIEWER_MODE_2D) == XRT_VIEWER_SOURCE_NOMINAL);
+	CHECK(target_viewer_source_for_mode(&out[1].d, XRT_VIEWER_MODE_3D) == XRT_VIEWER_SOURCE_PROVIDER);
+
+	CHECK(out[2].d.source == XRT_VIEWER_SOURCE_NOMINAL); // default = off with an opt-in-only provider
+	CHECK(out[2].offered);
+}
+
+TEST_CASE("availability: the slot answer, and the absent-slot rule", "[viewer_arbitration][setting][availability]")
+{
+	target_tracking_availability a;
+	target_tracking_availability_from_slot(nullptr, true, &a);
+	CHECK(a.available);
+	CHECK(a.serve_by_default); // a provider without the slot serves as before
+	CHECK_FALSE(a.stated);
+	target_tracking_availability_from_slot(nullptr, false, &a);
+	CHECK_FALSE(a.available);
+
+	xrt_tracking_availability s = {};
+	s.struct_size = sizeof(s);
+	s.available = 0;
+	s.reason = XRT_TRACKING_UNAVAILABLE_NO_ESTIMATOR;
+	std::snprintf(s.detail, sizeof(s.detail), "no face estimator in this build");
+	target_tracking_availability_from_slot(&s, false, &a);
+	CHECK(a.stated);
+	CHECK_FALSE(a.available);
+	CHECK(a.reason == XRT_TRACKING_UNAVAILABLE_NO_ESTIMATOR);
+	CHECK(std::string(target_tracking_unavailable_reason_str(a.reason)) == "no_estimator");
+	CHECK(std::string(a.detail) == "no face estimator in this build");
+
+	// Available + its own opt-in off: resident, but serves only screens that ask.
+	s.available = 1;
+	s.reason = 0;
+	s.flags = 0;
+	target_tracking_availability_from_slot(&s, true, &a);
+	CHECK(a.available);
+	CHECK_FALSE(a.serve_by_default);
+	s.flags = XRT_TRACKING_AVAILABILITY_SERVE_BY_DEFAULT;
+	target_tracking_availability_from_slot(&s, true, &a);
+	CHECK(a.serve_by_default);
+
+	// "Available" while probe() declined cannot be started: not available.
+	target_tracking_availability_from_slot(&s, false, &a);
+	CHECK_FALSE(a.available);
+
+	// An untrusted detail is re-terminated; an out-of-range reason reads OTHER.
+	std::memset(s.detail, 'x', sizeof(s.detail));
+	s.available = 0;
+	s.reason = 77;
+	target_tracking_availability_from_slot(&s, true, &a);
+	CHECK(a.reason == XRT_TRACKING_UNAVAILABLE_OTHER);
+	CHECK(std::strlen(a.detail) < sizeof(a.detail));
+
+	CHECK(std::string(target_tracking_unavailable_reason_text(TARGET_TRACKING_UNAVAILABLE_NO_PROVIDER)) ==
+	      "no viewer-tracking provider installed");
+}
+
+TEST_CASE("availability ABI: the appended slot keeps every earlier offset", "[viewer_arbitration][abi][setting]")
+{
+	CHECK(offsetof(xrt_tracking_plugin_iface, get_availability) ==
+	      offsetof(xrt_tracking_plugin_iface, activate) + sizeof(void *));
+	xrt_tracking_plugin_iface old_iface = {};
+	old_iface.struct_size = (uint32_t)offsetof(xrt_tracking_plugin_iface, get_availability);
+	old_iface.get_availability = [](xrt_tracking_availability *) { return XRT_SUCCESS; };
+	CHECK_FALSE(XRT_TRACKING_PLUGIN_IFACE_HAS(&old_iface, get_availability));
 }

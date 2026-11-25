@@ -187,8 +187,95 @@ static struct tracking_slot
 	struct xrt_tracking_plugin_instance *inst;
 	uint32_t priority;
 	char row_id[64];
+	struct target_tracking_availability avail; //!< ADR-066 Part B
 } g_slots[TARGET_COMPONENT_MAX_ENTRIES];
 static int g_slot_count = 0;
+
+//! ADR-066 Part B: the first declined row's stated reason (rank order), when it gave one.
+static bool g_have_decline_reason = false;
+static struct target_tracking_availability g_decline_reason;
+static int g_scan_unlicensed = 0;
+
+const char *
+target_tracking_unavailable_reason_str(uint32_t reason)
+{
+	switch (reason) {
+	case XRT_TRACKING_UNAVAILABLE_NONE: return "none";
+	case XRT_TRACKING_UNAVAILABLE_NO_CAMERA: return "no_camera";
+	case XRT_TRACKING_UNAVAILABLE_NO_ESTIMATOR: return "no_estimator";
+	case XRT_TRACKING_UNAVAILABLE_NO_CAPTURE_BACKEND: return "no_capture_backend";
+	case XRT_TRACKING_UNAVAILABLE_UNLICENSED: return "unlicensed";
+	case TARGET_TRACKING_UNAVAILABLE_NO_PROVIDER: return "no_provider";
+	case TARGET_TRACKING_UNAVAILABLE_DISABLED: return "disabled";
+	case TARGET_TRACKING_UNAVAILABLE_FAILED: return "failed";
+	case TARGET_TRACKING_UNAVAILABLE_ENV: return "disabled_by_env";
+	case XRT_TRACKING_UNAVAILABLE_OTHER:
+	default: return "other";
+	}
+}
+
+const char *
+target_tracking_unavailable_reason_text(uint32_t reason)
+{
+	switch (reason) {
+	case XRT_TRACKING_UNAVAILABLE_NONE: return "";
+	case XRT_TRACKING_UNAVAILABLE_NO_CAMERA: return "no camera";
+	case XRT_TRACKING_UNAVAILABLE_NO_ESTIMATOR: return "no face estimator in this build";
+	case XRT_TRACKING_UNAVAILABLE_NO_CAPTURE_BACKEND: return "no camera capture on this platform";
+	case XRT_TRACKING_UNAVAILABLE_UNLICENSED: return "the viewer-tracking provider is not licensed";
+	case TARGET_TRACKING_UNAVAILABLE_NO_PROVIDER: return "no viewer-tracking provider installed";
+	case TARGET_TRACKING_UNAVAILABLE_DISABLED: return "no viewer-tracking provider enabled";
+	case TARGET_TRACKING_UNAVAILABLE_FAILED: return "the viewer-tracking provider failed to load";
+	case TARGET_TRACKING_UNAVAILABLE_ENV: return "viewer-tracking providers disabled (DXR_TRACKING_PROVIDERS=0)";
+	case XRT_TRACKING_UNAVAILABLE_OTHER:
+	default: return "the viewer-tracking provider has no usable source";
+	}
+}
+
+void
+target_tracking_availability_from_slot(const struct xrt_tracking_availability *a,
+                                       bool probe_ok,
+                                       struct target_tracking_availability *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (a == NULL) {
+		// No slot: the behaviour before ADR-066 Part B.
+		out->available = probe_ok;
+		out->serve_by_default = probe_ok;
+		out->reason = probe_ok ? XRT_TRACKING_UNAVAILABLE_NONE : XRT_TRACKING_UNAVAILABLE_OTHER;
+		return;
+	}
+	out->stated = true;
+	// A provider that says "available" yet declined in probe() cannot be started: it is not.
+	out->available = a->available != 0 && probe_ok;
+	out->serve_by_default = (a->flags & XRT_TRACKING_AVAILABILITY_SERVE_BY_DEFAULT) != 0;
+	out->reason = out->available ? XRT_TRACKING_UNAVAILABLE_NONE
+	                             : (a->reason != XRT_TRACKING_UNAVAILABLE_NONE && a->reason <= 5u
+	                                    ? a->reason
+	                                    : (uint32_t)XRT_TRACKING_UNAVAILABLE_OTHER);
+	char detail[sizeof(a->detail) + 1];
+	memcpy(detail, a->detail, sizeof(a->detail));
+	detail[sizeof(a->detail)] = '\0'; // the provider is untrusted: re-terminate
+	snprintf(out->detail, sizeof(out->detail), "%.*s", (int)sizeof(out->detail) - 1, detail);
+}
+
+//! Ask @p iface's availability slot (absent → the probe-only rule).
+static void
+ask_availability(const struct xrt_tracking_plugin_iface *iface, bool probe_ok, struct target_tracking_availability *out)
+{
+	if (!XRT_TRACKING_PLUGIN_IFACE_HAS(iface, get_availability)) {
+		target_tracking_availability_from_slot(NULL, probe_ok, out);
+		return;
+	}
+	struct xrt_tracking_availability a;
+	memset(&a, 0, sizeof(a));
+	a.struct_size = (uint32_t)sizeof(a);
+	if (iface->get_availability(&a) != XRT_SUCCESS) {
+		target_tracking_availability_from_slot(NULL, probe_ok, out);
+		return;
+	}
+	target_tracking_availability_from_slot(&a, probe_ok, out);
+}
 
 bool
 target_tracking_plugin_disabled_by_env(void)
@@ -249,11 +336,13 @@ static const struct xrt_tracking_plugin_iface *
 tracking_try_load_one(struct target_component_entry *e,
                       struct xrt_tracking_plugin_instance **out_inst,
                       bool *out_declined,
-                      bool *out_untrusted)
+                      bool *out_untrusted,
+                      struct target_tracking_availability *out_avail)
 {
 	*out_inst = NULL;
 	*out_declined = false;
 	*out_untrusted = false;
+	memset(out_avail, 0, sizeof(*out_avail));
 
 	void *module = NULL;
 	void *fn = NULL;
@@ -284,7 +373,10 @@ tracking_try_load_one(struct target_component_entry *e,
 	if (iface->probe != NULL) {
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
-			U_LOG_I("tracking plugin loader:   %s: probe declined (no usable source).", e->id);
+			// ADR-066 Part B: ask why before unloading (enumeration only, no camera opened).
+			ask_availability(iface, false, out_avail);
+			U_LOG_I("tracking plugin loader:   %s: probe declined (no usable source%s%s).", e->id,
+			        out_avail->detail[0] != '\0' ? ": " : "", out_avail->detail);
 			*out_declined = true;
 			target_component_unload(module);
 			return NULL;
@@ -308,9 +400,15 @@ tracking_try_load_one(struct target_component_entry *e,
 		}
 		*out_inst = NULL;
 		*out_declined = true;
+		memset(out_avail, 0, sizeof(*out_avail));
+		out_avail->stated = true;
+		out_avail->reason = XRT_TRACKING_UNAVAILABLE_UNLICENSED;
+		snprintf(out_avail->detail, sizeof(out_avail->detail), "licence: %s",
+		         xrt_component_license_state_str(license.state));
 		target_component_unload(module);
 		return NULL;
 	}
+	ask_availability(iface, true, out_avail);
 	U_LOG_W(
 	    "tracking plugin loader: resident viewer-tracking provider: id=%s name='%s' plugin_api=%u probe_order=%u "
 	    "path=%s",
@@ -362,7 +460,9 @@ tracking_scan(void)
 		const bool is_pref = have_pref && strcmp(e->id, preferred) == 0;
 		struct xrt_tracking_plugin_instance *inst = NULL;
 		bool declined = false, untrusted = false;
-		const struct xrt_tracking_plugin_iface *iface = tracking_try_load_one(e, &inst, &declined, &untrusted);
+		struct target_tracking_availability avail;
+		const struct xrt_tracking_plugin_iface *iface =
+		    tracking_try_load_one(e, &inst, &declined, &untrusted, &avail);
 		if (iface != NULL) {
 			if (g_slot_count < TARGET_COMPONENT_MAX_ENTRIES) {
 				struct tracking_slot *s = &g_slots[g_slot_count++];
@@ -370,9 +470,17 @@ tracking_scan(void)
 				s->inst = inst;
 				s->priority = is_pref ? 0u : e->probe_order;
 				snprintf(s->row_id, sizeof(s->row_id), "%s", e->id);
+				s->avail = avail;
 			}
 		} else if (declined) {
 			g_scan_declined++;
+			if (avail.reason == XRT_TRACKING_UNAVAILABLE_UNLICENSED) {
+				g_scan_unlicensed++;
+			}
+			if (!g_have_decline_reason && avail.stated) {
+				g_have_decline_reason = true;
+				g_decline_reason = avail;
+			}
 		} else if (untrusted) {
 			g_scan_untrusted++;
 		} else {
@@ -419,6 +527,50 @@ target_tracking_plugin_get_license_state(int index, struct xrt_component_license
 	tracking_scan();
 	return xrt_tracking_plugin_iface_license_state(
 	    (index >= 0 && index < g_slot_count) ? g_slots[index].iface : NULL, out);
+}
+
+bool
+target_tracking_plugin_get_availability(int index, struct target_tracking_availability *out)
+{
+	tracking_scan();
+	if (out == NULL) {
+		return false;
+	}
+	if (index < 0 || index >= g_slot_count) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	*out = g_slots[index].avail;
+	return true;
+}
+
+void
+target_tracking_plugin_get_unavailable(struct target_tracking_availability *out)
+{
+	tracking_scan();
+	if (out == NULL) {
+		return;
+	}
+	memset(out, 0, sizeof(*out));
+	if (target_tracking_plugin_disabled_by_env()) {
+		out->reason = TARGET_TRACKING_UNAVAILABLE_ENV;
+	} else if (g_have_decline_reason) {
+		*out = g_decline_reason;
+		out->available = false;
+	} else if (g_scan_unlicensed > 0) {
+		out->reason = XRT_TRACKING_UNAVAILABLE_UNLICENSED;
+	} else if (g_scan_declined > 0) {
+		out->reason = XRT_TRACKING_UNAVAILABLE_OTHER;
+	} else if (g_scan_failed > 0 || g_scan_untrusted > 0) {
+		out->reason = TARGET_TRACKING_UNAVAILABLE_FAILED;
+	} else if (g_scan_registered > 0) {
+		out->reason = TARGET_TRACKING_UNAVAILABLE_DISABLED;
+	} else {
+		out->reason = TARGET_TRACKING_UNAVAILABLE_NO_PROVIDER;
+	}
+	if (out->detail[0] == '\0') {
+		snprintf(out->detail, sizeof(out->detail), "%s", target_tracking_unavailable_reason_text(out->reason));
+	}
 }
 
 uint32_t

@@ -388,6 +388,28 @@ struct xrt_status_layout
 	uint32_t source;          //!< `enum xrt_screen_info_source`.
 };
 
+/*!
+ * ADR-066 Part B: a screen's per-screen viewer-tracking setting, as the
+ * arbitration that built the snapshot read it (`status --json`
+ * `screens[i].viewer_tracking`). What a dashboard needs to draw a three-way
+ * selector (off / 3d / always), greyed out with @ref reason when not offered.
+ */
+struct xrt_status_viewer_tracking
+{
+	bool evaluated;          //!< false = not evaluated in the process that built the snapshot
+	char setting[16];        //!< "off" / "3d" / "always" / "default" (no per-screen value)
+	char setting_source[16]; //!< "env" / "user" / "machine" / "default"
+	char effective[16];      //!< after "default" was resolved: "off" / "3d" / "always"
+	bool tracked_2d;         //!< the 2D slot's views follow the provider
+	bool tracked_3d;         //!< the 3D slot's views follow the provider
+	bool available;          //!< the setting is offered on this screen (a compatible camera / provider)
+	//! Unavailable: why ("this display tracks the viewer itself", "no face estimator in this build", ...).
+	//! Available: what the provider tracks from ("webcam 'Integrated Camera'"), or "".
+	char reason[128];
+	char provider[XRT_STATUS_NAME_MAX]; //!< the provider that would serve ("" = none usable)
+	char key[64];                       //!< the screen key the setting is stored under
+};
+
 //! Eye-tracking capability and live state of a screen.
 struct xrt_status_eye_tracking
 {
@@ -432,6 +454,8 @@ struct xrt_status_eye_tracking
 	uint32_t viewer_host_restarts; //!< host restarts since the service started
 	//! The serving viewer-tracking provider's licence state (ADR-054 N5), where the views follow one.
 	struct xrt_status_licence viewer_licence;
+	//! ADR-066 Part B: the per-screen viewer-tracking setting (serialised as `screens[i].viewer_tracking`).
+	struct xrt_status_viewer_tracking viewer_tracking;
 };
 
 //! The rendering mode a screen is in (phase 2; absent headless).

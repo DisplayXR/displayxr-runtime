@@ -1089,6 +1089,34 @@ screen_to_cjson(const struct xrt_status_screen *s)
 		cJSON_AddNullToObject(et, "viewer_host");
 	}
 
+	// ADR-066 Part B: the per-screen viewer-tracking setting (off / 3d / always), its
+	// effect per slot and for the current mode, and whether it is offered here.
+	const struct xrt_status_viewer_tracking *vt = &s->eye_tracking.viewer_tracking;
+	if (vt->evaluated) {
+		cJSON *v = cJSON_AddObjectToObject(o, "viewer_tracking");
+		cJSON_AddStringToObject(v, "setting", vt->setting);
+		cJSON_AddStringToObject(v, "setting_source", vt->setting_source);
+		cJSON_AddStringToObject(v, "effective", vt->effective);
+		cJSON *modes = cJSON_AddObjectToObject(v, "tracked");
+		cJSON_AddBoolToObject(modes, "2d", vt->tracked_2d);
+		cJSON_AddBoolToObject(modes, "3d", vt->tracked_3d);
+		// The state in the CURRENT mode: needs the screen's mode (a service with a session on it).
+		if (s->mode.valid) {
+			cJSON_AddStringToObject(v, "current_mode", s->mode.is_3d ? "3d" : "2d");
+			cJSON_AddBoolToObject(v, "active", s->mode.is_3d ? vt->tracked_3d : vt->tracked_2d);
+		} else {
+			cJSON_AddNullToObject(v, "current_mode");
+			cJSON_AddNullToObject(v, "active");
+		}
+		add_str_or_null(v, "provider", vt->provider);
+		cJSON_AddBoolToObject(v, "available", vt->available);
+		// Unavailable: why (the dashboard greys the selector out with it). Available: what it tracks from.
+		add_str_or_null(v, "reason", vt->available ? "" : vt->reason);
+		add_str_or_null(v, "detail", vt->available ? vt->reason : "");
+	} else {
+		cJSON_AddNullToObject(o, "viewer_tracking");
+	}
+
 	if (s->mode.valid) {
 		cJSON *mode = cJSON_AddObjectToObject(o, "mode");
 		cJSON_AddNumberToObject(mode, "index", (double)s->mode.index);

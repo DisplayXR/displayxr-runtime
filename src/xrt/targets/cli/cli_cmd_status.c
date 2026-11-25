@@ -243,6 +243,17 @@ cli_status_build_headless(struct xrt_status_snapshot *out)
 	status_build_headless(out);
 }
 
+bool
+cli_status_fetch(struct xrt_status_snapshot *out)
+{
+	xrt_result_t why = XRT_SUCCESS;
+	if (status_fetch_service(out, &why)) {
+		return true;
+	}
+	status_build_headless(out);
+	return false;
+}
+
 //! Say why the service refused: the one cause is a CLI outside the service's directory (#960).
 static void
 note_refused(void)

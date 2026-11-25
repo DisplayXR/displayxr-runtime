@@ -1,7 +1,7 @@
 # Viewer-Tracking Provider Discovery Contract
 
 **Status:** implemented (ADR-054 §4.1, N6 Part 2, #2144) — in-process, service and out-of-process hosting
-(§4a, the N8 viewer pose page), per-screen routing (§4b).
+(§4a, the N8 viewer pose page), per-screen routing (§4b), the per-screen viewer-tracking setting (§4c, ADR-066 Part B).
 **ABI:** `src/xrt/include/xrt/xrt_tracking_plugin.h`, major 1 (`XRT_TRACKING_PLUGIN_API_VERSION_CURRENT`).
 **Siblings:** [plugin-discovery.md](plugin-discovery.md) (display processors),
 [input-provider-discovery.md](input-provider-discovery.md),
@@ -43,6 +43,8 @@ shared loader's ABI gate before any dispatch.
 | `get_status(inst)` | `STOPPED` / `RUNNING` / `NO_SOURCE` (camera unplugged). Non-blocking. Optional. |
 | `destroy(inst)` | Free. |
 | `describe_settings` | The settings it reads (ADR-054 decision 7). Optional. |
+| `get_license_state` / `activate` | Licence state and activation (§3 *Licence state*). Optional, appended. |
+| `get_availability(&out)` | ADR-066 Part B (§4c): could it serve a viewer here if a screen asked, and if not why (`NO_CAMERA`, `NO_ESTIMATOR`, `NO_CAPTURE_BACKEND`, `UNLICENSED`, `OTHER` + a detail string), and its own opt-in (`SERVE_BY_DEFAULT`). Enumerates, never opens a camera. Asked after `probe()` whether probe said yes or declined. Optional, appended (`XRT_TRACKING_PLUGIN_IFACE_HAS_GET_AVAILABILITY`); absent = "available if probe succeeded, reason unknown, serves by default". |
 
 `struct xrt_tracking_viewer_sample` (display space: metres, origin at the centre of the display
 surface, +X right, +Y up, +Z out of the glass toward the viewer):
@@ -359,7 +361,96 @@ provider is doing for that screen:
 | `none` | no provider involved (FIXED, no DP, nothing enabled) |
 
 "standby" is never "paused": the first is a display that tracks, the second a provider that lost
-its source.
+its source. `off` (ADR-066 Part B, §4c): a provider could serve, the screen's viewer-tracking
+setting keeps it off.
+
+### 4c. The per-screen viewer-tracking setting (ADR-066 Part B)
+
+Step 2 of §4 is **gated per screen** by a setting the user owns: `off` / `3d` / `always`, or no
+value (`default`). It is a runtime setting, not a display-processor option.
+
+| Setting | Step 2 on this screen |
+|---|---|
+| `off` | never: no provider, and no viewer request is made for it, so the camera stays closed |
+| `3d` | the provider drives the views only while the session is in the **3D slot**; in the 2D slot the views keep the display processor's answer and no viewer is requested |
+| `always` | 2D and 3D: head-coupled look-around in 2D too |
+| no value (`default`) | **off**, unless the provider opts in by itself (`SERVE_BY_DEFAULT`, sim-tracking's legacy `ENABLE=1`, or any provider without the availability slot): then `always`, what a provider did before the setting existed |
+
+Steps 1 and 3 are unchanged: a display that tracks the viewer itself (or owns it, or is FIXED) is
+never routed to a provider whatever its setting, and the setting is **not offered** there. A
+tracking display's camera never drives another screen's views: each screen's views come from its
+own DP's eyes, or from the provider, or nominal (§4b) — the per-screen table is the only path, in
+process (`oxr_session_locate_views`, per segment and for the whole-window locate on the window's
+screen, #2757) and over IPC (the service splices each segment by its `screen_id`).
+
+**Stores** (the same keys and chain as `dp use --screen`, `util/u_setting.h`):
+
+1. environment `DXR_VIEWER_TRACKING_PER_SCREEN="<key>=<off|3d|always>;..."` (always wins);
+2. per-user settings file, object `viewer_tracking_per_screen: { "<key>": "off" | "3d" | "always" }`;
+3. machine (Windows, admin): `HKLM\Software\DisplayXR\ViewerTracking\Screens`, one REG_SZ per key.
+
+`on` is read as `3d`; an unknown value is no value. The key is the screen's stable key (as
+`dp list` / `tracking list` print it); a value stored under a screen's legacy EDID key still applies.
+
+**Availability** (B2). The setting is offered on a screen only when that screen does not track,
+is EXTERNAL_OK, and the rank-0 provider is **available**. The provider says so through
+`get_availability` (§2), which enumerates and never opens a camera; with no provider resident the
+runtime says why: `no viewer-tracking provider installed` / `… enabled` / `… failed to load`, or
+the first declining provider's own reason (`no face estimator in this build`, `no camera`, `the
+viewer-tracking provider is not licensed`). The default Linux build compiles the stub estimator,
+so there sim-tracking's webcam source reads `unavailable: no face estimator in this build`. In the
+service the host's `--probe` carries the answer on the pose page (producer block, offsets 688–760,
+formerly zero), also on its no-provider exit, so the service never loads the provider to say why.
+
+**Camera ↔ screen association** is ADR-066 open question 7 and is not decided here: an available
+provider is offered on every EXTERNAL_OK screen without a tracker, and its samples are mapped from
+the primary's display space as in §4b.
+
+**When it applies.**
+- *Service (IPC clients):* `tracking set --screen` writes the store and asks the running service
+  for a display re-probe over DIAG (as `dp use --screen` does). The re-probe reloads the stores and
+  `target_viewer_tracking_settings_changed` re-runs the per-screen arbitration on the published
+  table (cheap when the stores did not move), so running clients' views follow **within a frame**;
+  the status snapshot follows within its 2 s floor.
+- *In-process app with no service:* it reads the setting when its system is created — the next
+  launch.
+- *The composed advertisement* (§5) is still static per instance: the primary screen's setting is
+  applied when the first screen table is published at system creation (before any session reads
+  the system, `target_viewer_tracking_recompose`), and a later change moves only the views. An app
+  told "no tracking" can therefore receive tracked views after a toggle, and one told "tracking" sees
+  `isTracking` false after `off`. No `XrEventDataEyeTrackingStateChangedDXR` is invented for the
+  toggle itself (ADR-066 open question 6).
+
+**The camera closes again** when a `3d` screen's session goes back to 2D, or a screen is turned
+`off`, and nothing else asks for a viewer: no viewer request is made any more, so the service's
+host stops on its idle stop (§4a, ~15 s), and an in-process runtime that loaded the provider
+(LOCAL) now stops it the same way — after the host's idle-stop time (10 s) without a request,
+checked on the locate path's own calls. The debounce keeps a quick 2D/3D flip from cycling the
+camera.
+
+**The seam for the rendering-mode code** (C1 owns the slot tables): `target_viewer_tracking_tracked_modes(screen,
+&out)` — also `xrt_viewer_tracking::get_tracked_modes` on `xrt_system_devices::viewer_tracking` —
+answers `{provider, tracked_2d, tracked_3d}` for a screen; `provider` false means "no provider
+here, keep the display's own per-mode flags". The composed advertisement marks HAS_TRACKING on the
+3D modes when the provider drives them, and on the 2D mode only for an explicit `always`.
+
+**Status.** Each screen row of `status --json` (and `tracking list --json` `screens[]`) carries
+`viewer_tracking`:
+
+```json
+"viewer_tracking": {
+  "setting": "3d", "setting_source": "user", "effective": "3d",
+  "tracked": { "2d": false, "3d": true },
+  "current_mode": "3d", "active": true,
+  "provider": "sim-tracking",
+  "available": true, "reason": null, "detail": "webcam 'Integrated Camera'"
+}
+```
+
+`setting` is what is stored (`default` = no value), `effective` what it resolved to, `tracked` per
+slot, `current_mode` / `active` the state in the screen's current mode (null without a session on
+it), `reason` why it is not offered (null when it is), `detail` what the provider tracks from.
+`null` for the whole object where the snapshot's builder did not evaluate it.
 ## 5. The composed `XR_DXR_display_info` advertisement
 
 The display plug-in reports only what **it** does; `sim_display` stays honest (0 modes, no
@@ -716,15 +807,23 @@ ProbeOrder 200. Two sources, picked by `SOURCE`:
   Its old bezel-offset model runs only as a legacy fallback: when `WEBCAM_OFFSET_MM` is set
   explicitly (and nothing better is stored), or on an older runtime without the host slot.
 
-Opt-in: `probe()` declines unless `ENABLE` = 1. With `SOURCE=webcam` it also declines unless a
-face estimator is built in **and** a camera matching `WEBCAM_DEVICE` is enumerated (it never
-opens the camera to decide; the camera opens on `start()`, on the provider's own worker thread).
+Opt-in (ADR-066 Part B, §4c): `probe()` says yes whenever the selected source is **available**,
+and `ENABLE` = 1 only makes it serve the screens that have no per-screen viewer-tracking value
+(`SERVE_BY_DEFAULT`). A screen set to `3d` / `always` is served without it. The selected source:
+`SOURCE` when it is set; unset, the scripted viewer under `ENABLE=1` (the legacy behaviour), else
+the **webcam** (a screen that asks for viewer tracking wants a real camera, never a scripted head).
+The scripted source is a test source and is available whenever it is the selected one; the webcam
+source is available only with a face estimator built in **and** a camera matching `WEBCAM_DEVICE`
+enumerated — `get_availability` says which is missing. Neither probe nor `get_availability` opens
+the camera (enumeration only: sysfs + udev on Linux, `MFEnumDeviceSources` on Windows); it opens on
+`start()`, on the provider's own worker thread, the first time a screen routed to it asks for a
+viewer (`tests_sim_tracking_webcam` counts zero mode listings / opens through both calls).
 Settings (`displayxr-cli tracking options sim-tracking`):
 
 | Key | Default | |
 |---|---|---|
-| `ENABLE` | 0 | opt-in |
-| `SOURCE` | script | `script` / `webcam` |
+| `ENABLE` | 0 | serve every screen with no per-screen value (the legacy opt-in; §4c) |
+| `SOURCE` | unset | `script` / `webcam`; unset = `script` under `ENABLE=1`, else `webcam` |
 | `SCRIPT` | sweep | `sweep` (head sweeps left-right) / `offset` (holds still) |
 | `PERIOD_MS`, `AMPLITUDE_M` | 4000, 0.10 | sweep |
 | `OFFSET_X_M` / `_Y_M` / `_Z_M` | 0 | from the nominal viewer (host geometry) |
@@ -789,8 +888,13 @@ end-to-end arm is `tests_oxr_view_space_viewer_tracking`.
 ## 9. Diagnostics
 
 - `displayxr-cli tracking list [--json]` — rows, Enabled (+ source), provenance, PreferredPlugin,
-  the row ranked first. `tracking enable|disable|use|prefer|reset|options|set|unset` mirror
-  `input`.
+  the row ranked first, then every screen's viewer-tracking setting, its effect and availability
+  (`screens[]` with the §4c `viewer_tracking` object in JSON; from the service when reachable, else
+  headless). `tracking enable|disable|use|prefer|reset|options|set|unset` mirror `input`.
+- `displayxr-cli tracking set --screen <key> off|3d|always [--machine]` (`on` = `3d`; shorthands
+  `tracking on|off --screen <key>`) and `tracking reset --screen <key>|all [--machine]` — the
+  per-screen setting (§4c); per user by default, `--machine` = HKLM (Windows, admin). They poke a
+  running service over DIAG, so its clients' views follow at once.
 - `displayxr-cli selftest --json` → `tracking_providers`: `registered`, `enabled`,
   `scan_declined`, `scan_failed`, `scan_untrusted`, `ranked` (registration ids), `active_id`,
   `viewer_source` (`dp` / `provider:<id>` / `nominal`), `viewer_reason`, `display_viewer_policy`,
@@ -860,4 +964,12 @@ apps beside a service reading the page instead of opening the camera again.
    after the camera calibration store, §6).
 13. **Per-screen camera-pose routing**: the host answers "the screen I serve" from any stored screen
    for the camera; once a provider is told the key of the screen it serves, pass it.
+14. **Per-screen setting (ADR-066 Part B, §4c) — open ends**: camera ↔ screen association (ADR-066
+   open question 7: today an available provider is offered on every EXTERNAL_OK screen); a policy
+   watch on the per-screen store for edits made without the CLI (the service picks them up at its
+   next re-probe); the eye-tracking-state event for a toggle (open question 6); Windows / macOS
+   camera enumeration reasons are as sim-tracking's webcam source reports them (macOS: no capture
+   backend → "no camera capture on this platform"); an in-process app with no service reads the
+   setting at its next launch; the IPC path judges `3d` by the service head's active mode (a
+   client's own mode does not cross IPC).
 

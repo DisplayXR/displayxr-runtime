@@ -508,6 +508,32 @@ public static class StatusText
         return real > 1;
     }
 
+    /// <summary>ADR-066 Part B: the three-way viewer-tracking selector, in order, with the CLI value each writes.</summary>
+    public static readonly IReadOnlyList<(string Label, string Value)> TrackingChoices = new[]
+    {
+        ("Off", "off"),
+        ("In 3D only", "3d"),
+        ("Always (2D and 3D)", "always"),
+    };
+
+    /// <summary>The selector index a screen's setting shows: what it resolved to ("default" reads as its effect).</summary>
+    public static int TrackingSelected(ViewerTracking vt)
+    {
+        string v = vt.Setting is "off" or "3d" or "always" ? vt.Setting : vt.Effective;
+        for (int i = 0; i < TrackingChoices.Count; i++)
+            if (TrackingChoices[i].Value == v) return i;
+        return 0;
+    }
+
+    /// <summary>The CLI verb a viewer-tracking choice runs (per user, as every per-screen choice here).</summary>
+    public static CliArgs TrackingVerb(string key, int index) =>
+        new("tracking", "set", "--screen", key, TrackingChoices[index].Value);
+
+    /// <summary>The line under the selector: why it is greyed out, or what it tracks from.</summary>
+    public static string? TrackingNote(ViewerTracking vt) => vt.Available
+        ? (vt.Detail is { Length: > 0 } d ? $"Uses {d}." : null)
+        : (vt.Reason is { Length: > 0 } r ? $"Not available: {r}." : "Not available on this display.");
+
     /// <summary>The CLI verb a selector choice runs.</summary>
     public static CliArgs DpVerb(string key, DpChoice choice) => choice.PluginId is null
         ? new CliArgs("dp", "reset", "--screen", key)

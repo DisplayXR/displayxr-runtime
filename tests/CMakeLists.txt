@@ -1128,6 +1128,32 @@ if(TARGET tests_oxr_view_space)
 			         )
 		endif()
 
+		# ADR-066 Part B, headless: the per-screen viewer-tracking setting (off / 3d /
+		# always) over the real sim_tracking plug-in and the runtime glue. Two
+		# processes (the scan is one-shot): the scripted source with its own opt-in
+		# off (it serves only screens that ask), and SOURCE=webcam on the default
+		# build's stub estimator ("unavailable: no face estimator"). No camera is
+		# opened in either arm; DXR_VIEWER_POSE_PAGE=none keeps a dev box's
+		# service page out of it.
+		add_executable(tests_viewer_tracking_per_screen tests_viewer_tracking_per_screen.cpp)
+		target_link_libraries(
+			tests_viewer_tracking_per_screen PRIVATE xrt-external-catch2 target_lists xrt-interfaces aux_util
+			                                         aux_os
+			)
+		add_dependencies(tests_viewer_tracking_per_screen drv_sim_tracking_plugin)
+		add_test(NAME tests_viewer_tracking_per_screen_script
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
+		                 DXR_TRACKING_SIM_TRACKING_SOURCE=script DXR_TRACKING_SIM_TRACKING_ENABLE=0
+		                 DXR_VIEWER_POSE_PAGE=none
+		                 $<TARGET_FILE:tests_viewer_tracking_per_screen> "[script],[script_default]" --success
+		         )
+		add_test(NAME tests_viewer_tracking_per_screen_stub
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
+		                 DXR_TRACKING_SIM_TRACKING_SOURCE=webcam DXR_TRACKING_SIM_TRACKING_ENABLE=0
+		                 DXR_TRACKING_SIM_TRACKING_WEBCAM_ESTIMATOR=none DXR_VIEWER_POSE_PAGE=none
+		                 $<TARGET_FILE:tests_viewer_tracking_per_screen> "[stub]" --success
+		         )
+
 		# Camera-pose calibration end to end (tracking-provider-discovery.md, "Camera
 		# pose calibration"): the real sim_tracking plug-in with a hidden
 		# CAMERA_TRUE_POSE -> camera-space samples at five dots x two distances ->
