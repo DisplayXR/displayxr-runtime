@@ -182,6 +182,17 @@ void
 comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 /*!
+ * ADR-047 Amendment 10 over IPC: the rendering-mode table this client's app is
+ * told, as the service computed it from where the client's window (or the
+ * present-owner window it shares) is. Read from the client's shared memory —
+ * no round trip, so it is cheap per locate / poll. @return its validity
+ * (invalid = the head device's table stands).
+ */
+struct xrt_effective_mode_table;
+bool
+comp_ipc_client_compositor_get_effective_table(struct xrt_compositor *xc, struct xrt_effective_mode_table *out);
+
+/*!
  * XR_DXR_display_info v25 over IPC: tell the service whether this client's
  * locates are fixed-viewer (XrViewLocateFixedViewerDXR) — framed for the
  * nominal viewer, asking the service-hosted viewer tracking for nothing. The

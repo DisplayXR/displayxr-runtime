@@ -34,6 +34,7 @@
 #include "xrt/xrt_results.h"
 
 #include "sim_display_interface.h"
+#include "sim_display_modes.h"
 #include "sim_display_settings.h"
 #include "sim_display_stereo_camera.h"
 #if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
@@ -219,6 +220,58 @@ sim_display_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst
 	}
 	if (out_info->struct_size >= offsetof(struct xrt_plugin_display_info, refresh_mhz) + sizeof(uint32_t)) {
 		out_info->refresh_mhz = display->refresh_mhz;
+	}
+	return true;
+}
+
+/*!
+ * ADR-047 Amendment 10: the declared list of ONE monitor sim_display won — the
+ * same table as its head device (sim_display_modes.h), so every sim screen
+ * offers the same 3D modes, each with its own per-screen choice. Quad is
+ * declared when OUTPUT=quad was set at start-up (the interim rule), listed
+ * START_UP_ONLY otherwise; the default 3D entry is the one OUTPUT names now.
+ */
+static bool
+sim_display_plugin_get_rendering_modes_for_monitor(struct xrt_plugin_instance *inst,
+                                                   const struct xrt_display_descriptor *display,
+                                                   const struct xrt_display_physical *physical,
+                                                   struct xrt_rendering_mode *out_modes,
+                                                   uint32_t capacity,
+                                                   uint32_t *out_count,
+                                                   uint32_t *out_default_3d)
+{
+	(void)inst;
+	(void)display;
+	(void)physical;
+	if (out_modes == NULL || out_count == NULL || capacity == 0) {
+		return false;
+	}
+	char start[32];
+	enum sim_display_output_mode start_kind = SIM_DISPLAY_DEFAULT_KIND;
+	(void)sim_display_kind_parse(sim_display_setting("OUTPUT", start, sizeof(start)) ? start : NULL, &start_kind);
+	const bool include_quad = start_kind == SIM_DISPLAY_OUTPUT_QUAD;
+
+	struct xrt_rendering_mode all[XRT_MAX_RENDERING_MODES];
+	const uint32_t n = sim_display_fill_declared(
+	    include_quad, sim_display_fake_tracking_enabled() || sim_display_webcam_tracking_enabled(), all, NULL);
+	const uint32_t count = n < capacity ? n : capacity;
+	for (uint32_t i = 0; i < count; i++) {
+		out_modes[i] = all[i];
+	}
+	*out_count = count;
+
+	if (out_default_3d != NULL) {
+		char now[32];
+		enum sim_display_output_mode want = SIM_DISPLAY_DEFAULT_KIND;
+		if (!sim_display_kind_parse(sim_display_setting_reread("OUTPUT", now, sizeof(now)) ? now : NULL,
+		                            &want)) {
+			want = SIM_DISPLAY_DEFAULT_KIND;
+		}
+		uint32_t entry = sim_display_entry_for_kind(want, count);
+		if (entry != 0 && want == SIM_DISPLAY_OUTPUT_QUAD && !include_quad) {
+			entry = 0; // listed START_UP_ONLY: not selectable on this run
+		}
+		*out_default_3d = entry != 0 ? entry : sim_display_entry_for_kind(SIM_DISPLAY_DEFAULT_KIND, count);
 	}
 	return true;
 }
@@ -529,6 +582,9 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 
     /* ADR-054 N6 Part 2: views may follow a viewer-tracking provider when sim does not track. */
     .get_viewer_policy = sim_display_plugin_get_viewer_policy,
+
+    /* ADR-047 Amendment 10: each sim screen's own declared list and default 3D entry. */
+    .get_rendering_modes_for_monitor = sim_display_plugin_get_rendering_modes_for_monitor,
 };
 
 

@@ -25,6 +25,8 @@
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_rendering_modes.h"
+#include "xrt/xrt_display_status.h"
+#include "util/u_setting.h"
 #include "util/u_system.h"
 #include "util/u_time.h"
 #include "util/u_tiling.h"
@@ -45,6 +47,8 @@
 
 #include "target_plugin_loader.h"
 #include "target_screens.h"
+#include "target_screen_modes.h"
+#include "util/u_screen_modes.h"
 #include "target_display_hotplug.h"
 #include "target_viewer_tracking.h"
 
@@ -330,6 +334,20 @@ static struct xrt_plugin_display_info g_display_info_applied;
 static bool g_display_info_applied_valid = false;
 static struct os_mutex g_display_info_mutex;
 static bool g_display_info_mutex_initialized = false;
+
+/*!
+ * ADR-047 Amendment 10 decision 1: the instance's worst case over EVERY
+ * claimed screen's mode list, taken once when the system's screens are first
+ * published and fixed from then on (ADR-010: size once, never recreate).
+ * apply_plugin_display_info max-merges it back after recomputing the head
+ * screen's part, so a later refresh never shrinks what apps were told.
+ */
+static struct
+{
+	bool valid;
+	uint32_t atlas_w, atlas_h;
+	uint32_t view_w, view_h;
+} g_instance_worst;
 //! When the plug-in last DECLINED (returned false); re-asking is throttled for
 //! @ref DISPLAY_INFO_DECLINE_RETRY_NS after that. A compliant plug-in declines
 //! fast, but a pre-contract one may spend its whole SR query budget inside the
@@ -417,7 +435,8 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 	// FALSE). One-shot WARN per apply, not fatal.
 	{
 		bool any_tracked = false;
-		for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+		const uint32_t n_modes = u_device_rendering_modes_envelope_count(head);
+		for (uint32_t mi = 0; mi < n_modes; mi++) {
 			if (head->rendering_modes[mi].mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) {
 				any_tracked = true;
 				break;
@@ -451,6 +470,12 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 	// the table the runtime actually serves.
 	(void)u_device_reenforce_two_rendering_modes(head, plugin->id);
 
+	// ADR-066 C1.4: everything below is computed over the ENVELOPE - the full
+	// declared list the device keeps behind its two slots - so a live config
+	// switch that remaps slot 1 finds its entry already tiled and the worst-
+	// case atlas already large enough.
+	const uint32_t env_count = u_device_rendering_modes_envelope_count(head);
+
 	// Compute tiling once we have native pixel dims. The per-mode
 	// fields are filled for the current orientation, but the
 	// system-wide atlas is the worst case ACROSS orientations for
@@ -458,13 +483,13 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 	// on Android the app's render swapchain is never recreated on a
 	// device flip, so it must be allocated large enough for either.
 	if (pdi->display_pixel_width > 0 && pdi->display_pixel_height > 0) {
-		for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+		for (uint32_t mi = 0; mi < env_count; mi++) {
 			u_tiling_compute_mode(&head->rendering_modes[mi], pdi->display_pixel_width,
 			                      pdi->display_pixel_height);
 		}
-		u_tiling_compute_system_atlas_oriented(head->rendering_modes, head->rendering_mode_count,
-		                                       pdi->display_pixel_width, pdi->display_pixel_height,
-		                                       &info->atlas_width_pixels, &info->atlas_height_pixels);
+		u_tiling_compute_system_atlas_oriented(head->rendering_modes, env_count, pdi->display_pixel_width,
+		                                       pdi->display_pixel_height, &info->atlas_width_pixels,
+		                                       &info->atlas_height_pixels);
 	}
 
 	// Recommended view scale: prefer iface-supplied (Leia SR
@@ -480,17 +505,52 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 		info->recommended_view_scale_x = pdi->recommended_view_scale_x;
 		info->recommended_view_scale_y = pdi->recommended_view_scale_y;
 	} else {
-		float min_scale_x = 1.0f, min_scale_y = 1.0f;
-		for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
-			if (head->rendering_modes[mi].view_scale_x > 0.0f &&
-			    head->rendering_modes[mi].view_scale_x < min_scale_x)
-				min_scale_x = head->rendering_modes[mi].view_scale_x;
-			if (head->rendering_modes[mi].view_scale_y > 0.0f &&
-			    head->rendering_modes[mi].view_scale_y < min_scale_y)
-				min_scale_y = head->rendering_modes[mi].view_scale_y;
+		// ADR-047 Amendment 10 (the app-side review): the 3D SLOT's scale -
+		// what an app in 3D renders on this screen - not the smallest scale
+		// anywhere in the declared list. With ADR-066 C1 the list holds every
+		// kind the user may pick (half-resolution anaglyph next to the
+		// full-resolution "Same as 2D" default), so the minimum named a mode
+		// the screen is not in and halved every app's recommended size.
+		const uint32_t slot =
+		    head->rendering_mode_count > U_RENDERING_MODE_3D ? U_RENDERING_MODE_3D : U_RENDERING_MODE_2D;
+		float sx = head->rendering_mode_count > 0 ? head->rendering_modes[slot].view_scale_x : 1.0f;
+		float sy = head->rendering_mode_count > 0 ? head->rendering_modes[slot].view_scale_y : 1.0f;
+		info->recommended_view_scale_x = sx > 0.0f ? sx : 1.0f;
+		info->recommended_view_scale_y = sy > 0.0f ? sy : 1.0f;
+	}
+
+	// ADR-047 Amendment 10: the largest per-view rect of the head screen's
+	// list (maxImageRect*), then the instance's worst case over every claimed
+	// screen once it is known (fixed per instance).
+	if (pdi->display_pixel_width > 0 && pdi->display_pixel_height > 0) {
+		uint32_t vw = 0, vh = 0;
+		for (uint32_t mi = 0; mi < env_count; mi++) {
+			if (head->rendering_modes[mi].view_count > XRT_MAX_VIEWS) {
+				continue;
+			}
+			if (head->rendering_modes[mi].view_width_pixels > vw) {
+				vw = head->rendering_modes[mi].view_width_pixels;
+			}
+			if (head->rendering_modes[mi].view_height_pixels > vh) {
+				vh = head->rendering_modes[mi].view_height_pixels;
+			}
 		}
-		info->recommended_view_scale_x = min_scale_x;
-		info->recommended_view_scale_y = min_scale_y;
+		info->worst_view_width_pixels = vw;
+		info->worst_view_height_pixels = vh;
+	}
+	if (g_instance_worst.valid) {
+		if (g_instance_worst.atlas_w > info->atlas_width_pixels) {
+			info->atlas_width_pixels = g_instance_worst.atlas_w;
+		}
+		if (g_instance_worst.atlas_h > info->atlas_height_pixels) {
+			info->atlas_height_pixels = g_instance_worst.atlas_h;
+		}
+		if (g_instance_worst.view_w > info->worst_view_width_pixels) {
+			info->worst_view_width_pixels = g_instance_worst.view_w;
+		}
+		if (g_instance_worst.view_h > info->worst_view_height_pixels) {
+			info->worst_view_height_pixels = g_instance_worst.view_h;
+		}
 	}
 
 	// Per-API DP factories from the iface — factored into
@@ -759,6 +819,10 @@ publish_screens_locked(const struct xrt_system_compositor_info *info, bool initi
 	target_screens_system_from_info(info, &sys);
 	target_screens_build(&info->dp_registry, info->active_plugin_id, &sys, now);
 
+	// ADR-047 Amendment 10: every screen's own mode table, re-read on every
+	// publish (a hotplugged screen brings its list; a re-claim swaps it).
+	target_screen_modes_publish(now, &info->dp_registry, g_display_info_head, initial);
+
 	bool changed = false;
 	if (initial) {
 		g_published_screens = *now;
@@ -792,6 +856,29 @@ publish_screens_locked(const struct xrt_system_compositor_info *info, bool initi
 				    (sc->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0 ? " (system default)" : "");
 			}
 			g_published_screens = *now;
+			// ADR-047 Amendment 10 / ADR-066 C2: a screen that arrived after
+			// the instance was sized and does not fit its worst case is
+			// clamped and resampled for running apps (recreation is C2, a
+			// later stage); status reports its entries as restart_app.
+			if (g_instance_worst.valid) {
+				struct u_screen_mode_table *tbl = calloc(1, sizeof(*tbl));
+				for (uint32_t i = 0; tbl != NULL && i < now->count && i < XRT_SCREEN_LIST_MAX; i++) {
+					if (u_screen_modes_get(now->screens[i].id, tbl) && tbl->sized &&
+					    !u_screen_modes_table_fits(tbl, g_instance_worst.atlas_w,
+					                               g_instance_worst.atlas_h)) {
+						U_LOG_W(
+						    "display hotplug: screen 0x%016llx '%s' needs a larger atlas than "
+						    "this "
+						    "instance was sized for (%ux%u): running apps see it clamped and "
+						    "resampled until they restart (applies: restart_app; ADR-066 C2 is "
+						    "a "
+						    "later stage)",
+						    (unsigned long long)now->screens[i].id, now->screens[i].key,
+						    g_instance_worst.atlas_w, g_instance_worst.atlas_h);
+					}
+				}
+				free(tbl);
+			}
 			// ADR-054 N6 Part 2: a new topology re-routes the viewer source
 			// per screen (a hotplugged EXTERNAL_OK screen takes the provider,
 			// a tracking one keeps its own; the primary stays as created).
@@ -918,6 +1005,11 @@ t_syscomp_destroy_hook(struct xrt_system_compositor *xsysc)
 	// this point must not query the plug-in about it.
 	g_display_info_head = NULL;
 	g_display_info_applied_valid = false;
+	// ADR-047 Amendment 10: the per-screen tables and the worst case belong
+	// to this system.
+	g_instance_worst.valid = false;
+	u_screen_modes_clear();
+	u_screen_modes_set_instance_worst(0, 0);
 	if (g_display_info_mutex_initialized) {
 		os_mutex_unlock(&g_display_info_mutex);
 	}
@@ -967,6 +1059,30 @@ display_hotplug_begin(struct xrt_system_compositor *xsysc)
 	os_mutex_lock(&g_display_info_mutex);
 	g_hotplug_info = &xsysc->info;
 	(void)publish_screens_locked(&xsysc->info, true);
+	// ADR-047 Amendment 10 decision 1: size the instance over every claimed
+	// screen (the per-dimension union), once, now that every screen's list is
+	// known. apply_plugin_display_info keeps it from here on.
+	{
+		struct xrt_system_compositor_info *info = &xsysc->info;
+		const uint32_t head_w = info->atlas_width_pixels, head_h = info->atlas_height_pixels;
+		uint32_t aw = head_w, ah = head_h;
+		uint32_t vw = info->worst_view_width_pixels, vh = info->worst_view_height_pixels;
+		u_screen_modes_registry_union(&aw, &ah, &vw, &vh);
+		g_instance_worst.valid = true;
+		g_instance_worst.atlas_w = aw;
+		g_instance_worst.atlas_h = ah;
+		g_instance_worst.view_w = vw;
+		g_instance_worst.view_h = vh;
+		info->atlas_width_pixels = aw;
+		info->atlas_height_pixels = ah;
+		info->worst_view_width_pixels = vw;
+		info->worst_view_height_pixels = vh;
+		u_screen_modes_set_instance_worst(aw, ah);
+		U_LOG_W(
+		    "instance worst case over every claimed screen (ADR-047 Amendment 10): atlas %ux%u (the head "
+		    "screen alone %ux%u), largest view %ux%u",
+		    aw, ah, head_w, head_h, vw, vh);
+	}
 	// ADR-066 Part B: the primary's viewer-tracking setting is known now (its
 	// screen key): recompose its advertisement before any session reads it.
 	target_viewer_tracking_recompose(&xsysc->info, g_display_info_head);
@@ -1341,6 +1457,9 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	}
 }
 
+static bool
+head_screen_mode_choice(struct xrt_device *xdev, char *out_name, size_t cap, uint32_t *out_source);
+
 static xrt_result_t
 t_instance_create_system(struct xrt_instance *xinst,
                          struct xrt_system **out_xsys,
@@ -1381,6 +1500,9 @@ t_instance_create_system(struct xrt_instance *xinst,
 	// (tile layout, V-key toggle), the IPC shared-memory copy, oxr's system
 	// view count (hmd->view_count, recomputed by the trim). A longer table is
 	// trimmed with one WARN naming the driver.
+	// ADR-066 C1: no per-screen 3D-mode resolver until THIS system has
+	// published its screens below (a previous instance's are gone).
+	u_rendering_modes_set_choice_resolver(NULL);
 	if (xsysd->static_roles.head != NULL) {
 		const struct xrt_plugin_iface *tm_plugin = target_plugin_get_active();
 		(void)u_device_enforce_two_rendering_modes(xsysd->static_roles.head,
@@ -1568,6 +1690,52 @@ out:
 			os_mutex_unlock(&g_display_info_mutex);
 		}
 
+		// ADR-066 C1: the head screen's 3D-mode choice steers slot 1 from
+		// here on (the slot refresh polls it); apply it now, before any session
+		// exists, so the first one starts in the chosen entry.
+		u_rendering_modes_set_choice_resolver(head_screen_mode_choice);
+		// ADR-047 Amendment 10: a stored choice `dp mode set` accepted as
+		// `applies: restart_app` (a start-up-only entry: sim_display's Quad)
+		// is declared now, at this start, before the instance is sized -
+		// then re-tiled, and the worst case widened, like OUTPUT=quad at start.
+		if (head != NULL) {
+			char start_choice[64] = {0};
+			uint32_t start_src = 0;
+			if (head_screen_mode_choice(head, start_choice, sizeof(start_choice), &start_src) &&
+			    u_device_rendering_modes_promote_choice(head, start_choice) &&
+			    xsysc->info.display_pixel_width > 0 && xsysc->info.display_pixel_height > 0) {
+				struct xrt_system_compositor_info *si = &xsysc->info;
+				const uint32_t env = u_device_rendering_modes_envelope_count(head);
+				for (uint32_t mi = 0; mi < env; mi++) {
+					u_tiling_compute_mode(&head->rendering_modes[mi], si->display_pixel_width,
+					                      si->display_pixel_height);
+					if (head->rendering_modes[mi].view_width_pixels > si->worst_view_width_pixels) {
+						si->worst_view_width_pixels =
+						    head->rendering_modes[mi].view_width_pixels;
+					}
+					if (head->rendering_modes[mi].view_height_pixels >
+					    si->worst_view_height_pixels) {
+						si->worst_view_height_pixels =
+						    head->rendering_modes[mi].view_height_pixels;
+					}
+				}
+				uint32_t aw = 0, ah = 0;
+				u_tiling_compute_system_atlas_oriented(head->rendering_modes, env,
+				                                       si->display_pixel_width,
+				                                       si->display_pixel_height, &aw, &ah);
+				if (aw > si->atlas_width_pixels) {
+					si->atlas_width_pixels = aw;
+				}
+				if (ah > si->atlas_height_pixels) {
+					si->atlas_height_pixels = ah;
+				}
+			}
+		}
+		if (head != NULL) {
+			const struct xrt_plugin_iface *rm_plugin = target_plugin_get_active();
+			(void)u_device_rendering_modes_refresh_config(head, rm_plugin != NULL ? rm_plugin->id : NULL);
+		}
+
 		// #2617: the destroy hook clears the statics above, hotplug or not.
 		(void)syscomp_destroy_hook_install(xsysc);
 
@@ -1616,6 +1784,47 @@ t_instance_get_active_plugin(struct xrt_instance *xinst,
 	*out_iface = iface;
 	*out_inst = iface != NULL ? target_plugin_get_active_instance() : NULL;
 	return iface != NULL;
+}
+
+/*!
+ * ADR-066 C1: the per-screen 3D-mode choice of the head device's screen — the
+ * system-default screen, `screens[0]` of the list below (its DP is the
+ * primary). Reads the store fresh (u_setting); called by the runtime's slot
+ * refresh at most once a second, with none of u_rendering_modes' locks held.
+ */
+static bool
+head_screen_mode_choice(struct xrt_device *xdev, char *out_name, size_t cap, uint32_t *out_source)
+{
+	(void)xdev;
+	if (!g_display_info_mutex_initialized) {
+		return false;
+	}
+	char key[XRT_SCREEN_NAME_MAX] = {0};
+	struct xrt_screen_list *list = calloc(1, sizeof(*list));
+	if (list == NULL) {
+		return false;
+	}
+	os_mutex_lock(&g_display_info_mutex);
+	if (g_screens_info != NULL) {
+		struct target_screens_system sys;
+		target_screens_system_from_info(g_screens_info, &sys);
+		target_screens_build(&g_screens_info->dp_registry, g_screens_info->active_plugin_id, &sys, list);
+		if (list->count > 0) {
+			snprintf(key, sizeof(key), "%s", list->screens[0].key);
+		}
+	}
+	os_mutex_unlock(&g_display_info_mutex);
+	free(list);
+	if (key[0] == '\0') {
+		return false;
+	}
+	enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+	if (u_setting_get_mode_3d_for_screen(key, out_name, cap, &src) == NULL) {
+		return false;
+	}
+	*out_source =
+	    src == U_SETTING_SOURCE_MACHINE ? XRT_STATUS_MODE_3D_SOURCE_MACHINE : XRT_STATUS_MODE_3D_SOURCE_USER;
+	return true;
 }
 
 /*!

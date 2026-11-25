@@ -264,6 +264,47 @@ struct xrt_segment_metric
 	bool have_eyes; //!< @ref eyes is valid (the DP reported them)
 };
 
+//! Size of @ref xrt_effective_mode_slot::mode_name, incl. the NUL.
+#define XRT_EFFECTIVE_MODE_NAME_MAX 64
+
+/*!
+ * One slot of a window's effective rendering-mode table (ADR-047 Amendment
+ * 10): what xrEnumerateDisplayRenderingModesDXR reports for it.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_effective_mode_slot
+{
+	uint32_t view_count;
+	uint32_t tile_columns;
+	uint32_t tile_rows;
+	float view_scale_x; //!< Window axes.
+	float view_scale_y;
+	bool hardware_display_3d;
+	uint32_t mode_flags;
+	uint32_t view_width_pixels; //!< The layout screen's pixels x the effective scale.
+	uint32_t view_height_pixels;
+	char mode_name[XRT_EFFECTIVE_MODE_NAME_MAX];
+};
+
+/*!
+ * The effective rendering-mode table of one window (ADR-047 Amendment 10):
+ * the two slots its app enumerates, following the screen(s) the window is on
+ * (`util/u_screen_modes.h` has the rule). Plain data, no pointers: it rides
+ * @ref xrt_segment_metrics by value, in-process and over IPC.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_effective_mode_table
+{
+	bool valid;                   //!< false: report the head device's table (nothing per screen known).
+	uint32_t screen_count;        //!< Covered screens it was computed over.
+	uint64_t majority_screen_id;  //!< The screen holding most of the window.
+	uint64_t layout_screen_id[2]; //!< Per slot: the screen whose entry gave the layout.
+	bool clamped[2];              //!< Per slot: the scale was clamped to the instance's worst case.
+	struct xrt_effective_mode_slot slot[2];
+};
+
 /*!
  * The segment table of a window, for per-segment views (multi-screen M3).
  *
@@ -292,6 +333,15 @@ struct xrt_segment_metrics
 	//! the viewer). 0 for an OS window (it IS on the screen plane); a workspace
 	//! tile's pose z (ADR-052 D2) — every segment's canvas sits at this depth.
 	float window_depth_m;
+
+	/*!
+	 * ADR-047 Amendment 10: the rendering-mode table the window's app is told
+	 * (the view size follows the window's screen), after the hysteresis.
+	 * Filled whether or not the window is segmented (@ref count may be 0 with
+	 * a valid table: a window wholly on the session screen); invalid when the
+	 * compositor does not compute one (the head device's table stands).
+	 */
+	struct xrt_effective_mode_table table;
 };
 
 /*!

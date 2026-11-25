@@ -8,8 +8,14 @@ related: [ADR-010, ADR-014, ADR-022, ADR-027, ADR-028, ADR-030, ADR-041]
 # ADR-065: Two run-time rendering modes per display driver; the 3D kind is a start-up setting
 
 **Status:** Accepted (2026-11-22), stage A of
-[#2766](https://github.com/DisplayXR/displayxr-runtime/issues/2766). Stage B (changing the kind
-while apps run) is explicitly deferred. Related:
+[#2766](https://github.com/DisplayXR/displayxr-runtime/issues/2766). **Stage B is superseded by
+ADR-066 C1** (implemented): the runtime keeps each driver's full declared list as the sizing
+envelope, apps still see two slots, and the 3D kind (now "the screen's 3D mode", a runtime-owned
+per-screen setting with the driver's own setting as its default) applies live by remapping slot 1,
+announced with `XrEventDataRenderingModeTableChangedDXR` (`XR_DXR_display_info` v27). Decisions 1,
+2 and 4 below are amended by it (nothing is dropped; sizing is over the full list; the kind applies
+live), and sim_display's default kind is now **Same as 2D**, not anaglyph. The text below is the
+ADR as accepted. Related:
 [ADR-010](ADR-010-shared-app-iosurface-worst-case-sized.md) (size once, never recreate — kept),
 [ADR-028](ADR-028-display-mode-recipe-vs-hardware-state.md) (the mode is the content recipe),
 [ADR-041](ADR-041-fixed-view-count-with-per-frame-activity.md) (fixed view count),
@@ -121,6 +127,9 @@ modes with the kind fixed at start-up needs none of that.
   restart; owners of a shipping display never change it.
 
 ## Deferred: changing the kind while apps run (stage B)
+
+> **Superseded by ADR-066 C1 (implemented).** The envelope is the list each driver already
+> declares, so no swapchain is recreated for any entry of it; see the status note above.
 
 Not decided here. It would need a new display-info event ("the mode table changed: re-read it
 and recreate your swapchains") with a SPEC_VERSION bump and a defined outcome for apps that

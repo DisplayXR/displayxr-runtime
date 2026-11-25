@@ -468,6 +468,55 @@ struct xrt_status_mode
 	bool is_3d;     //!< Hardware display in 3D.
 };
 
+//! Choices carried in @ref xrt_status_mode_3d (= XRT_MAX_RENDERING_MODES).
+#define XRT_STATUS_MAX_MODE_3D_CHOICES 8
+
+//! Where a screen's 3D mode came from (ADR-066 C1). JSON strings in parentheses.
+enum xrt_status_mode_3d_source
+{
+	XRT_STATUS_MODE_3D_SOURCE_RUNTIME_DEFAULT = 0, //!< ("runtime_default") nothing chose: the runtime's pick.
+	XRT_STATUS_MODE_3D_SOURCE_DRIVER_DEFAULT = 1,  //!< ("driver_default") the driver's own setting.
+	XRT_STATUS_MODE_3D_SOURCE_USER = 2,            //!< ("user") the per-user per-screen choice.
+	XRT_STATUS_MODE_3D_SOURCE_MACHINE = 3,         //!< ("machine") the machine-wide per-screen choice.
+};
+
+//! Whether a 3D-mode choice can take effect (JSON "now" / "restart_app" / "not_supported").
+enum xrt_status_mode_3d_applies
+{
+	XRT_STATUS_MODE_3D_APPLIES_NOW = 0,           //!< In the declared list: a live remap.
+	XRT_STATUS_MODE_3D_APPLIES_RESTART_APP = 1,   //!< Needs a new instance (outside what is sized).
+	XRT_STATUS_MODE_3D_APPLIES_NOT_SUPPORTED = 2, //!< Cannot apply on this screen.
+};
+
+//! One declared rendering mode a screen's 3D slot can map to.
+struct xrt_status_mode_3d_choice
+{
+	char name[32];    //!< Stable choice name (the slug of the driver's mode name, e.g. "same_as_2d").
+	char label[32];   //!< The driver's own mode name, plain words (e.g. "Same as 2D").
+	uint32_t views;   //!< View count.
+	bool tracked;     //!< The entry follows the viewer (HAS_TRACKING).
+	bool passthrough; //!< One full-resolution view serving as the 3D slot (lens stays 2D).
+	uint32_t applies; //!< `enum xrt_status_mode_3d_applies`.
+	char reason[96];  //!< Why, when not NOW ("" otherwise).
+};
+
+/*!
+ * A screen's "3D mode" (ADR-066 C1): which declared entry its 3D slot maps
+ * to, what chose it, and every entry it could map to. JSON `mode_3d`.
+ */
+struct xrt_status_mode_3d
+{
+	bool valid;       //!< The screen's driver table is known (@ref active, @ref choices meaningful).
+	char active[32];  //!< The entry slot 1 maps to now (a choice name).
+	char setting[32]; //!< The stored per-screen choice ("" = none: JSON null).
+	uint32_t source;  //!< `enum xrt_status_mode_3d_source`.
+	uint32_t choice_count;
+	struct xrt_status_mode_3d_choice choices[XRT_STATUS_MAX_MODE_3D_CHOICES];
+	//! Why there are no choices ("" = none): a stored choice for a screen whose
+	//! driver declares no 3D modes now (JSON top-level `reason`, else null).
+	char reason[96];
+};
+
 //! One DP bound to a screen (phase 2).
 struct xrt_status_dp
 {
@@ -497,6 +546,7 @@ struct xrt_status_screen
 	struct xrt_status_layout layout;             //!< Metres + nominal viewer.
 	struct xrt_status_eye_tracking eye_tracking; //!< Caps + live state.
 	struct xrt_status_mode mode;                 //!< Current rendering mode (phase 2).
+	struct xrt_status_mode_3d mode_3d;           //!< The screen's 3D mode (ADR-066 C1).
 	uint32_t dp_count;                           //!< Valid entries in @ref dps.
 	struct xrt_status_dp dps[XRT_STATUS_MAX_SCREEN_DPS];         //!< DPs bound to the screen (phase 2).
 	struct xrt_status_vendor vendor;                             //!< Vendor cell (phase 3).
@@ -883,6 +933,7 @@ struct xrt_status_live
 	uint32_t dp_count;                                        //!< Valid entries in @ref dps.
 	struct xrt_status_live_dp dps[XRT_STATUS_MAX_LIVE_DPS];   //!< Bound DPs.
 	struct xrt_status_mode mode;                              //!< The head's current rendering mode.
+	struct xrt_status_mode_3d mode_3d;                        //!< The head's 3D mode (ADR-066 C1).
 	struct xrt_status_workspace workspace;                    //!< Workspace state.
 	//! ADR-053: the conversion core's rows as the service's conversion status
 	//! source reports them (`ipc_server_set_conv_status_source`; none = 0 rows).

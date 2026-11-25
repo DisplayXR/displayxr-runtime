@@ -19,6 +19,8 @@
 #include "xrt/xrt_screen.h"
 #include "xrt/xrt_tracking_plugin.h"
 
+#include "util/u_rendering_modes.h"
+
 #include "util/u_eye_history.h"
 #include "util/u_logging.h"
 #include "util/u_setting.h"
@@ -843,7 +845,11 @@ compose_mode_flags(struct xrt_device *head, const struct target_viewer_decision 
 	if (head == NULL) {
 		return;
 	}
-	for (uint32_t mi = 0; mi < head->rendering_mode_count && mi < 64; mi++) {
+	// Over the envelope (ADR-066 C1): a live 3D-mode switch copies an envelope
+	// entry into slot 1, so every declared entry carries its flag, not only
+	// the two presented slots.
+	const uint32_t n_modes = u_device_rendering_modes_envelope_count(head);
+	for (uint32_t mi = 0; mi < n_modes && mi < 64; mi++) {
 		struct xrt_rendering_mode *m = &head->rendering_modes[mi];
 		const uint64_t bit = (uint64_t)1 << mi;
 		if ((g_marked_modes & bit) != 0) {

@@ -527,6 +527,15 @@ oxr_system_fill_in(
 			if (h_max < info->display_pixel_height) {
 				h_max = info->display_pixel_height;
 			}
+			// ADR-047 Amendment 10: the largest view any entry of any claimed
+			// screen's list can ask for (a window moved to a larger screen,
+			// or a 3D mode with a larger scale), fixed for the instance.
+			if (w_max < info->worst_view_width_pixels) {
+				w_max = info->worst_view_width_pixels;
+			}
+			if (h_max < info->worst_view_height_pixels) {
+				h_max = info->worst_view_height_pixels;
+			}
 		} else {
 			// Legacy: no display processor, use compositor recommended directly
 			w = (uint32_t)(info->views[di].recommended.width_pixels * scale);
@@ -1133,6 +1142,30 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 		display_info->nominalViewerPositionInDisplaySpace.z = info ? info->nominal_viewer_z_m : 0.5f;
 		display_info->displayPixelWidth = info ? info->display_pixel_width : 0;
 		display_info->displayPixelHeight = info ? info->display_pixel_height : 0;
+	}
+
+	// v28 (ADR-047 Amendment 10): the instance's worst case over every claimed
+	// screen's full mode list - what an app sizes its swapchain from once.
+	XrDisplayRenderingWorstCaseDXR *worst = NULL;
+	if (sys->inst->extensions.DXR_display_info) {
+		worst = OXR_GET_OUTPUT_FROM_CHAIN(properties, XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR,
+		                                  XrDisplayRenderingWorstCaseDXR);
+	}
+	if (worst != NULL) {
+		struct xrt_device *wc_head = GET_XDEV_BY_ROLE(sys, head);
+		uint32_t vw = info ? info->worst_view_width_pixels : 0;
+		uint32_t vh = info ? info->worst_view_height_pixels : 0;
+		if (info != NULL && vw == 0) {
+			vw = info->display_pixel_width;
+		}
+		if (info != NULL && vh == 0) {
+			vh = info->display_pixel_height;
+		}
+		worst->maxAtlasWidthPixels = info ? info->atlas_width_pixels : 0;
+		worst->maxAtlasHeightPixels = info ? info->atlas_height_pixels : 0;
+		worst->maxViewWidthPixels = vw;
+		worst->maxViewHeightPixels = vh;
+		worst->maxViewCount = (wc_head != NULL && wc_head->hmd != NULL) ? wc_head->hmd->view_count : 0;
 	}
 
 	// v16: 3D panel desktop position, so handle/texture-class apps can create

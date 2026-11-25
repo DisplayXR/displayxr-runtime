@@ -3193,6 +3193,18 @@ struct xrt_system_compositor_info
 	//! cannot be swapped under live sessions, so a complete adoption needs a new
 	//! system: the service restarts itself once no client is connected.
 	bool head_device_stale;
+
+	/*!
+	 * ADR-047 Amendment 10: the largest per-view rect any entry of any claimed
+	 * screen's mode list can ask for (the per-dimension maximum of view
+	 * scale x that screen's pixels), fixed for the instance like
+	 * @ref atlas_width_pixels — which, since the same amendment, is the
+	 * worst case over every claimed screen too. `maxImageRect*` and the
+	 * XR_DXR_display_info worst-case statement report these. 0 = unknown
+	 * (the session screen's display pixels stand in).
+	 */
+	uint32_t worst_view_width_pixels;
+	uint32_t worst_view_height_pixels;
 };
 
 struct xrt_system_compositor;

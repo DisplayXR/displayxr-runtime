@@ -8,6 +8,7 @@
  */
 
 #include "comp_vk_native_segments.h"
+#include "util/comp_segments_view_size.h"
 
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_limits.h"
@@ -83,6 +84,9 @@ struct seg_screen_state
 	//! Windows (ADR-047 Amendment 2): this DP holds the session's window —
 	//! it is the owner, and phases from the window, not the present origin.
 	bool has_hwnd;
+	//! ADR-047 Amendment 10: the entry last told to @ref dp through
+	//! set_output_entry, plus one (0 = never told).
+	int32_t entry_sent_plus1;
 
 	/*!
 	 * One DP input image PER FRAME CLASS. The repaint ("fill") parks on its
@@ -182,6 +186,15 @@ struct comp_vk_native_segments
 	 * destroy segment DPs.
 	 */
 	struct os_mutex dp_mutex;
+
+	/*!
+	 * ADR-047 Amendment 10: the view size follows the window's screen — the
+	 * covered screens after the dwell, each screen's own table, and the
+	 * effective table the app is told. Written on the weave thread
+	 * (comp_vk_native_segments_update_view_size), read by the app thread
+	 * under @ref dp_mutex (comp_vk_native_segments_get_effective_table).
+	 */
+	struct comp_segments_view_size vs;
 };
 
 
@@ -390,6 +403,7 @@ dp_release(struct comp_vk_native_segments *segs, uint32_t i)
 	}
 	st->mode_sent = -1;
 	st->uncovered = false;
+	st->entry_sent_plus1 = 0;
 }
 
 /*!
@@ -1023,6 +1037,7 @@ comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool, VkQ
 	}
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
 	comp_segments_cover_dwell_init(&segs->cover, 0);
+	comp_segments_view_size_init(&segs->vs);
 	if (os_mutex_init(&segs->dp_mutex) != 0) {
 		free(segs);
 		return NULL;
@@ -1086,6 +1101,9 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 	}
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
 	comp_segments_cover_dwell_init(&segs->cover, 0);
+	os_mutex_lock(&segs->dp_mutex);
+	comp_segments_view_size_init(&segs->vs); // new screens: re-read every table
+	os_mutex_unlock(&segs->dp_mutex);
 	segs->primary_index = UINT32_MAX;
 	segs->owner_index = -1;
 	segs->primary_for_screen = false;
@@ -1488,6 +1506,10 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 	struct xrt_display_processor *dp_of[COMP_SEGMENTS_MAX] = {0};
 	struct seg_screen_state *st_of[COMP_SEGMENTS_MAX] = {0};
 	bool weave[COMP_SEGMENTS_MAX] = {false};
+	// ADR-047 Amendment 10: each non-primary segment's DP input is laid out
+	// as ITS screen's entry for the app's slot (the primary keeps the
+	// session grid, which is the head device's entry).
+	struct comp_segments_segment_grid grid[COMP_SEGMENTS_MAX];
 	int32_t tx[COMP_SEGMENTS_MAX], ty[COMP_SEGMENTS_MAX];
 	uint32_t tw[COMP_SEGMENTS_MAX], th[COMP_SEGMENTS_MAX];
 	bool have_tile[COMP_SEGMENTS_MAX] = {false};
@@ -1507,6 +1529,9 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 		}
 		const int i = (int)g->screen_index;
 		st_of[k] = (i >= 0 && (uint32_t)i < segs->screen_count) ? &segs->st[i] : NULL;
+		grid[k] = comp_segments_view_size_segment_grid(
+		    g->is_primary ? NULL : comp_segments_view_size_entry(&segs->vs, (uint32_t)i, f->active_slot),
+		    f->tile_columns, f->tile_rows);
 		if (g->is_primary) {
 			// The primary screen's 1:1 gate is the session-level one
 			// (#1595 / #1831), already applied to the frame's layout.
@@ -1558,8 +1583,8 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 			continue;
 		}
 		struct seg_screen_state *st = st_of[k];
-		const uint32_t cw = tw[k] * f->tile_columns;
-		const uint32_t ch = th[k] * f->tile_rows;
+		const uint32_t cw = tw[k] * grid[k].cols;
+		const uint32_t ch = th[k] * grid[k].rows;
 		struct seg_crop *crop = &st->crop[cls];
 		if (!crop_ensure(vk, crop, cw, ch, f->src_format)) {
 			weave[k] = false; // no input image: flat 2D instead
@@ -1568,19 +1593,23 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 		image_barrier(vk, cmd, crop->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
 		              VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 		              VK_PIPELINE_STAGE_TRANSFER_BIT);
+		// Segment tile v takes the session's view v: the first grid[k].views
+		// views, laid out in the segment's own grid (ADR-047 Amendment 10).
 		VkImageCopy regions[XRT_MAX_VIEWS];
 		uint32_t rc = 0;
-		for (uint32_t row = 0; row < f->tile_rows; row++) {
-			for (uint32_t col = 0; col < f->tile_columns && rc < XRT_MAX_VIEWS; col++) {
-				regions[rc++] = (VkImageCopy){
-				    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-				    .srcOffset = {(int32_t)(col * f->view_width) + tx[k],
-				                  (int32_t)(row * f->view_height) + ty[k], 0},
-				    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-				    .dstOffset = {(int32_t)(col * tw[k]), (int32_t)(row * th[k]), 0},
-				    .extent = {tw[k], th[k], 1},
-				};
-			}
+		for (uint32_t v = 0; v < grid[k].views && rc < XRT_MAX_VIEWS; v++) {
+			const uint32_t scol = v % f->tile_columns;
+			const uint32_t srow = v / f->tile_columns;
+			const uint32_t dcol = v % grid[k].cols;
+			const uint32_t drow = v / grid[k].cols;
+			regions[rc++] = (VkImageCopy){
+			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .srcOffset = {(int32_t)(scol * f->view_width) + tx[k],
+			                  (int32_t)(srow * f->view_height) + ty[k], 0},
+			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .dstOffset = {(int32_t)(dcol * tw[k]), (int32_t)(drow * th[k]), 0},
+			    .extent = {tw[k], th[k], 1},
+			};
 		}
 		vk->vkCmdCopyImage(cmd, f->src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, crop->image,
 		                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rc, regions);
@@ -1654,10 +1683,22 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 					                                            g->present_origin_y);
 				}
 				xrt_display_processor_set_target_color_view(dp, f->target_view);
+				// ADR-047 Amendment 10: which of its screen's entries to
+				// draw, on change only (the app moved 2D <-> 3D, or the
+				// user picked another 3D mode for this screen).
+				if (grid[k].entry >= 0 && st->entry_sent_plus1 != grid[k].entry + 1) {
+					st->entry_sent_plus1 = grid[k].entry + 1;
+					if (!xrt_display_processor_vk_set_output_entry(vdp, (uint32_t)grid[k].entry)) {
+						U_LOG_I(
+						    "segments: screen 0x%016llx's DP has no set_output_entry slot - it "
+						    "draws its default for a %ux%u atlas",
+						    (unsigned long long)g->screen_id, grid[k].cols, grid[k].rows);
+					}
+				}
 			}
 			xrt_display_processor_process_atlas(
-			    dp, cmd, (VkImage_XDP)st->crop[cls].image, st->crop[cls].view, tw[k], th[k], f->tile_columns,
-			    f->tile_rows, (VkFormat_XDP)f->src_format, f->target_fb, (VkImage_XDP)f->target_image,
+			    dp, cmd, (VkImage_XDP)st->crop[cls].image, st->crop[cls].view, tw[k], th[k], grid[k].cols,
+			    grid[k].rows, (VkFormat_XDP)f->src_format, f->target_fb, (VkImage_XDP)f->target_image,
 			    f->target_width, f->target_height, (VkFormat_XDP)f->target_format, g->window_rect.x,
 			    g->window_rect.y, g->window_rect.w, g->window_rect.h);
 			any_woven = true;
@@ -1739,10 +1780,61 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 		struct seg_capture *c = &segs->cap[segs->cap_count++];
 		c->screen_index = t->seg[k].screen_index;
 		c->woven = weave[k];
-		c->w = weave[k] ? tw[k] * f->tile_columns : 0;
-		c->h = weave[k] ? th[k] * f->tile_rows : 0;
+		c->w = weave[k] ? tw[k] * grid[k].cols : 0;
+		c->h = weave[k] ? th[k] * grid[k].rows : 0;
 	}
 	return any_woven;
+}
+
+bool
+comp_vk_native_segments_update_view_size(struct comp_vk_native_segments *segs,
+                                         const struct comp_seg_rect *window_desktop,
+                                         const struct comp_seg_rect *canvas,
+                                         const struct xrt_rendering_mode *head_modes,
+                                         uint32_t head_count,
+                                         uint32_t max_views,
+                                         uint32_t cap_w,
+                                         uint32_t cap_h)
+{
+	if (segs == NULL || !segs->enabled || window_desktop == NULL) {
+		return false;
+	}
+	// Computed on the weave thread's own copy (from its own table: the update
+	// above may not run this frame — zero-copy on the primary, a
+	// self-submitting DP — and the size must still follow the window back);
+	// published under the lock.
+	struct comp_segments_view_size *next = malloc(sizeof(*next));
+	if (next == NULL) {
+		return false;
+	}
+	*next = segs->vs;
+	const bool changed = comp_segments_view_size_update_for_window(next, window_desktop, canvas, segs->screens,
+	                                                               segs->screen_count, head_modes, head_count,
+	                                                               max_views, cap_w, cap_h, os_monotonic_get_ns());
+	os_mutex_lock(&segs->dp_mutex);
+	segs->vs = *next;
+	os_mutex_unlock(&segs->dp_mutex);
+	if (changed) {
+		comp_segments_view_size_log_change(&next->eff);
+	}
+	free(next);
+	return changed;
+}
+
+bool
+comp_vk_native_segments_get_effective_table(struct comp_vk_native_segments *segs, struct xrt_effective_mode_table *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (segs == NULL) {
+		return false;
+	}
+	os_mutex_lock(&segs->dp_mutex);
+	*out = segs->vs.eff;
+	os_mutex_unlock(&segs->dp_mutex);
+	return out->valid;
 }
 
 bool

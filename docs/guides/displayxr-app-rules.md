@@ -521,6 +521,13 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   ```
   Ref: `test_apps/common/xr_session_common.cpp:200-225`.
 
+  **Since `XR_DXR_display_info` v28, size at the worst case the runtime states**
+  (`XrDisplayRenderingWorstCaseDXR`, chained on `XrSystemProperties`): the loop above covers only
+  the session screen's two slots, but the table follows the window to other screens and other 3D
+  modes (ADR-047 Amendment 10), so a window moved to a larger screen would overflow a swapchain
+  sized from it. Take `max(maxAtlasWidthPixels, loop)` × `max(maxAtlasHeightPixels, loop)`; keep the
+  loop as the fallback for an older runtime (the struct then stays zero).
+
 - **INV-4.3 — Per-tile render size = window (canvas) × scaleXY, NEVER display size.** This is
   the one you called out. `scaleX/Y` is the **active mode's** `viewScaleX/Y`.
   - **Wrong:** `renderW = displayPixelWidth / 2;` (the legacy hardcoded hack —

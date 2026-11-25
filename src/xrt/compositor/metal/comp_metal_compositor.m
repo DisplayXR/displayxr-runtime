@@ -2503,7 +2503,7 @@ metal_compositor_render_hud(struct comp_metal_compositor *c, float dt,
 	data.render_width = c->view_width;
 	data.render_height = c->view_height;
 	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count,
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes, u_device_rendering_modes_envelope_count(c->xdev),
 		                              &data.swapchain_width, &data.swapchain_height);
 	}
 	data.window_width = win_w;
@@ -7395,7 +7395,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	uint32_t atlas_w = pixel_width;
 	uint32_t atlas_h = pixel_height;
 	if (xdev != NULL && xdev->rendering_mode_count > 0) {
-		for (uint32_t mi = 0; mi < xdev->rendering_mode_count; mi++) {
+		for (uint32_t mi = 0; mi < u_device_rendering_modes_envelope_count(xdev); mi++) {
 			const struct xrt_rendering_mode *m = &xdev->rendering_modes[mi];
 			// Device-published DISPLAY-scoped table — the worst-case input to
 			// u_tiling_compute_system_atlas below. Per-frame view/atlas dims
@@ -7410,7 +7410,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 			        m->atlas_width_pixels, m->atlas_height_pixels);
 		}
 		u_tiling_compute_system_atlas(xdev->rendering_modes,
-		                              xdev->rendering_mode_count,
+		                              u_device_rendering_modes_envelope_count(xdev),
 		                              &atlas_w, &atlas_h);
 		U_LOG_W("System atlas worst-case: %ux%u (fallback was %ux%u)",
 		        atlas_w, atlas_h, pixel_width, pixel_height);

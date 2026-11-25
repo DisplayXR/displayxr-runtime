@@ -2241,7 +2241,7 @@ session_render_hud_overlay(struct multi_compositor *mc,
 	data.render_width = render_w;
 	data.render_height = render_h;
 	if (xdev != NULL && xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count,
+		u_tiling_compute_system_atlas(xdev->rendering_modes, u_device_rendering_modes_envelope_count(xdev),
 		                              &data.swapchain_width, &data.swapchain_height);
 	}
 	data.window_width = fb_width;

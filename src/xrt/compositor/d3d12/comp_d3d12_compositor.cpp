@@ -16,6 +16,7 @@
 #include "comp_d3d12_outcomp.h"
 #include "comp_d3d12_segments.h" // multi-screen M6 (D3D12)
 #include "util/comp_segments_route.h"
+#include "util/comp_segments_view_size.h"
 #include "util/comp_texture_target_win32.h" // ADR-060 texture target binding (#2382); #2370 client-presents
 #include "util/comp_texture_target_drag_snap_win32.h" // #2725: drag snap of the reference window
 #include "util/comp_dp_windowless_d3d12.h"  // ADR-060 windowless DP rule (#2382)
@@ -2621,7 +2622,8 @@ d3d12_reroute_wire(struct comp_d3d12_compositor *c, struct xrt_device *xdev, boo
 	// same numbers the own-legs arm bridges at).
 	uint32_t sys_w = 0, sys_h = 0;
 	if (xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &sys_w, &sys_h);
+		u_tiling_compute_system_atlas(xdev->rendering_modes, u_device_rendering_modes_envelope_count(xdev),
+		                              &sys_w, &sys_h);
 	}
 	if (sys_w == 0 || sys_h == 0) {
 		sys_w = c->settings.preferred.width;
@@ -3581,8 +3583,8 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	if (reason == nullptr) {
 		uint32_t sys_w = 0, sys_h = 0;
 		if (xdev->rendering_mode_count > 0) {
-			u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &sys_w,
-			                              &sys_h);
+			u_tiling_compute_system_atlas(xdev->rendering_modes,
+			                              u_device_rendering_modes_envelope_count(xdev), &sys_w, &sys_h);
 		}
 		if (sys_w == 0 || sys_h == 0) {
 			sys_w = c->settings.preferred.width;
@@ -4336,8 +4338,9 @@ d3d12_render_hud_overlay(struct comp_d3d12_compositor *c,
 	data.render_width = render_w;
 	data.render_height = render_h;
 	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count,
-		                              &data.swapchain_width, &data.swapchain_height);
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes,
+		                              u_device_rendering_modes_envelope_count(c->xdev), &data.swapchain_width,
+		                              &data.swapchain_height);
 	}
 	data.window_width = win_w;
 	data.window_height = win_h;
@@ -5671,6 +5674,32 @@ d3d12_tt_weave(struct comp_d3d12_compositor *c,
 }
 
 /*!
+ * ADR-047 Amendment 10: does this session follow the window's screen for its
+ * view size and 3D mode? Not for a legacy app (its size is the compromise:
+ * the head device's table stands and every segment keeps the session grid).
+ */
+static bool
+d3d12_view_size_on(const struct comp_d3d12_compositor *c)
+{
+	return c->segments != nullptr && !c->legacy_app_tile_scaling && c->xdev != nullptr && c->xdev->hmd != nullptr;
+}
+
+//! ADR-047 Amendment 10: the instance's worst case covers every claimed screen's modes.
+static void
+d3d12_cap_to_instance_worst_case(const struct comp_d3d12_compositor *c, uint32_t *inout_w, uint32_t *inout_h)
+{
+	if (c->seg_sys_info == nullptr || c->legacy_app_tile_scaling) {
+		return;
+	}
+	if (c->seg_sys_info->atlas_width_pixels > *inout_w) {
+		*inout_w = c->seg_sys_info->atlas_width_pixels;
+	}
+	if (c->seg_sys_info->atlas_height_pixels > *inout_h) {
+		*inout_h = c->seg_sys_info->atlas_height_pixels;
+	}
+}
+
+/*!
  * Multi-screen M6 (ADR-047 D2, D3D12): does this window span monitors? The
  * twin of the D3D11 compositor's pre-split gate — only off the zero-copy path
  * (the atlas must be ours to crop: a repaint is never armed on it), off the
@@ -5753,6 +5782,19 @@ d3d12_segments_tick(struct comp_d3d12_compositor *c,
 				comp_d3d12_segments_set_visibility(c->segments, c->visibility);
 				comp_d3d12_segments_set_display_mode(c->segments, c->hardware_display_3d);
 			}
+			// ADR-047 Amendment 10: the view size follows the window's
+			// screen. Runs on every weave with a placed window - also the
+			// ones that do not split (zero-copy on the session screen) - so
+			// the size follows the window back. Legacy apps never see it.
+			if (d3d12_view_size_on(c)) {
+				const uint32_t cap_w =
+				    c->seg_sys_info != nullptr ? c->seg_sys_info->atlas_width_pixels : 0;
+				const uint32_t cap_h =
+				    c->seg_sys_info != nullptr ? c->seg_sys_info->atlas_height_pixels : 0;
+				(void)comp_d3d12_segments_update_view_size(
+				    c->segments, &win, &canvas, c->xdev->rendering_modes, c->xdev->rendering_mode_count,
+				    c->mode_fill_views, cap_w, cap_h);
+			}
 		}
 	}
 
@@ -5783,6 +5825,9 @@ d3d12_segments_tick(struct comp_d3d12_compositor *c,
 	if (seg_split) {
 		const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
 		(void)comp_d3d12_segments_get_metrics(c->segments, &win, &canvas, c->display_processor != nullptr, &m);
+	}
+	if (have_win && d3d12_view_size_on(c)) {
+		(void)comp_d3d12_segments_get_effective_table(c->segments, &m.table);
 	}
 	{
 		std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
@@ -6136,6 +6181,11 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 		sf.transparent_background = c->transparent_background;
 		sf.primary_dp = c->display_processor;
 		sf.renderer = c->renderer;
+		// ADR-047 Amendment 10: each non-primary segment in its own screen's
+		// entry for the app's slot.
+		sf.screen_entries = d3d12_view_size_on(c);
+		sf.active_slot =
+		    c->xdev != nullptr && c->xdev->hmd != nullptr ? c->xdev->hmd->active_rendering_mode_index : 0;
 		comp_d3d12_segments_record(c->segments, &sf);
 	} else {
 		// Pass actual backbuffer dimensions to the DP. Canvas offset and size are
@@ -7163,10 +7213,41 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 * tear the same way.
 	 */
 	const struct xrt_rendering_mode *frame_mode = NULL;
+	uint32_t frame_slot = 0;
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		frame_slot = idx;
 		if (idx < c->xdev->rendering_mode_count) {
 			frame_mode = &c->xdev->rendering_modes[idx];
+		}
+	}
+	/*
+	 * ADR-047 Amendment 10: the view size follows the window's screen. When
+	 * the window is on (or across) other screens, the atlas is laid out and
+	 * sized from the table its app was told (the effective table, published
+	 * by the last weave) - the session's tiles and view scale are the head
+	 * screen's only while the window is on it. The lens state stays the
+	 * app's (its slot's): only the geometry is overlaid.
+	 */
+	struct xrt_rendering_mode frame_mode_eff;
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (c->reroute.split != NULL) {
+		comp_hub_d3d11_set_view_size_policy(c->reroute.split, !c->legacy_app_tile_scaling, c->mode_fill_views);
+	}
+#endif
+	if (frame_mode != NULL && !c->legacy_app_tile_scaling) {
+		struct xrt_effective_mode_table eff;
+		bool have_eff = false;
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		if (c->reroute.active && c->reroute.split != NULL) {
+			have_eff = comp_hub_d3d11_get_effective_table(c->reroute.split, &eff);
+		} else
+#endif
+		    if (c->segments != nullptr) {
+			have_eff = comp_d3d12_segments_get_effective_table(c->segments, &eff);
+		}
+		if (have_eff && comp_segments_view_size_overlay_mode(frame_mode, &eff, frame_slot, &frame_mode_eff)) {
+			frame_mode = &frame_mode_eff;
 		}
 	}
 	// The worst-case atlas cap follows the table as it is now (a display-info
@@ -7175,9 +7256,14 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (frame_mode != NULL && c->renderer != NULL) {
 		uint32_t cap_w = 0, cap_h = 0;
 		comp_d3d12_renderer_get_atlas_cap(c->renderer, &cap_w, &cap_h);
-		if (u_tiling_follow_atlas_cap(c->xdev->rendering_modes, c->xdev->rendering_mode_count, &cap_w,
-		                              &cap_h)) {
-			comp_d3d12_renderer_set_atlas_cap(c->renderer, cap_w, cap_h);
+		uint32_t want_w = cap_w, want_h = cap_h;
+		(void)u_tiling_follow_atlas_cap(c->xdev->rendering_modes, c->xdev->rendering_mode_count, &want_w,
+		                                &want_h);
+		// ADR-047 Amendment 10: the instance's worst case covers every claimed
+		// screen's modes, so a window on another screen fits too.
+		d3d12_cap_to_instance_worst_case(c, &want_w, &want_h);
+		if (want_w != cap_w || want_h != cap_h) {
+			comp_d3d12_renderer_set_atlas_cap(c->renderer, want_w, want_h);
 		}
 	}
 
@@ -9447,7 +9533,8 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	// #2564: bound the atlas's grow headroom by the worst case across modes.
 	if (xdev != NULL && xdev->rendering_mode_count > 0) {
 		uint32_t cap_w = 0, cap_h = 0;
-		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &cap_w, &cap_h);
+		u_tiling_compute_system_atlas(xdev->rendering_modes, u_device_rendering_modes_envelope_count(xdev),
+		                              &cap_w, &cap_h);
 		comp_d3d12_renderer_set_atlas_cap(c->renderer, cap_w, cap_h);
 	}
 
@@ -9998,7 +10085,9 @@ comp_d3d12_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_
 	// own manager and publishes its own table (eyes filled per query, like
 	// below) — the VK tier's shape.
 	if (c->reroute.active && c->reroute.split != NULL) {
-		return comp_hub_d3d11_get_segment_metrics(c->reroute.split, out) && out->count > 0;
+		// ADR-047 Amendment 10: a valid effective table is an answer too.
+		(void)comp_hub_d3d11_get_segment_metrics(c->reroute.split, out);
+		return out->count > 0 || out->table.valid;
 	}
 #endif
 	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
@@ -10017,7 +10106,9 @@ comp_d3d12_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_
 			s->have_eyes = comp_d3d12_segments_get_eyes(c->segments, s->screen_id, &s->eyes);
 		}
 	}
-	return out->count > 0;
+	// ADR-047 Amendment 10: a valid effective table is an answer too (the
+	// window wholly back on the session screen during the dwell).
+	return out->count > 0 || out->table.valid;
 }
 
 extern "C" void

@@ -348,7 +348,10 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	CHECK(offsetof(xrt_plugin_iface, activate) == offsetof(xrt_plugin_iface, get_license_state) + sizeof(void *));
 	// ADR-054 Amendment 3 appended get_setting_status after activate (the new last slot).
 	CHECK(offsetof(xrt_plugin_iface, get_setting_status) == offsetof(xrt_plugin_iface, activate) + sizeof(void *));
-	CHECK(offsetof(xrt_plugin_iface, get_setting_status) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	// ADR-047 Amendment 10 appended get_rendering_modes_for_monitor after it (the new last slot).
+	CHECK(offsetof(xrt_plugin_iface, get_rendering_modes_for_monitor) ==
+	      offsetof(xrt_plugin_iface, get_setting_status) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, get_rendering_modes_for_monitor) + sizeof(void *) == sizeof(xrt_plugin_iface));
 	{
 		// An older plug-in (struct_size ends before the slot) declares nothing.
 		xrt_plugin_iface older{};
@@ -415,7 +418,10 @@ TEST_CASE("GL DP: set_present_origin is the appended last slot, struct_size-gate
 	               offsetof(xrt_display_processor_gl, set_present_origin) + sizeof(void *));
 	STATIC_REQUIRE(offsetof(xrt_display_processor_gl, get_eye_positions_at) + sizeof(void *) ==
 	               offsetof(xrt_display_processor_gl, snap_window_rect));
+	// ADR-047 Amendment 10 appended set_output_entry after it (the new last slot).
 	STATIC_REQUIRE(offsetof(xrt_display_processor_gl, snap_window_rect) + sizeof(void *) ==
+	               offsetof(xrt_display_processor_gl, set_output_entry));
+	STATIC_REQUIRE(offsetof(xrt_display_processor_gl, set_output_entry) + sizeof(void *) ==
 	               sizeof(xrt_display_processor_gl));
 
 	xrt_display_processor_gl dp{};

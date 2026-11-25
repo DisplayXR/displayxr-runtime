@@ -524,15 +524,16 @@ note_screen_pickup(void)
 {
 	int xret = 0;
 	switch (cli_poke_service_reprobe_quiet(&xret)) {
-	case 0:
+	case CLI_POKE_DONE:
 		P("The running DisplayXR service re-evaluated the screens: the views of running apps follow now.\n");
 		P("(The tracking capability an app was told at its start stays as it was until its next launch.)\n");
 		break;
-	case 1:
+	case CLI_POKE_REFUSED:
 		P("The running DisplayXR service refused the re-probe request (xrt_result=%d) — applies at the next "
 		  "session.\n",
 		  xret);
 		break;
+	case CLI_POKE_VERSION_SKEW: cli_poke_say_version_skew(false); break;
 	default:
 		P("No DisplayXR service reachable — applies at the next app launch (in-process apps read it at "
 		  "start).\n");
@@ -690,7 +691,8 @@ list_screens(cJSON *root)
 	if (snap == NULL) {
 		return;
 	}
-	const bool from_service = cli_status_fetch(snap);
+	// 1 = the service's, 0 = headless, -1 = the service is wedged (nothing built).
+	const bool from_service = cli_status_fetch(snap) > 0;
 	if (root != NULL) {
 		cJSON_AddStringToObject(root, "screens_source", from_service ? "service" : "headless");
 		cJSON *arr = cJSON_AddArrayToObject(root, "screens");

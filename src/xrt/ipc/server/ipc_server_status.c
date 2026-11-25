@@ -52,6 +52,8 @@
 
 #include "os/os_threading.h"
 #include "os/os_time.h"
+#include "util/u_rendering_modes.h"
+#include "util/u_screen_modes.h"
 #include "util/u_misc.h"
 #include "util/u_status_snapshot.h"
 #include "util/u_time.h"
@@ -337,6 +339,13 @@ live_key(const struct xrt_status_live *live)
 	mix_u64(&h, live->mode.valid);
 	mix_u64(&h, live->mode.index);
 	mix_u64(&h, live->mode.is_3d);
+	// ADR-066 C1: a live 3D-mode remap moves the status generation.
+	for (const char *p = live->mode_3d.active; *p != '\0'; p++) {
+		mix_u64(&h, (uint64_t)(unsigned char)*p);
+	}
+	mix_u64(&h, live->mode_3d.source);
+	// ADR-047 Amendment 10: so does another screen's (its own table's slot 1).
+	mix_u64(&h, u_screen_modes_generation());
 	mix_u64(&h, live->workspace.enabled);
 	mix_str(&h, live->workspace.controller);
 	mix_u64(&h, live->workspace.screen_count);
@@ -523,7 +532,9 @@ gather_live(struct ipc_server *s, struct ipc_server_status *st, uint64_t now_ns)
 		const uint32_t n = head->rendering_mode_count < XRT_MAX_RENDERING_MODES ? head->rendering_mode_count
 		                                                                        : XRT_MAX_RENDERING_MODES;
 		const uint32_t idx = head->hmd->active_rendering_mode_index;
-		for (uint32_t i = 0; i < n; i++) {
+		// The view capacity is the ENVELOPE's (ADR-066 C1.4), not the two slots'.
+		const uint32_t env = u_device_rendering_modes_envelope_count(head);
+		for (uint32_t i = 0; i < env; i++) {
 			if (head->rendering_modes[i].view_count > view_capacity) {
 				view_capacity = head->rendering_modes[i].view_count;
 			}
@@ -536,6 +547,8 @@ gather_live(struct ipc_server *s, struct ipc_server_status *st, uint64_t now_ns)
 			live->mode.views = rm->view_count;
 			live->mode.is_3d = rm->hardware_display_3d;
 		}
+		// ADR-066 C1: the head's 3D mode (the entry slot 1 maps to + choices).
+		u_device_rendering_modes_fill_status(head, &live->mode_3d);
 	}
 
 	live->workspace.enabled = s->workspace_mode;

@@ -32,6 +32,7 @@
 #include "util/comp_lazy_transparency.h"
 #include "util/comp_segments.h"
 #include "util/comp_segments_route.h"
+#include "util/comp_segments_view_size.h"
 #include "util/comp_weave_screens.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
@@ -716,6 +717,9 @@ struct comp_vk_native_compositor
 	bool dp_tolerates_resample;
 	//! The rendering-mode index @ref dp_tolerates_resample was last read at.
 	uint32_t dp_caps_mode_index;
+	//! ADR-066 C1: the slot-table generation the caps above were read under (a
+	//! 3D-mode switch remaps slot 1 without moving the index).
+	uint32_t dp_caps_mode_gen;
 	//! vk_make_dp_vk called the factory (whether or not it succeeded).
 	bool dp_create_attempted;
 
@@ -4369,8 +4373,9 @@ vk_hud_prepare(struct comp_vk_native_compositor *c, uint32_t target_width, uint3
 		data.render_height = vh;
 	}
 	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count,
-		                              &data.swapchain_width, &data.swapchain_height);
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes,
+		                              u_device_rendering_modes_envelope_count(c->xdev), &data.swapchain_width,
+		                              &data.swapchain_height);
 	}
 	data.window_width = target_width;
 	data.window_height = target_height;
@@ -6236,10 +6241,12 @@ vk_dp_refresh_resample_caps(struct comp_vk_native_compositor *c)
 		return;
 	}
 	const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-	if (idx == c->dp_caps_mode_index) {
+	const uint32_t gen = u_device_rendering_modes_generation(c->xdev);
+	if (idx == c->dp_caps_mode_index && gen == c->dp_caps_mode_gen) {
 		return;
 	}
 	c->dp_caps_mode_index = idx;
+	c->dp_caps_mode_gen = gen;
 	const bool tol =
 	    xrt_display_processor_vk_tolerates_resample((struct xrt_display_processor_vk *)c->display_processor);
 	if (tol == c->dp_tolerates_resample) {
@@ -7170,6 +7177,18 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 	if (split && !collapsed_2d) {
 		(void)comp_vk_native_segments_get_metrics(c->segments, &c->seg_window, &canvas,
 		                                          c->display_processor != NULL, &m);
+	}
+	// ADR-047 Amendment 10: the view size follows the window's screen. Runs
+	// on every weave with a placed window - also the ones that do not split
+	// (zero-copy on the session screen) - so the size follows the window back.
+	// Legacy apps never see the table (their size is the compromise).
+	if (c->segments != NULL && c->have_seg_window && !c->legacy_app_tile_scaling && c->xdev != NULL) {
+		const uint32_t cap_w = c->seg_sys_info != NULL ? c->seg_sys_info->atlas_width_pixels : 0;
+		const uint32_t cap_h = c->seg_sys_info != NULL ? c->seg_sys_info->atlas_height_pixels : 0;
+		(void)comp_vk_native_segments_update_view_size(c->segments, &c->seg_window, &canvas,
+		                                               c->xdev->rendering_modes, c->xdev->rendering_mode_count,
+		                                               c->mode_fill_views, cap_w, cap_h);
+		(void)comp_vk_native_segments_get_effective_table(c->segments, &m.table);
 	}
 #if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
 	/*
@@ -9637,6 +9656,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				    .view_height = view_height,
 				    .tile_columns = tc,
 				    .tile_rows = tr,
+				    .active_slot = (c->xdev != NULL && c->xdev->hmd != NULL)
+				                       ? c->xdev->hmd->active_rendering_mode_index
+				                       : 0,
 				    .target_fb = target_fb,
 				    .target_image = (VkImage)(uintptr_t)target_image,
 				    .target_view = (VkImageView)(uintptr_t)target_view,
@@ -13465,6 +13487,40 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 			frame_mode = &c->xdev->rendering_modes[idx];
 		}
 	}
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	/*
+	 * ADR-047 Amendment 10: the view size follows the window's screen. When
+	 * the window is on (or across) other screens, the atlas is laid out and
+	 * sized from the table its app was told (the effective table) - the
+	 * session's tiles and view scale are the head screen's only while the
+	 * window is on it. The lens state stays the app's (its slot's): only the
+	 * geometry is overlaid.
+	 */
+	struct xrt_rendering_mode frame_mode_eff;
+#ifdef XRT_OS_WINDOWS
+	// #918 VK-1: under the split the D3D11 weave segments the window and
+	// computes the effective table (comp_hub_d3d11_set_view_size_policy).
+	if (c->split != NULL) {
+		comp_hub_d3d11_set_view_size_policy(c->split, !c->legacy_app_tile_scaling, c->mode_fill_views);
+		if (frame_mode != NULL && !c->legacy_app_tile_scaling) {
+			const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+			struct xrt_effective_mode_table eff;
+			if (comp_hub_d3d11_get_effective_table(c->split, &eff) &&
+			    comp_segments_view_size_overlay_mode(frame_mode, &eff, idx, &frame_mode_eff)) {
+				frame_mode = &frame_mode_eff;
+			}
+		}
+	} else
+#endif
+	    if (frame_mode != NULL && c->segments != NULL && !c->legacy_app_tile_scaling) {
+		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		struct xrt_effective_mode_table eff;
+		if (comp_vk_native_segments_get_effective_table(c->segments, &eff) &&
+		    comp_segments_view_size_overlay_mode(frame_mode, &eff, idx, &frame_mode_eff)) {
+			frame_mode = &frame_mode_eff;
+		}
+	}
+#endif
 
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
 	// from the frame's active mode.
@@ -15572,6 +15628,7 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 			c->dp_caps_mode_index = (c->xdev != NULL && c->xdev->hmd != NULL)
 			                            ? c->xdev->hmd->active_rendering_mode_index
 			                            : UINT32_MAX;
+			c->dp_caps_mode_gen = u_device_rendering_modes_generation(c->xdev);
 		}
 	} else {
 		U_LOG_W("No VK display processor factory provided");
@@ -19245,7 +19302,9 @@ comp_vk_native_compositor_get_segment_metrics(struct xrt_compositor *xc, struct 
 	// adapter, which segments with its own manager and publishes its own
 	// table (eyes filled per query, like below).
 	if (c->split != NULL) {
-		return comp_hub_d3d11_get_segment_metrics(c->split, out) && out->count > 0;
+		// ADR-047 Amendment 10: a valid effective table is an answer too.
+		(void)comp_hub_d3d11_get_segment_metrics(c->split, out);
+		return out->count > 0 || out->table.valid;
 	}
 #endif
 	os_mutex_lock(&c->seg_pub_mutex);
@@ -19262,7 +19321,11 @@ comp_vk_native_compositor_get_segment_metrics(struct xrt_compositor *xc, struct 
 		}
 	}
 	os_mutex_unlock(&c->seg_pub_mutex);
-	return out->count > 0;
+	// ADR-047 Amendment 10: a valid effective table is an answer too - the
+	// window wholly back on the session screen keeps the covered screens'
+	// table for the dwell, and the app must be told the table the atlas is
+	// laid out from.
+	return out->count > 0 || out->table.valid;
 #else
 	(void)xc;
 	return false;

@@ -58,6 +58,7 @@ extern "C" {
  * by pointer, so a forward decl is sufficient at this layer.
  */
 struct xrt_device;
+struct xrt_rendering_mode;
 
 
 /*!
@@ -2005,7 +2006,69 @@ struct xrt_plugin_iface
 	 * @ref XRT_PLUGIN_IFACE_HAS_SETTING_STATUS.
 	 */
 	xrt_component_get_setting_status_fn_t get_setting_status;
+
+	/*!
+	 * The DECLARED rendering-mode list of ONE monitor this plug-in won
+	 * (ADR-047 Amendment 10, ADR-066 C1): the per-monitor twin of the head
+	 * device's `xrt_device::rendering_modes`, so a screen other than the
+	 * head's has its own mode table — its own 3D entries, view counts, tile
+	 * grids and view scales — and its own per-screen "3D mode" choice.
+	 *
+	 * The plug-in fills up to @p capacity entries (at most
+	 * `XRT_MAX_RENDERING_MODES`) of @p out_modes in its OWN order, with the
+	 * same rules as a device's table: entry 0 is the flat full-screen 2D
+	 * entry, the rest are the 3D entries it can show on that monitor, each
+	 * with `mode_index` = its position, `view_count`, `view_scale_x/y` (in the
+	 * monitor's native axes), `tile_columns/rows`, `hardware_display_3d`,
+	 * `mode_name` and `mode_flags` (HAS_TRACKING, 3D_PASSTHROUGH,
+	 * START_UP_ONLY, CAN_ROTATE). The runtime computes the pixel fields
+	 * (`u_tiling_compute_mode`). @p out_default_3d is the entry the plug-in's
+	 * own configuration puts in the 3D slot when the user has made no
+	 * per-screen choice (its index, >= 1).
+	 *
+	 * @p display / @p physical as for @ref get_display_info_for_monitor.
+	 * Cheap, any thread, re-callable: the runtime re-asks when the screen
+	 * table changes. A display processor made for that monitor through a
+	 * `create_dp_*_for_screen` factory is told which entry to draw through
+	 * its variant's `set_output_entry` slot (in this numbering).
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field),
+	 * or false, reads the monitor's list as the head device's — today's
+	 * behaviour. Appended per ADR-020 (append-only within a major; gated by
+	 * @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref get_setting_status. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_RENDERING_MODES_FOR_MONITOR.
+	 */
+	bool (*get_rendering_modes_for_monitor)(struct xrt_plugin_instance *inst,
+	                                        const struct xrt_display_descriptor *display,
+	                                        const struct xrt_display_physical *physical,
+	                                        struct xrt_rendering_mode *out_modes,
+	                                        uint32_t capacity,
+	                                        uint32_t *out_count,
+	                                        uint32_t *out_default_3d);
 };
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_rendering_modes_for_monitor (ADR-047 Amendment 10),
+ * so a plug-in built against an older runtime header can #ifdef-guard
+ * filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_RENDERING_MODES_FOR_MONITOR 1
+
+/*!
+ * True when @p iface implements @ref
+ * xrt_plugin_iface::get_rendering_modes_for_monitor (and its struct_size
+ * covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_rendering_modes_for_monitor(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, get_rendering_modes_for_monitor) +
+	                                 sizeof(iface->get_rendering_modes_for_monitor) &&
+	       iface->get_rendering_modes_for_monitor != NULL;
+}
 
 /*!
  * Defined when @ref xrt_plugin_iface carries @ref

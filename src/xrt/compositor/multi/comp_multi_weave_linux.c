@@ -122,6 +122,7 @@
 #include "util/u_weave_span2d.h"
 #include "util/u_weave_present_origin.h"
 #include "util/u_weave_flat.h"
+#include "util/u_weave_peer.h"
 
 #include "vk/vk_helpers.h"
 #include "vk/vk_dmabuf.h"
@@ -231,6 +232,10 @@ weave_ensure_mutex(struct multi_compositor *mc)
 		os_mutex_init(&mc->weave.mutex);
 		mc->weave.out_fd = -1;
 		mc->weave.mutex_initialized = true;
+	}
+	if (!mc->weave.pub_mutex_initialized) {
+		os_mutex_init(&mc->weave.pub_mutex); // ADR-047 Amendment 10: the published copies
+		mc->weave.pub_mutex_initialized = true;
 	}
 	pthread_mutex_unlock(&g_weave_mutex_init_lock);
 }
@@ -1826,20 +1831,54 @@ weave_segs_log(struct multi_compositor *mc, bool split)
 }
 
 /*!
+ * ADR-047 Amendment 10: publish what this submit decided for the session's
+ * other readers (the IPC main loop, a locating session): the effective table
+ * the window's apps are told and, when woven per screen, the per-screen table
+ * with every screen's eyes as of now. Holding weave.mutex; pub_mutex is a leaf.
+ */
+static void
+weave_publish(struct multi_compositor *mc,
+              bool weaves,
+              const struct xrt_effective_mode_table *eff,
+              const struct xrt_segment_metrics *segs)
+{
+	if (!mc->weave.pub_mutex_initialized) {
+		return;
+	}
+	os_mutex_lock(&mc->weave.pub_mutex);
+	mc->weave.pub_weaves = weaves;
+	mc->weave.pub_window_id = mc->weave.window_id;
+	if (eff != NULL) {
+		mc->weave.pub_eff = *eff;
+	} else {
+		U_ZERO(&mc->weave.pub_eff);
+	}
+	if (segs != NULL) {
+		mc->weave.pub_segs = *segs;
+	} else {
+		U_ZERO(&mc->weave.pub_segs);
+	}
+	os_mutex_unlock(&mc->weave.pub_mutex);
+}
+
+/*!
  * One metric update of the per-screen weave: place the screens in the
  * window's frame (comp_weave_screens_project), hand a moved projection to the
- * manager without disturbing its DPs, recompute the table and run the DP
- * lifecycle (hysteresis: a DP is created after 2 updates on its screen and
- * retired ~30 updates after the window left it).
+ * manager without disturbing its DPs, follow the view size (ADR-047 Amendment
+ * 10: every submit with a placed window, also the ones that cannot split, so
+ * the size follows the window back), and - when @p may_split - recompute the
+ * table and run the DP lifecycle (hysteresis: a DP is created after 2 updates
+ * on its screen and retired ~30 updates after the window left it).
  *
  * Holding weave.mutex, the previous frame waited.
  *
  * @return true when this submit must be woven per screen.
  */
 static bool
-weave_segs_update(struct vk_bundle *vk, struct multi_compositor *mc)
+weave_segs_update(struct vk_bundle *vk, struct multi_compositor *mc, bool may_split)
 {
 	if (!weave_segs_sync(vk, mc)) {
+		weave_publish(mc, mc->weave.have_geometry, NULL, NULL);
 		return false;
 	}
 	const struct comp_weave_window win = {
@@ -1866,21 +1905,61 @@ weave_segs_update(struct vk_bundle *vk, struct multi_compositor *mc)
 		            : "");
 	}
 	if (frame == COMP_WEAVE_FRAME_NONE) {
+		weave_publish(mc, true, NULL, NULL);
 		return false;
 	}
 	if (comp_weave_screens_compare(mc->weave.segs_proj, &proj) != COMP_WEAVE_SCREENS_SAME) {
 		if (!comp_vk_native_segments_set_screen_geometry(mc->weave.segs, &proj)) {
+			weave_publish(mc, true, NULL, NULL);
 			return false; // cannot happen (same list, same filter): stay single-DP
 		}
 		*mc->weave.segs_proj = proj;
 	}
 	const struct comp_seg_rect canvas = {0, 0, wr.w, wr.h};
-	const bool split = comp_vk_native_segments_update(mc->weave.segs, &wr, &canvas, (int32_t)WEAVE_VK_FORMAT,
-	                                                  !mc->weave.fence_pending, 0);
-	// Every per-screen DP follows this session's confirmed 2D/3D state, like
-	// the engine's own DP (a DP the update just created gets it here).
-	comp_vk_native_segments_set_display_mode(mc->weave.segs, !mc->weave.hw_2d_confirmed);
-	weave_segs_log(mc, split);
+
+	// ADR-047 Amendment 10: the view size follows the window's screen. The
+	// present-owner is never a legacy app; it lays its views out from what it
+	// enumerates, so no view cap here (0) and the instance's worst case clamps.
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+	(void)comp_vk_native_segments_update_view_size(mc->weave.segs, &wr, &canvas, mc->weave.head_modes,
+	                                               mc->weave.head_mode_count, 0, info->atlas_width_pixels,
+	                                               info->atlas_height_pixels);
+	struct xrt_effective_mode_table eff;
+	(void)comp_vk_native_segments_get_effective_table(mc->weave.segs, &eff);
+
+	bool split = false;
+	if (may_split) {
+		split = comp_vk_native_segments_update(mc->weave.segs, &wr, &canvas, (int32_t)WEAVE_VK_FORMAT,
+		                                       !mc->weave.fence_pending, 0);
+		// Every per-screen DP follows this session's confirmed 2D/3D state, like
+		// the engine's own DP (a DP the update just created gets it here).
+		comp_vk_native_segments_set_display_mode(mc->weave.segs, !mc->weave.hw_2d_confirmed);
+		weave_segs_log(mc, split);
+	}
+
+	// The per-screen table with every screen's eyes NOW, for a locating
+	// session whose element lies wholly on a non-primary screen (the
+	// Amendment 4 addendum): that screen's own DP's eyes (nominal where it
+	// does not track), never this engine's DP's (the session screen's camera).
+	struct xrt_segment_metrics *segs = NULL;
+	struct xrt_segment_metrics m;
+	if (split && comp_vk_native_segments_get_metrics(mc->weave.segs, &wr, &canvas, true, &m)) {
+		for (uint32_t k = 0; k < m.count && k < XRT_MAX_SEGMENTS; k++) {
+			struct xrt_segment_metric *g = &m.seg[k];
+			if (g->is_primary) {
+				g->have_eyes =
+				    xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, &g->eyes) &&
+				    g->eyes.valid;
+			} else {
+				g->have_eyes = comp_vk_native_segments_get_eyes(mc->weave.segs, g->screen_id, &g->eyes);
+			}
+			if (!g->have_eyes) {
+				U_ZERO(&g->eyes);
+			}
+		}
+		segs = &m;
+	}
+	weave_publish(mc, true, &eff, segs);
 	return split;
 }
 #endif // COMP_MULTI_WEAVE_HAVE_SEGMENTS
@@ -3126,8 +3205,14 @@ weave_run_frame(struct vk_bundle *vk,
 		const bool mono_frame = mc->weave.mono_in_2d && mc->weave.hw_2d_confirmed;
 		const bool whole_window = (nview || rect_count > 0) && mc->weave.have_geometry &&
 		                          mc->weave.out_w == mc->weave.win_w && mc->weave.out_h == mc->weave.win_h;
-		if (whole_window && !mono_frame && !xrt_display_processor_is_self_submitting(mc->weave.dp)) {
-			seg_split = weave_segs_update(vk, mc);
+		const bool may_split =
+		    whole_window && !mono_frame && !xrt_display_processor_is_self_submitting(mc->weave.dp);
+		// ADR-047 Amendment 10: every submit with a placed window follows the
+		// view size; only the frames above may also be woven per screen.
+		if (mc->weave.have_geometry) {
+			seg_split = weave_segs_update(vk, mc, may_split);
+		} else {
+			weave_publish(mc, false, NULL, NULL);
 		}
 		mc->weave.segs_split = seg_split;
 	}
@@ -3301,6 +3386,9 @@ weave_run_frame(struct vk_bundle *vk,
 		    .transparent_background = false, // the engine never declares transparency to its DP
 		    .atlas_encoding = -1,            // nor an atlas encoding
 		    .primary_dp = mc->weave.dp,
+		    // ADR-047 Amendment 10: each other screen's DP draws THAT screen's
+		    // entry for the session's slot (its confirmed 2D/3D state).
+		    .active_slot = mc->weave.hw_2d_confirmed ? 0u : 1u,
 		};
 		(void)comp_vk_native_segments_record(mc->weave.segs, &sf);
 		// The record leaves the target in PRESENT_SRC_KHR (the DP contract it
@@ -3596,8 +3684,13 @@ weave_run_frame(struct vk_bundle *vk,
 		bool on_primary = true;
 		const uint64_t eye_screen =
 		    comp_weave_screens_eye_screen(comp_vk_native_segments_get_table(mc->weave.segs), &on_primary);
-		if (eye_screen != 0 && !on_primary &&
-		    comp_vk_native_segments_get_eyes(mc->weave.segs, eye_screen, out_eyes)) {
+		if (eye_screen != 0 && !on_primary) {
+			if (!comp_vk_native_segments_get_eyes(mc->weave.segs, eye_screen, out_eyes)) {
+				// That screen's DP is not up yet (the lifecycle hysteresis):
+				// no eyes this frame rather than the session screen's camera
+				// (the bug class of runtime #2757).
+				U_ZERO(out_eyes);
+			}
 			return true;
 		}
 		U_ZERO(out_eyes);
@@ -4182,6 +4275,107 @@ comp_multi_weave_linux_set_capture_tag(struct xrt_compositor *xc, const char *ta
 }
 
 void
+comp_multi_weave_linux_set_head_modes(struct xrt_compositor *xc, const struct xrt_rendering_mode *modes, uint32_t count)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	const uint32_t n = (modes != NULL && count > 0) ? (count < 2 ? count : 2) : 0;
+	for (uint32_t i = 0; i < n; i++) {
+		mc->weave.head_modes[i] = modes[i];
+	}
+	mc->weave.head_mode_count = n;
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+//! The bound window as this session's own bind / geometry calls described it
+//! (read unlocked, the trade multi_compositor_get_window_metrics makes: a torn
+//! read during a drag costs one tick of a stale match).
+static void
+weave_window_key(const struct multi_compositor *mc, struct u_weave_window_key *out)
+{
+	U_ZERO(out);
+	out->valid = mc->weave.have_geometry && mc->weave.win_w > 0 && mc->weave.win_h > 0;
+	out->window_id = mc->weave.window_bound ? mc->weave.window_id : 0;
+	out->x = mc->weave.win_x;
+	out->y = mc->weave.win_y;
+	out->w = mc->weave.win_w;
+	out->h = mc->weave.win_h;
+}
+
+bool
+comp_multi_weave_get_window_key(struct xrt_compositor *xc, struct u_weave_window_key *out_key)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (out_key == NULL) {
+		return false;
+	}
+	U_ZERO(out_key);
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	weave_window_key(mc, out_key);
+	return out_key->valid;
+}
+
+bool
+comp_multi_weave_get_published_table(struct xrt_compositor *xc,
+                                     struct u_weave_window_key *out_key,
+                                     struct xrt_effective_mode_table *out_table)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (out_key == NULL || out_table == NULL) {
+		return false;
+	}
+	U_ZERO(out_key);
+	U_ZERO(out_table);
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	weave_window_key(mc, out_key);
+	if (!mc->weave.pub_mutex_initialized) {
+		return false;
+	}
+	os_mutex_lock(&mc->weave.pub_mutex);
+	const bool weaves = mc->weave.pub_weaves;
+	*out_table = mc->weave.pub_eff;
+	os_mutex_unlock(&mc->weave.pub_mutex);
+	return weaves && out_key->valid;
+}
+
+bool
+comp_multi_weave_get_published_segments(struct xrt_compositor *xc,
+                                        struct u_weave_window_key *out_key,
+                                        struct xrt_segment_metrics *out)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (out_key == NULL || out == NULL) {
+		return false;
+	}
+	U_ZERO(out_key);
+	U_ZERO(out);
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	weave_window_key(mc, out_key);
+	if (!mc->weave.pub_mutex_initialized) {
+		return false;
+	}
+	os_mutex_lock(&mc->weave.pub_mutex);
+	const bool weaves = mc->weave.pub_weaves;
+	*out = mc->weave.pub_segs;
+	os_mutex_unlock(&mc->weave.pub_mutex);
+	if (!weaves || out->count == 0 || out->count > XRT_MAX_SEGMENTS) {
+		U_ZERO(out);
+		return false;
+	}
+	return true;
+}
+
+void
 comp_multi_weave_set_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req)
 {
 	struct multi_compositor *mc = multi_compositor(xc);
@@ -4299,6 +4493,10 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 	os_mutex_unlock(&mc->weave.mutex);
 	os_mutex_destroy(&mc->weave.mutex);
 	mc->weave.mutex_initialized = false;
+	if (mc->weave.pub_mutex_initialized) {
+		os_mutex_destroy(&mc->weave.pub_mutex);
+		mc->weave.pub_mutex_initialized = false;
+	}
 }
 
 #endif // XRT_OS_LINUX_DESKTOP

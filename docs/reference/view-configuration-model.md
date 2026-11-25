@@ -14,15 +14,26 @@ types it advertises, how many views each reports, what `xrLocateViews` and
 > Landed for [#1486](https://github.com/DisplayXR/displayxr-runtime/issues/1486)
 > (option B) / [#80](https://github.com/DisplayXR/displayxr-runtime/issues/80).
 
-> **Two rendering modes per driver ([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md)).**
-> At run time every display driver serves exactly two modes: mode 0 = 2D (1 view)
-> and mode 1 = its 3D *kind*, chosen by a driver setting when the device is created
-> (sim-display's `OUTPUT`). The runtime trims a longer table at the apply point. So
-> the device max view count — what `PRIMARY_MULTIVIEW_DXR` reports — is the
-> selected kind's (2 for every stereo kind, 4 only for sim-display's `quad`
-> inspection kind), and it is fixed for the instance, as OpenXR requires. A stereo
-> session against a 4-view kind has no 2-view 3D mode to fall back to: the floor
-> below takes it to **2D**, and a request for mode 1 is denied.
+> **Two slots per driver, the full declared list behind them
+> ([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md),
+> ADR-066 (design PR #2792) C1).**
+> Apps see exactly two modes: slot 0 = 2D (1 view) and slot 1 = the screen's **3D
+> mode**, one entry of the display driver's declared list (a per-screen `dp mode set`
+> choice, else the driver's own default, e.g. sim-display's `OUTPUT`). The runtime
+> keeps the whole declared list as the envelope, so the device max view count —
+> what `PRIMARY_MULTIVIEW_DXR` locates — is the **maximum over the declared list**,
+> not over the two slots, and it is fixed for the instance, as OpenXR requires. Slot 1
+> is the 3D mode **by position** — it may be a one-view passthrough entry — so never find
+> it by `viewCount >= 2` or `hardwareDisplay3D`. A
+> 3D-mode switch remaps slot 1 live (`XrEventDataRenderingModeTableChangedDXR`) and
+> never changes the located count; the active slot's view count moves, and
+> `XrViewActivityStateDXR.activeViewCount` reports it. On sim-display the default
+> list tops out at 2 views (Quad is declared only when `OUTPUT=quad` at start-up),
+> so nothing changes there by default. A stereo session against a 4-view slot 1 has
+> no 2-view 3D mode to fall back to: the floor below takes it to **2D** (also at a
+> live switch, with a 1 → 0 mode-changed event), and a request for mode 1 is denied.
+> Full view sets only: the located count is `floor(XRT_MAX_VIEWS / max) × max`,
+> at least one set and at most the view-set capacity.
 
 ## What the runtime advertises
 

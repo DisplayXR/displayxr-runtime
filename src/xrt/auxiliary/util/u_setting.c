@@ -719,7 +719,7 @@ struct screen_pref
 //! One per-screen map: its three stores and its cache.
 struct screen_map
 {
-	const char *env;      //!< tier 1
+	const char *env;      //!< tier 1 (NULL: no environment tier)
 	const char *json_key; //!< tier 2: the object in the per-user settings file
 #ifdef XRT_OS_WINDOWS
 	const wchar_t *machine_path; //!< tier 3: HKLM subkey, one REG_SZ value per screen key
@@ -748,6 +748,19 @@ static struct screen_map s_map_vt = {
 #endif
 };
 
+/*
+ * ADR-066 C1: the per-screen 3D mode, the same map with no environment tier.
+ * Its getter reads the stores fresh on every call (u_setting_get_mode_3d_for_screen):
+ * its callers poll at most once a second and a write must apply live.
+ */
+static struct screen_map s_map_m3d = {
+    .env = NULL,
+    .json_key = U_SETTING_MODE_3D_JSON_KEY,
+#ifdef XRT_OS_WINDOWS
+    .machine_path = L"Software\\DisplayXR\\DisplayProcessors\\Mode3D",
+#endif
+};
+
 //! Bumped by every reload of the per-screen stores (a long-lived process re-reads them).
 static uint64_t s_screen_generation = 1;
 
@@ -757,6 +770,7 @@ screen_maps_invalidate_locked(void)
 {
 	s_map_dp.loaded = false;
 	s_map_vt.loaded = false;
+	s_map_m3d.loaded = false;
 	s_screen_generation++;
 }
 
@@ -1060,7 +1074,8 @@ map_get(struct screen_map *m, const char *key, char *buf, size_t cap, enum u_set
 
 	// 1. The environment always wins, as for every other option.
 	char env[SCREEN_ENV_MAX];
-	if (env_get_raw(env, sizeof(env), m->env) != NULL && u_setting_per_screen_env_lookup(env, key, buf, cap)) {
+	if (m->env != NULL && env_get_raw(env, sizeof(env), m->env) != NULL &&
+	    u_setting_per_screen_env_lookup(env, key, buf, cap)) {
 		if (out_source != NULL) {
 			*out_source = U_SETTING_SOURCE_ENV;
 		}
@@ -1294,4 +1309,83 @@ u_setting_machine_set_viewer_tracking_for_screen(const char *key, enum u_setting
 {
 	return map_machine_set(&s_map_vt, key,
 	                       value == U_SETTING_VIEWER_TRACKING_UNSET ? NULL : u_setting_viewer_tracking_str(value));
+}
+
+/*
+ *
+ * Per-screen 3D mode (ADR-066 C1): which declared rendering mode a screen's
+ * 3D slot maps to. Two tiers, read fresh on every call (the callers poll at
+ * most once a second, and a write must apply live):
+ *
+ *   1. per-user file "mode_3d_per_screen": { "<key>": "<mode name>" }
+ *   2. machine       HKLM\Software\DisplayXR\DisplayProcessors\Mode3D,
+ *                    value "<key>" (REG_SZ, admin; Windows only)
+ *
+ */
+
+const char *
+u_setting_get_mode_3d_for_screen(const char *key, char *buf, size_t cap, enum u_setting_source *out_source)
+{
+	if (!screen_key_valid(key)) {
+		if (out_source != NULL) {
+			*out_source = U_SETTING_SOURCE_DEFAULT;
+		}
+		return NULL;
+	}
+	// Fresh on every call (both tiers): drop the cache first.
+	lock();
+	s_map_m3d.loaded = false;
+	unlock();
+	const char *r = map_get(&s_map_m3d, key, buf, cap, out_source);
+	if (r == NULL && buf != NULL && cap > 0) {
+		buf[0] = '\0';
+	}
+	return r;
+}
+
+uint64_t
+u_setting_user_stamp(void)
+{
+	char path[512];
+	if (!user_path(path, sizeof(path))) {
+		return 0;
+	}
+#ifdef XRT_OS_WINDOWS
+	WIN32_FILE_ATTRIBUTE_DATA fa;
+	if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
+		return 0;
+	}
+	const uint64_t t = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+	const uint64_t sz = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+	return t ^ (sz << 1) ^ 1ull;
+#else
+	struct stat st;
+	if (stat(path, &st) != 0) {
+		return 0;
+	}
+#if defined(__APPLE__)
+	const uint64_t ns = (uint64_t)st.st_mtimespec.tv_nsec;
+#else
+	const uint64_t ns = (uint64_t)st.st_mtim.tv_nsec;
+#endif
+	return ((uint64_t)st.st_mtime * 1000000000ull + ns) ^ ((uint64_t)st.st_size << 1) ^ 1ull;
+#endif
+}
+
+bool
+u_setting_user_set_mode_3d_for_screen(const char *key, const char *mode_name)
+{
+	return map_user_set(&s_map_m3d, key, mode_name);
+}
+
+bool
+u_setting_user_clear_mode_3d_per_screen(void)
+{
+	return map_user_clear(&s_map_m3d);
+}
+
+enum u_setting_write_result
+u_setting_machine_set_mode_3d_for_screen(const char *key, const char *mode_name)
+{
+	return map_machine_set(&s_map_m3d, key, mode_name);
 }

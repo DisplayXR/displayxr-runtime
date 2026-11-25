@@ -41,6 +41,8 @@
 
 #include "os/os_time.h"
 
+#include "util/u_rendering_modes.h"
+#include "util/u_screen_modes.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
@@ -160,6 +162,11 @@ void
 comp_ipc_client_compositor_segments_enable(struct xrt_compositor *xc, uint64_t pinned_display_id);
 bool
 comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics);
+// ADR-047 Amendment 10 over IPC: this client's effective rendering-mode table,
+// from its shared memory (no round trip).
+struct xrt_effective_mode_table;
+bool
+comp_ipc_client_compositor_get_effective_table(struct xrt_compositor *xc, struct xrt_effective_mode_table *out);
 
 // IPC-client DP tracking state (#441 Phase 2) — same linkage pattern as
 // above. Consumed ONLY for the derived isTracking value + tracking-state
@@ -2232,6 +2239,145 @@ xrt_to_passthrough_state_flags(enum xrt_passthrough_state state)
 }
 #endif
 
+
+// ADR-047 Amendment 10 (defined with the locate path below).
+static bool
+oxr_session_is_ipc_client(const struct oxr_session *sess);
+static void
+locate_note_effective_table(struct oxr_session *sess, const struct xrt_segment_metrics *m);
+
+#ifdef OXR_HAVE_DXR_display_info
+//! ADR-066 C1.6: at most one table-changed event per session per second.
+#define OXR_MODE_TABLE_EVENT_MIN_NS (1000ull * 1000ull * 1000ull)
+
+/*!
+ * ADR-066 C1: tell the app when a 3D-mode switch remapped the head's slot 1.
+ *
+ * Polled from oxr_session_poll, i.e. from the app's own xrPollEvent: first
+ * u_device_rendering_modes_sync makes the table current (in-process: re-read
+ * the screen's 3D-mode choice and the driver's default at most once a second;
+ * IPC: re-copy the service's table when its generation moved). Then, on a new
+ * generation:
+ *  - the slot index does NOT move (the app owns its 2D/3D state) - except when
+ *    this session sits in slot 1 and cannot fill the new entry (a 2-view
+ *    session facing a 4-view slot 1): it is floored to slot 0 exactly as at
+ *    xrBeginSession (#1499), and told with XrEventDataRenderingModeChangedDXR
+ *    1 -> 0, queued FIRST;
+ *  - then one XrEventDataRenderingModeTableChangedDXR (XR_DXR_display_info v27)
+ *    carrying the active index, flags 0 (C1 never asks for recreation). It is
+ *    queued here, never inside xrRequestDisplayRenderingModeDXR, so it is
+ *    never the answer to a request; at most one per second per session,
+ *    coalesced to the latest table (a newer generation inside the second waits
+ *    and is reported once). XrEventDataRenderingModeChangedDXR is never sent
+ *    with an unchanged index;
+ *  - in-process, when the session is in slot 1 and the new entry wants the
+ *    other lens state (a passthrough entry vs a 3D one), the lens follows, with
+ *    the usual hardware-state event.
+ */
+static void
+oxr_session_rendering_modes_poll(struct oxr_logger *log, struct oxr_session *sess)
+{
+	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+	if (head == NULL || head->hmd == NULL) {
+		return;
+	}
+	const uint64_t now = os_monotonic_get_ns();
+	// ADR-047 Amendment 10: every other screen's 3D-mode choice too (in-process:
+	// the registry re-reads the store at most once a second; empty elsewhere).
+	(void)u_screen_modes_refresh_choices(now, false);
+	// Over IPC the service keeps this client's effective table in its shared
+	// memory: follow it here too, so an app that polls without locating (or
+	// between locates) is told when its window changes screen.
+	if (oxr_session_is_ipc_client(sess)) {
+		struct xrt_segment_metrics m;
+		memset(&m, 0, sizeof(m));
+		(void)comp_ipc_client_compositor_get_effective_table(&sess->xcn->base, &m.table);
+		locate_note_effective_table(sess, &m);
+	}
+	const uint32_t gen = u_device_rendering_modes_sync(head, now);
+	const bool slots_moved = gen != sess->rendering_mode_generation;
+	const bool screen_moved = sess->eff_table_gen != sess->eff_table_gen_told;
+	if (!slots_moved && !screen_moved) {
+		return;
+	}
+	if (!sess->sys->inst->extensions.DXR_display_info) {
+		sess->rendering_mode_generation = gen;
+		sess->eff_table_gen_told = sess->eff_table_gen;
+		return; // a legacy app cannot be told; its table is current anyway
+	}
+	if (sess->rendering_mode_table_event_ns != 0 &&
+	    now - sess->rendering_mode_table_event_ns < OXR_MODE_TABLE_EVENT_MIN_NS) {
+		return; // coalesce: the next poll past the second reports the latest table
+	}
+	sess->rendering_mode_generation = gen;
+	sess->eff_table_gen_told = sess->eff_table_gen;
+	uint32_t cur = head->hmd->active_rendering_mode_index;
+	if (cur >= head->rendering_mode_count) {
+		return;
+	}
+	const bool service_mode = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
+
+	if (!slots_moved) {
+		// Only the window's screen changed: the app's slot does not move and
+		// no lens is asked for (each screen's DP renders the app's mode).
+		const struct xrt_effective_mode_table *e = &sess->eff_table;
+		if (e->valid) {
+			U_LOG_W(
+			    "oxr: rendering-mode table changed (ADR-047 Amendment 10): the window moved - slot 1 is "
+			    "now '%s' (%u views, %ux%u tiles, scale %.3f x %.3f) on screen 0x%016llx",
+			    e->slot[1].mode_name, e->slot[1].view_count, e->slot[1].tile_columns, e->slot[1].tile_rows,
+			    (double)e->slot[1].view_scale_x, (double)e->slot[1].view_scale_y,
+			    (unsigned long long)e->majority_screen_id);
+		} else {
+			U_LOG_W(
+			    "oxr: rendering-mode table changed (ADR-047 Amendment 10): the window is back on the "
+			    "session screen - its display's table");
+		}
+		sess->rendering_mode_table_event_ns = now;
+		oxr_event_push_XrEventDataRenderingModeTableChanged(log, sess, cur, 0);
+		return;
+	}
+
+	if (cur == U_RENDERING_MODE_3D && oxr_session_mode_floor_enabled() &&
+	    oxr_frame_sync_is_session_running(&sess->frame_sync) && sess->view_config_view_count > 0 &&
+	    oxr_session_may_move_display_mode(sess, head, NULL, NULL)) {
+		const uint32_t max_submit = oxr_segment_views_per_segment_capacity(
+		    sess->view_config_view_count,
+		    sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, head->hmd->view_count);
+		if (!oxr_mode_fillable_by(&head->rendering_modes[cur], max_submit)) {
+			U_LOG_W(
+			    "oxr: 3D-mode switch (ADR-066 C1) put '%s' (%u views) in slot 1, which this %u-view "
+			    "session "
+			    "cannot fill - floored to 2D (#1499)",
+			    head->rendering_modes[cur].mode_name, head->rendering_modes[cur].view_count, max_submit);
+			head->hmd->active_rendering_mode_index = U_RENDERING_MODE_2D;
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)U_RENDERING_MODE_2D);
+			oxr_session_request_display_mode(log, sess, false);
+			sess->last_rendering_mode_index = U_RENDERING_MODE_2D;
+			oxr_event_push_XrEventDataRenderingModeChanged(log, sess, cur, U_RENDERING_MODE_2D);
+			cur = U_RENDERING_MODE_2D;
+		}
+	}
+
+	if (cur == U_RENDERING_MODE_3D && !service_mode) {
+		const bool want_hw =
+		    u_rendering_modes_index_wants_hw_3d(head->rendering_modes, head->rendering_mode_count, cur);
+		if (want_hw != sess->hardware_display_3d) {
+			oxr_session_request_display_mode(log, sess, want_hw);
+			if (!oxr_session_window_hidden(sess)) {
+				oxr_event_push_XrEventDataHardwareDisplayStateChanged(log, sess,
+				                                                      want_hw ? XR_TRUE : XR_FALSE);
+			}
+		}
+	}
+	U_LOG_W("oxr: rendering-mode table changed (ADR-066 C1, generation %u): slot 1 is now '%s' (%u views)", gen,
+	        head->rendering_mode_count > 1 ? head->rendering_modes[1].mode_name : "-",
+	        head->rendering_mode_count > 1 ? head->rendering_modes[1].view_count : 0);
+	sess->rendering_mode_table_event_ns = now;
+	oxr_event_push_XrEventDataRenderingModeTableChanged(log, sess, cur, 0);
+}
+#endif // OXR_HAVE_DXR_display_info
+
 XrResult
 oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 {
@@ -2257,6 +2403,12 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	oxr_session_visibility_poll(log, sess);
 
 #ifdef OXR_HAVE_DXR_display_info
+	// ADR-066 C1 / ADR-047 Amendment 10: a live config switch (a screen's 3D
+	// mode) remapped slot 1, or the window's screen changed the table. FIRST:
+	// its #1499 floor records last_rendering_mode_index and queues its own
+	// mode-changed event, so the #2801 poll below finds nothing left to report
+	// (one event per index change, never two).
+	oxr_session_rendering_modes_poll(log, sess);
 	// #2801: report a mode the in-process compositor's keys moved.
 	oxr_session_mode_observed_poll(log, sess);
 #endif
@@ -4327,6 +4479,18 @@ locate_wants_fixed_viewer(struct oxr_session *sess, const XrViewLocateInfo *info
 #endif
 }
 
+//! An out-of-process session: its compositor is the IPC client compositor.
+static bool
+oxr_session_is_ipc_client(const struct oxr_session *sess)
+{
+	if (sess == NULL || sess->xcn == NULL || sess->sys == NULL || sess->sys->xsysc == NULL ||
+	    !sess->sys->xsysc->info.is_service_mode) {
+		return false;
+	}
+	return !(sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor ||
+	         sess->is_metal_native_compositor || sess->is_gl_native_compositor || sess->is_vk_native_compositor);
+}
+
 /*!
  * XR_DXR_display_info v25 over IPC: the SERVICE computes this client's views
  * and hosts the viewer-tracking provider, so it has to know. The flag rides
@@ -4419,6 +4583,10 @@ locate_views_one(struct oxr_logger *log,
 	uint32_t active_view_count = (active_mode_idx < xdev->rendering_mode_count)
 	    ? xdev->rendering_modes[active_mode_idx].view_count
 	    : view_count;
+	// ADR-047 Amendment 10: the slot's view count on the window's screen.
+	if (sess->eff_table.valid && active_mode_idx < 2 && sess->eff_table.slot[active_mode_idx].view_count > 0) {
+		active_view_count = sess->eff_table.slot[active_mode_idx].view_count;
+	}
 
 #ifdef OXR_HAVE_DXR_display_info
 	// Auto-2D is presentation-only: the vk_native hold never touches the
@@ -6161,40 +6329,87 @@ locate_views_one(struct oxr_logger *log,
 //! the other native compositors, every other service session — answers false
 //! and keeps one view set.
 static bool
-locate_get_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics *out)
+locate_fetch_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics *out)
 {
 	memset(out, 0, sizeof(*out));
-	if (sess->seg_ipc && sess->xcn != NULL) {
-		return comp_ipc_client_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+	if (oxr_session_is_ipc_client(sess)) {
+		// ADR-047 Amendment 10 over IPC: the service computes this client's
+		// effective table from where its window is and keeps it in the
+		// client's shared memory; the per-screen segment table (Windows, two
+		// DP-backed screens) still comes by message.
+		const bool have_segs =
+		    sess->seg_ipc && comp_ipc_client_compositor_get_segment_metrics(&sess->xcn->base, out);
+		if (!have_segs) {
+			memset(out, 0, sizeof(*out));
+		}
+		const bool have_table = comp_ipc_client_compositor_get_effective_table(&sess->xcn->base, &out->table);
+		return have_segs || have_table;
 	}
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
 	if (sess->xcn != NULL && sess->is_vk_native_compositor) {
-		return comp_vk_native_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+		return comp_vk_native_compositor_get_segment_metrics(&sess->xcn->base, out);
 	}
 #endif
 #if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
 	if (sess->xcn != NULL && sess->is_d3d11_native_compositor) {
-		return comp_d3d11_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+		return comp_d3d11_compositor_get_segment_metrics(&sess->xcn->base, out);
 	}
 #endif
 #if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_OS_MACOS)
 	if (sess->xcn != NULL && sess->is_metal_native_compositor) {
-		return comp_metal_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+		return comp_metal_compositor_get_segment_metrics(&sess->xcn->base, out);
 	}
 #endif
 #if defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
 	if (sess->xcn != NULL && sess->is_d3d12_native_compositor) {
-		return comp_d3d12_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+		return comp_d3d12_compositor_get_segment_metrics(&sess->xcn->base, out);
 	}
 #endif
 #if defined(XRT_HAVE_GL_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
 	// Multi-screen M6/M3: the in-process OpenGL compositor on Windows.
 	if (sess->xcn != NULL && sess->is_gl_native_compositor) {
-		return comp_gl_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+		return comp_gl_compositor_get_segment_metrics(&sess->xcn->base, out);
 	}
 #endif
 	(void)sess;
 	return false;
+}
+
+/*!
+ * ADR-047 Amendment 10: keep the table the compositor computed for this
+ * window (@p m NULL / invalid = the head device's table). A change bumps the
+ * session's table generation; oxr_session_poll tells the app.
+ */
+static void
+locate_note_effective_table(struct oxr_session *sess, const struct xrt_segment_metrics *m)
+{
+	struct xrt_effective_mode_table next;
+	memset(&next, 0, sizeof(next));
+#ifdef OXR_HAVE_DXR_display_info
+	if (m != NULL && m->table.valid && sess->sys->inst->extensions.DXR_display_info) {
+		next = m->table;
+	}
+#else
+	(void)m;
+#endif
+	if (memcmp(&next, &sess->eff_table, sizeof(next)) != 0) {
+		const bool size_moved =
+		    next.valid != sess->eff_table.valid ||
+		    (next.valid && (memcmp(next.slot, sess->eff_table.slot, sizeof(next.slot)) != 0));
+		sess->eff_table = next;
+		if (size_moved) {
+			sess->eff_table_gen++;
+		}
+	}
+}
+
+//! The compositor's segment table (see locate_fetch_segment_metrics), and the effective table it carries.
+static bool
+locate_get_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics *out)
+{
+	const bool ok = locate_fetch_segment_metrics(sess, out);
+	locate_note_effective_table(sess, ok ? out : NULL);
+	return ok && out->count > 0;
 }
 
 /*!
@@ -9024,6 +9239,9 @@ oxr_session_create(struct oxr_logger *log,
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL && head->hmd != NULL) {
 			sess->last_rendering_mode_index = head->hmd->active_rendering_mode_index;
+			// ADR-066 C1: the table this session starts from; a later
+			// generation is a live config switch (oxr_session_poll).
+			sess->rendering_mode_generation = u_device_rendering_modes_generation(head);
 			// Seed the hardware 2D/3D belief from the ACTIVE mode too. It was
 			// zero-initialised ("2D") regardless of the panel, so on a display
 			// that boots in its 3D mode the first xrRequestDisplayRenderingModeDXR

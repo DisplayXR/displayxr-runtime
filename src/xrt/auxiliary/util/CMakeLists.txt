@@ -170,6 +170,8 @@ add_library(
 	u_resampler.h
 	u_sandbox.c
 	u_sandbox.h
+	u_screen_modes.c
+	u_screen_modes.h
 	u_sd_notify.c
 	u_sd_notify.h
 	u_session.c

@@ -46,17 +46,21 @@ static const struct knob g_knobs[] = {
     {{"TRACKING_SWAY_PERIOD_MS", XRT_COMPONENT_SETTING_TYPE_INT, "4000", "fake tracking: sway period (>= 100)"},
      "FAKE_TRACKING_SWAY_PERIOD_MS"},
     // Panel geometry + output.
-    // ADR-065: two run-time modes, 0 = 2D and 1 = the 3D kind OUTPUT names;
-    // read when the device is created (next app / service start).
-    {{"OUTPUT", XRT_COMPONENT_SETTING_TYPE_ENUM, "anaglyph",
-      "the 3D kind mode 1 draws: anaglyph, sbs, squeezed|squeezed_sbs, quad (4 views: an inspection kind, "
-      "stereo apps fall back to 2D), interlaced, blend; 2d|passthrough = anaglyph and start in 2D"},
+    // ADR-066 C1: OUTPUT is the config - which declared entry the 3D slot
+    // (mode 1) maps to. It applies LIVE (the runtime polls it); mode 0 is
+    // always full-screen 2D and not configurable.
+    {{"OUTPUT", XRT_COMPONENT_SETTING_TYPE_ENUM, "default",
+      "the default 3D mode (slot 1) of a screen with no 'dp mode set' choice, applied live: Same as 2D "
+      "(default|same_as_2d: one sharp full-resolution view, the default; 2d and passthrough are aliases of it, "
+      "no longer 'anaglyph, start in 2D'), anaglyph, sbs, squeezed|squeezed_sbs, interlaced, blend, quad (4 "
+      "views: declared only when it is the 3D mode at start-up, here or as the screen's 'dp mode set' choice, so "
+      "switching TO quad applies at the next start; stereo apps fall back to 2D)"},
      "OUTPUT"},
     {{"START_3D", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
-      "start in the 3D kind (mode 1) instead of 2D (mode 0); ignored with OUTPUT=2d"},
+      "start in the 3D mode (mode 1) instead of 2D (mode 0); read at start"},
      "START_3D"},
     {{"FORCE_MODE", XRT_COMPONENT_SETTING_TYPE_INT, "-1",
-      "pin the rendering mode for every app: 0 = 2D, 1 = the 3D kind OUTPUT names; -1 = off (other values are "
+      "pin the rendering mode for every app: 0 = 2D, 1 = the 3D mode OUTPUT names; -1 = off (other values are "
       "ignored)"},
      "FORCE_MODE"},
     {{"WIDTH_M", XRT_COMPONENT_SETTING_TYPE_FLOAT, "0.344", "panel width in metres"}, "WIDTH_M"},
@@ -275,6 +279,16 @@ sim_display_setting(const char *key, char *buf, size_t cap)
 	}
 	copy_str(buf, cap, r->value);
 	return true;
+}
+
+bool
+sim_display_setting_reread(const char *key, char *buf, size_t cap)
+{
+	const int i = knob_index(key);
+	if (i >= 0) {
+		g_cache[i].resolved = false; // drop the cached value: resolve() reads the host again
+	}
+	return sim_display_setting(key, buf, cap);
 }
 
 bool

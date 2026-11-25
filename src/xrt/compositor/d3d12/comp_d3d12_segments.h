@@ -43,6 +43,8 @@
 extern "C" {
 #endif
 
+struct xrt_rendering_mode;
+
 struct comp_d3d12_segments;
 struct comp_d3d12_renderer;
 
@@ -144,6 +146,17 @@ struct comp_d3d12_segments_frame
 	struct xrt_display_processor_d3d12 *primary_dp;
 	//! For the flat-2D fill (comp_d3d12_renderer_blit_rect).
 	struct comp_d3d12_renderer *renderer;
+	/*!
+	 * ADR-047 Amendment 10: crop and draw each NON-primary segment as ITS
+	 * screen's entry for @ref active_slot (comp_segments_view_size_segment_grid,
+	 * the screen's table from the per-screen registry), and tell its DP the
+	 * entry (set_output_entry) on change. False (zero-init) keeps every
+	 * segment in the session's grid, as before.
+	 */
+	bool screen_entries;
+	//! The app's run-time slot this frame (0 = 2D, 1 = the 3D mode); read
+	//! with @ref screen_entries.
+	uint32_t active_slot;
 };
 
 /*!
@@ -216,6 +229,38 @@ comp_d3d12_segments_get_metrics(const struct comp_d3d12_segments *segs,
                                 const struct comp_seg_rect *canvas,
                                 bool primary_has_dp,
                                 struct xrt_segment_metrics *out);
+
+/*!
+ * ADR-047 Amendment 10: advance the view-size state with the window's current
+ * placement (its own segment table, so it runs also on frames that do not
+ * split — zero-copy on the session screen — and the size follows the window
+ * back) and recompute the effective table the app is told: invalid while the
+ * window is on the session screen (the head device's table stands), else the
+ * covered screens' tables after a 0.5 s dwell (majority with Amendment 2's
+ * 20 % dead band). One WARN per change, the same wording on every
+ * compositor (comp_segments_view_size_log_change). Weave thread.
+ *
+ * @param head_modes, head_count  The head device's presented table.
+ * @param max_views    The most views one view set of the session carries (0 = no limit).
+ * @param cap_w, cap_h The instance's worst-case atlas (0 = no clamp).
+ * @return true when the effective table changed.
+ */
+bool
+comp_d3d12_segments_update_view_size(struct comp_d3d12_segments *segs,
+                                     const struct comp_seg_rect *window_desktop,
+                                     const struct comp_seg_rect *canvas,
+                                     const struct xrt_rendering_mode *head_modes,
+                                     uint32_t head_count,
+                                     uint32_t max_views,
+                                     uint32_t cap_w,
+                                     uint32_t cap_h);
+
+/*!
+ * ADR-047 Amendment 10: the effective table (see
+ * @ref comp_d3d12_segments_update_view_size). Any thread. Returns its validity.
+ */
+bool
+comp_d3d12_segments_get_effective_table(struct comp_d3d12_segments *segs, struct xrt_effective_mode_table *out);
 
 /*!
  * #2218 (#4): publish the session's local zone mask to every segment DP that

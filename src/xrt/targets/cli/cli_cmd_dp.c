@@ -39,6 +39,13 @@
  *                      through the host iface at init, so a write applies to
  *                      the next session / service start.
  *
+ *   dp mode list [--screen <key>] [--json]
+ *   dp mode set <name> --screen <key> [--machine]
+ *   dp mode reset --screen <key>|all [--machine]
+ *                      ADR-066 C1: a screen's 3D mode — which entry of its
+ *                      driver's declared list the 3D slot maps to. Stored per
+ *                      screen like `dp use --screen`; applies live.
+ *
  *   dp use <id> --screen <key> [--machine]
  *   dp reset --screen <key>|all [--machine]
  *                      The per-screen preference (display dashboard phase 7):
@@ -84,7 +91,9 @@
 #include "target_screen_pin.h"
 
 #include "os/os_display_edid.h"
+#include "util/u_git_tag.h"
 #include "util/u_logging.h"
+#include "util/u_rendering_modes.h"
 #include "util/u_setting.h"
 #include "util/u_status_snapshot.h"
 #include "xrt/xrt_compositor.h"
@@ -481,6 +490,8 @@ note_settings_pickup(void)
 {
 	P("The plug-in reads its settings at init through the host iface — a running service /\n");
 	P("session keeps what it read; restart the DisplayXR service (or launch a fresh app).\n");
+	P("Exception (ADR-066 C1): a display driver's default 3D mode (sim-display OUTPUT) applies live,\n");
+	P("within ~1 s; a per-screen 'dp mode set' choice outranks it.\n");
 }
 
 //! The class's `activate` slot behind the shared `activate` verb (ADR-054 N5).
@@ -596,7 +607,7 @@ cmd_reset(bool machine)
  * `system_request_display_reprobe`), so the change applies without waiting
  * for a world event. Says what happened.
  */
-//! The re-probe call alone: 0 = done, 1 = refused (@p out_xret), 2 = no service reachable.
+//! The re-probe call alone, the one every per-screen write makes (dp use, dp mode, tracking set).
 static int
 poke_service_quiet(int *out_xret)
 {
@@ -607,18 +618,22 @@ poke_service_quiet(int *out_xret)
 	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
 	struct ipc_connection ipc_c;
 	memset(&ipc_c, 0, sizeof(ipc_c));
-	if (cli_ipc_connect(&ipc_c, U_LOGGING_RAW, &ii) == XRT_SUCCESS) {
+	const xrt_result_t cret = cli_ipc_connect(&ipc_c, U_LOGGING_RAW, &ii);
+	if (cret == XRT_ERROR_IPC_VERSION_SKEW) {
+		return CLI_POKE_VERSION_SKEW;
+	}
+	if (cret == XRT_SUCCESS) {
 		const xrt_result_t xret = ipc_call_system_request_display_reprobe(&ipc_c);
 		ipc_client_connection_fini(&ipc_c);
 		if (out_xret != NULL) {
 			*out_xret = (int)xret;
 		}
-		return xret == XRT_SUCCESS ? 0 : 1;
+		return xret == XRT_SUCCESS ? CLI_POKE_DONE : CLI_POKE_REFUSED;
 	}
 #else
 	(void)out_xret;
 #endif
-	return 2;
+	return CLI_POKE_NO_SERVICE;
 }
 
 int
@@ -627,31 +642,60 @@ cli_poke_service_reprobe_quiet(int *out_xret)
 	return poke_service_quiet(out_xret);
 }
 
+//! A running service of another build refused this CLI (the git-tag gate): say who sees the stored write.
+void
+cli_poke_say_version_skew(bool live_setting)
+{
+	P("A DisplayXR service is running, but it is a different version than this displayxr-cli (%s) and\n",
+	  u_git_tag);
+	P("refused its connection (the log line above names both versions).\n");
+	if (live_setting) {
+		P("The choice IS stored. That service, and the IPC apps attached to it, do not see it until it is\n");
+		P("restarted on a build that matches this CLI; in-process apps of this build pick it up within ~1 "
+		  "s.\n");
+	} else {
+		P("The preference IS stored; that service re-reads it at its next start.\n");
+	}
+}
+
+/*!
+ * Ask the running service to re-probe now (session-free DIAG RPC
+ * `system_request_display_reprobe`), so the change applies without waiting
+ * for a world event, and say what happened. @p mode_3d: the write was a
+ * per-screen 3D mode (it applies live, ADR-066 C1).
+ */
+static void
+poke_service_ex(bool mode_3d)
+{
+	int xret = 0;
+	switch (poke_service_quiet(&xret)) {
+	case CLI_POKE_DONE:
+		if (mode_3d) {
+			P("The running DisplayXR service applies it within ~1 s.\n");
+			return;
+		}
+		P("The running DisplayXR service re-probes now: a secondary screen's segment DP\n");
+		P("follows within ~1 s; the primary screen (and in-process apps) at the next session.\n");
+		return;
+	case CLI_POKE_REFUSED:
+		P("The running DisplayXR service refused the re-probe request (xrt_result=%d) — applies at the "
+		  "next session.\n",
+		  xret);
+		return;
+	case CLI_POKE_VERSION_SKEW: cli_poke_say_version_skew(mode_3d); return;
+	default: break;
+	}
+	if (mode_3d) {
+		P("No DisplayXR service reachable — running in-process apps pick it up within ~1 s.\n");
+		return;
+	}
+	P("No DisplayXR service reachable — applies at the next session (in-process apps: their next launch).\n");
+}
+
 static void
 poke_service(void)
 {
-#ifdef CLI_HAVE_IPC
-	struct xrt_instance_info ii;
-	memset(&ii, 0, sizeof(ii));
-	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
-	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
-	struct ipc_connection ipc_c;
-	memset(&ipc_c, 0, sizeof(ipc_c));
-	if (cli_ipc_connect(&ipc_c, U_LOGGING_RAW, &ii) == XRT_SUCCESS) {
-		const xrt_result_t xret = ipc_call_system_request_display_reprobe(&ipc_c);
-		ipc_client_connection_fini(&ipc_c);
-		if (xret == XRT_SUCCESS) {
-			P("The running DisplayXR service re-probes now: a secondary screen's segment DP\n");
-			P("follows within ~1 s; the primary screen (and in-process apps) at the next session.\n");
-			return;
-		}
-		P("The running DisplayXR service refused the re-probe request (xrt_result=%d) — applies at the "
-		  "next session.\n",
-		  (int)xret);
-		return;
-	}
-#endif
-	P("No DisplayXR service reachable — applies at the next session (in-process apps: their next launch).\n");
+	poke_service_ex(false);
 }
 
 static bool
@@ -822,6 +866,265 @@ cmd_reset_screen(const char *key, bool machine)
 	return 0;
 }
 
+/*
+ *
+ * Per-screen 3D mode (ADR-066 C1): `dp mode list|set|reset`.
+ *
+ * The 3D slot (run-time mode 1) of a screen maps to one entry of its display
+ * driver's declared list. The choice is per screen and runtime-owned, stored
+ * like `dp use --screen` (per user, or --machine); with none, the driver's own
+ * default applies (sim-display: its OUTPUT setting). The running service (and
+ * every in-process app) re-reads it within ~1 s and remaps live.
+ *
+ */
+
+//! The status snapshot `dp mode` reads; NULL (after saying why) when none can be built.
+static struct xrt_status_snapshot *
+mode_snapshot(void)
+{
+	struct xrt_status_snapshot *snap = calloc(1, sizeof(*snap));
+	if (snap == NULL) {
+		P("FAIL: out of memory.\n");
+		return NULL;
+	}
+	if (cli_status_fetch(snap) < 0) {
+		free(snap);
+		return NULL;
+	}
+	return snap;
+}
+
+//! The row whose key is @p key (case-insensitive, current or legacy form); NULL when none.
+static struct xrt_status_screen *
+mode_find_row(struct xrt_status_snapshot *snap, const char *key)
+{
+	char cur[TARGET_SCREEN_KEY_MAX] = {0};
+	char legacy[TARGET_SCREEN_KEY_MAX] = {0};
+	const bool resolved = screen_key_lookup(key, cur, sizeof(cur), legacy, sizeof(legacy));
+	for (uint32_t i = 0; i < snap->screen_count; i++) {
+		struct xrt_status_screen *sc = &snap->screens[i];
+		if (key_ieq(sc->key, key) || (resolved && key_ieq(sc->key, cur))) {
+			return sc;
+		}
+	}
+	return NULL;
+}
+
+static void
+mode_print_row(const struct xrt_status_screen *sc)
+{
+	const struct xrt_status_mode_3d *m = &sc->mode_3d;
+	P("  %s  (%s)\n", sc->key[0] != '\0' ? sc->key : "(no key)", sc->friendly_name);
+	if (!m->valid) {
+		P("    3D mode: not known for this screen%s%s%s\n", m->setting[0] != '\0' ? " (stored choice: '" : "",
+		  m->setting, m->setting[0] != '\0' ? "')" : "");
+		return;
+	}
+	P("    slot 0: 2D (full screen, not configurable)\n");
+	P("    slot 1 (3D mode): %s  [source: %s%s%s%s]\n", m->active, u_status_mode_3d_source_str(m->source),
+	  m->setting[0] != '\0' ? ", setting '" : "", m->setting, m->setting[0] != '\0' ? "'" : "");
+	for (uint32_t k = 0; k < m->choice_count; k++) {
+		const struct xrt_status_mode_3d_choice *c = &m->choices[k];
+		P("      %c %-16s %-16s %u view%s%s%s  applies: %s%s%s\n", strcmp(c->name, m->active) == 0 ? '*' : ' ',
+		  c->name, c->label, c->views, c->views == 1 ? "" : "s", c->tracked ? ", tracked" : "",
+		  c->passthrough ? ", passthrough" : "", u_status_mode_3d_applies_str(c->applies),
+		  c->reason[0] != '\0' ? " - " : "", c->reason);
+	}
+}
+
+static int
+cmd_mode_list(const char *screen, bool json)
+{
+	struct xrt_status_snapshot *snap = mode_snapshot();
+	if (snap == NULL) {
+		return 3;
+	}
+	const struct xrt_status_screen *only = NULL;
+	if (screen != NULL) {
+		only = mode_find_row(snap, screen);
+		if (only == NULL) {
+			P("FAIL: no connected screen has the key '%s' (see 'dp list').\n", screen);
+			free(snap);
+			return 1;
+		}
+	}
+	if (json) {
+		cJSON *root = cJSON_CreateObject();
+		cJSON_AddStringToObject(root, "source", u_status_source_str(snap->source));
+		cJSON *arr = cJSON_AddArrayToObject(root, "screens");
+		for (uint32_t i = 0; i < snap->screen_count; i++) {
+			const struct xrt_status_screen *sc = &snap->screens[i];
+			if (only != NULL && sc != only) {
+				continue;
+			}
+			cJSON *row = cJSON_CreateObject();
+			cJSON_AddStringToObject(row, "key", sc->key);
+			cJSON_AddStringToObject(row, "name", sc->friendly_name);
+			cJSON_AddItemToObject(row, "mode_3d", u_status_mode_3d_to_cjson(&sc->mode_3d));
+			cJSON_AddItemToArray(arr, row);
+		}
+		char *text = cJSON_Print(root);
+		if (text != NULL) {
+			printf("%s\n", text);
+			cJSON_free(text);
+		}
+		cJSON_Delete(root);
+	} else {
+		P(" :: 3D mode per screen (%s)\n",
+		  snap->source == XRT_STATUS_SOURCE_SERVICE ? "from the running service" : "headless");
+		for (uint32_t i = 0; i < snap->screen_count; i++) {
+			if (only == NULL || &snap->screens[i] == only) {
+				mode_print_row(&snap->screens[i]);
+			}
+		}
+		P("Set one with: displayxr-cli dp mode set <name> --screen <key>   (applies live)\n");
+	}
+	free(snap);
+	return 0;
+}
+
+static int
+cmd_mode_set(const char *name, const char *screen, bool machine)
+{
+	if (screen == NULL || strcmp(screen, "all") == 0) {
+		P("error: 'dp mode set' needs one screen key: --screen <key> (see 'dp mode list').\n");
+		return 1;
+	}
+	struct xrt_status_snapshot *snap = mode_snapshot();
+	if (snap == NULL) {
+		return 3;
+	}
+	struct xrt_status_screen *sc = mode_find_row(snap, screen);
+	if (sc == NULL) {
+		P("FAIL: no connected screen has the key '%s' (see 'dp mode list') — nothing written.\n", screen);
+		free(snap);
+		return 1;
+	}
+	if (!sc->mode_3d.valid) {
+		P("FAIL: the 3D mode of screen '%s' cannot be chosen: no display driver claims it, so it has no mode "
+		  "table (ADR-047 Amendment 10) — nothing written.\n",
+		  sc->key);
+		free(snap);
+		return 1;
+	}
+	const struct xrt_status_mode_3d_choice *pick = NULL;
+	char want[64];
+	u_rendering_mode_slug(name, want, sizeof(want));
+	for (uint32_t k = 0; k < sc->mode_3d.choice_count; k++) {
+		if (strcmp(sc->mode_3d.choices[k].name, want) == 0) {
+			pick = &sc->mode_3d.choices[k];
+		}
+	}
+	if (pick == NULL) {
+		P("FAIL: '%s' is not a 3D mode of screen '%s'. Choices:", name, sc->key);
+		for (uint32_t k = 0; k < sc->mode_3d.choice_count; k++) {
+			P(" %s", sc->mode_3d.choices[k].name);
+		}
+		P(" — nothing written.\n");
+		free(snap);
+		return 1;
+	}
+	if (pick->applies == XRT_STATUS_MODE_3D_APPLIES_NOT_SUPPORTED) {
+		P("FAIL: '%s' cannot apply on screen '%s' (%s%s%s) — nothing written.\n", pick->name, sc->key,
+		  u_status_mode_3d_applies_str(pick->applies), pick->reason[0] != '\0' ? ": " : "", pick->reason);
+		free(snap);
+		return 1;
+	}
+	// restart_app (ADR-047 Amendment 10): the label is true - the choice is
+	// STORED and honoured the next time the app (and the service) starts; the
+	// running ones keep drawing what they draw now.
+	const bool next_start = pick->applies == XRT_STATUS_MODE_3D_APPLIES_RESTART_APP;
+	char next_reason[160];
+	(void)snprintf(next_reason, sizeof(next_reason), "%s", pick->reason);
+	char key[TARGET_SCREEN_KEY_MAX];
+	(void)snprintf(key, sizeof(key), "%s", sc->key);
+	char label[32];
+	(void)snprintf(label, sizeof(label), "%s", pick->label);
+	char stored[32];
+	(void)snprintf(stored, sizeof(stored), "%s", pick->name);
+	free(snap);
+	if (machine) {
+		const int rc = machine_result(u_setting_machine_set_mode_3d_for_screen(key, stored),
+		                              "writing the machine-wide per-screen 3D mode");
+		if (rc != 0) {
+			return rc;
+		}
+		P("Machine-wide 3D mode set: screen '%s' -> '%s' (%s); a per-user choice still wins.\n", key, stored,
+		  label);
+	} else {
+		if (!u_setting_user_set_mode_3d_for_screen(key, stored)) {
+			P("FAIL: could not write the per-user settings file.\n");
+			return 1;
+		}
+		P("3D mode set: screen '%s' -> '%s' (%s).\n", key, stored, label);
+	}
+	if (next_start) {
+		P("Stored; applies the next time the app starts (and the service, for apps attached to it)%s%s. "
+		  "Running apps keep their current 3D mode.\n",
+		  next_reason[0] != '\0' ? ": " : "", next_reason);
+		return 0;
+	}
+	poke_service_ex(true);
+	return 0;
+}
+
+static int
+cmd_mode_reset(const char *screen, bool machine)
+{
+	if (screen == NULL) {
+		P("error: 'dp mode reset' needs --screen <key>|all.\n");
+		return 1;
+	}
+	const bool all = strcmp(screen, "all") == 0;
+	char key[TARGET_SCREEN_KEY_MAX] = {0};
+	if (!all) {
+		char legacy[TARGET_SCREEN_KEY_MAX] = {0};
+		if (!screen_key_lookup(screen, key, sizeof(key), legacy, sizeof(legacy))) {
+			(void)snprintf(key, sizeof(key), "%s", screen);
+		}
+	}
+	if (machine) {
+		const int rc = machine_result(u_setting_machine_set_mode_3d_for_screen(all ? NULL : key, NULL),
+		                              "clearing the machine-wide per-screen 3D mode");
+		if (rc != 0) {
+			return rc;
+		}
+	} else {
+		const bool ok =
+		    all ? u_setting_user_clear_mode_3d_per_screen() : u_setting_user_set_mode_3d_for_screen(key, NULL);
+		if (!ok) {
+			P("FAIL: could not update the per-user settings file.\n");
+			return 1;
+		}
+	}
+	P("%s 3D mode%s cleared%s%s%s: the display driver's default applies (live).\n",
+	  machine ? "Machine-wide" : "Per-user", all ? "s" : "", all ? "" : " for screen '", all ? "" : key,
+	  all ? "" : "'");
+	poke_service_ex(true);
+	return 0;
+}
+
+static int
+cmd_mode(int argc, const char **argv, const char *screen, bool machine)
+{
+	const char *sub = argc >= 4 ? argv[3] : NULL;
+	if (sub == NULL || strcmp(sub, "list") == 0) {
+		return cmd_mode_list(screen, cli_has_flag(argc, argv, "--json"));
+	}
+	if (strcmp(sub, "set") == 0) {
+		if (argc < 5 || argv[4][0] == '-') {
+			P("error: 'dp mode set' needs a mode name (see 'dp mode list').\n");
+			return 1;
+		}
+		return cmd_mode_set(argv[4], screen, machine);
+	}
+	if (strcmp(sub, "reset") == 0) {
+		return cmd_mode_reset(screen, machine);
+	}
+	P("error: unknown 'dp mode' subcommand '%s' (list | set | reset).\n", sub);
+	return 1;
+}
+
 static int
 print_usage(void)
 {
@@ -843,6 +1146,15 @@ print_usage(void)
 	P("  use <id> --screen <key>       Weave the screen <key> (from 'dp list') with <id>; per-user, no admin.\n");
 	P("  reset --screen <key>|all      Clear one / every per-screen preference.\n");
 	P("    --machine                   With --screen: the machine-wide store (HKLM, admin) instead.\n");
+	P("  mode list [--screen <key>] [--json]\n");
+	P("                                Each screen's 3D mode: slot 0 is always 2D; slot 1 is one entry of\n");
+	P("                                the driver's declared list (name, label, views, tracked, applies).\n");
+	P("  mode set <name> --screen <key> [--machine]\n");
+	P("                                The screen's 3D slot = <name>; applies LIVE (~1 s), per user by\n");
+	P("                                default. A restart_app choice is stored and applies at the next\n");
+	P("                                app start; a not_supported one is refused, with the reason.\n");
+	P("  mode reset --screen <key>|all [--machine]\n");
+	P("                                Back to the driver's default 3D mode (sim-display: OUTPUT).\n");
 	P("A running service re-probes at once (secondary screens follow; the primary at the next session).\n");
 	P("POSIX: use/reset write the per-user 'preferred' file; enable/disable = the manifest's plugin.enabled.\n");
 	return 1;
@@ -863,6 +1175,9 @@ cli_cmd_dp(int argc, const char **argv)
 	}
 	if (strcmp(verb, "list") == 0) {
 		return cmd_list(argc, argv);
+	}
+	if (strcmp(verb, "mode") == 0) {
+		return cmd_mode(argc, argv, screen, machine);
 	}
 	if (strcmp(verb, "enable") == 0 || strcmp(verb, "disable") == 0) {
 		if (screen != NULL) {

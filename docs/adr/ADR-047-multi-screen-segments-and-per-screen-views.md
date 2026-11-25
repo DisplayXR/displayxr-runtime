@@ -695,8 +695,10 @@ screen; the `CLIENT_TEXTURE` and legacy per-client weaves, which keep the primar
 
 ## Amendment 10 (2026-11-23): the view size follows the window's screen
 
-**Status: proposed, not implemented.** The project lead approved the direction; it is open for
-cross-box review. Companion to [ADR-066](ADR-066-live-display-driver-settings-envelope-sizing.md),
+**Status: accepted and implemented** (2026-11-24): every compositor (in-process Vulkan, D3D11,
+D3D12, GL, Metal) and the out-of-process paths (the IPC shared-memory table, the desktop-Linux and
+macOS weave engines, the D3D11 service). See `docs/architecture/comp-segments.md` and
+`XR_DXR_display_info` v28. Companion to [ADR-066](ADR-066-live-display-driver-settings-envelope-sizing.md),
 which makes display-driver settings apply while apps run. Roadmap: ADR-066 § *Roadmap*, stages 1
 and 3.
 

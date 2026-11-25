@@ -309,6 +309,34 @@ comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct
 	return out_metrics->count > 0;
 }
 
+bool
+comp_ipc_client_compositor_get_effective_table(struct xrt_compositor *xc, struct xrt_effective_mode_table *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (xc == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL || icc->ipc_c->ism == NULL) {
+		return false;
+	}
+	struct ipc_shared_memory *ism = icc->ipc_c->ism;
+	// The service writes the generation LAST: a copy that straddles a rewrite
+	// is retried once, else dropped (the next locate / poll reads it again).
+	for (int attempt = 0; attempt < 2; attempt++) {
+		const uint32_t gen = ism->hmd.effective_table_generation;
+		*out = ism->hmd.effective_table;
+		if (ism->hmd.effective_table_generation == gen) {
+			return out->valid;
+		}
+	}
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
 /*
  * XR_DXR_weave v19 (#1884): the per-screen segment table of this session's
  * last weave. Asked for only by a caller that chained XrWeaveOutputRectPartsDXR

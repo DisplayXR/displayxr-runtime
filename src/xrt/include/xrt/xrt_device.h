@@ -257,6 +257,18 @@ struct xrt_binding_profile
 //! orientations so the app's swapchain — never recreated on rotation — fits either. When
 //! clear, the mode is orientation-locked and only its native orientation is sized for.
 #define XRT_RENDERING_MODE_FLAG_CAN_ROTATE   (1u << 1)
+//! ADR-066 C1.2: a ONE-view entry a driver declares to serve as a 3D slot (a
+//! passthrough "3D" mode: the app is in its 3D mode, the display shows one
+//! full-resolution view). Counted as 3D by u_rendering_mode_is_3d(); it does
+//! NOT set the lens - hardware_display_3d stays false and no lens switch is
+//! asked for. Append-only (ADR-022): no struct change, no ABI bump.
+#define XRT_RENDERING_MODE_FLAG_3D_PASSTHROUGH (1u << 2)
+//! ADR-066 C1: an entry the driver LISTS but does not declare for this run - it
+//! can be selected only when the driver starts with it (sim-display's Quad when
+//! OUTPUT is not quad). Such entries must come LAST in the table; the runtime
+//! leaves them out of the sizing envelope and reports them as "restart the app
+//! to apply". Append-only (ADR-022).
+#define XRT_RENDERING_MODE_FLAG_START_UP_ONLY (1u << 3)
 
 /*!
  * A named rendering mode exposed by a device.
@@ -311,6 +323,19 @@ enum xrt_device_property_id
 	//! device's held mode instead of the app's request. Devices that don't
 	//! implement it return XRT_ERROR_NOT_IMPLEMENTED (treated as not-pinned).
 	XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED = 3,
+
+	/*!
+	 * ADR-066 C1: which entry of the device's DECLARED rendering-mode list
+	 * its configuration maps to the 3D slot (run-time mode 1), in the
+	 * driver's own numbering (>= 1). Read-only. The driver answers from its
+	 * CURRENT configuration (it re-reads its settings on this call, not a
+	 * value cached at creation), so the runtime polls it to apply a config
+	 * switch live (u_device_rendering_modes_refresh_config). Returns
+	 * XRT_ERROR_NOT_IMPLEMENTED when the driver has no such configuration;
+	 * the runtime then keeps the slot it chose at creation. A value outside
+	 * the declared list, or not a 3D entry, is ignored by the runtime.
+	 */
+	XRT_DEVICE_PROPERTY_CONFIGURED_3D_MODE = 4,
 };
 
 /*!

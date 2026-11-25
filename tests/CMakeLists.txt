@@ -155,6 +155,7 @@ set(tests
     tests_oxr_input_providers_rule
     tests_xrt_active_mode_scale
     tests_u_rendering_modes
+    tests_u_screen_modes
     tests_sim_display_modes
     tests_input_arbiter_rig
     tests_input_arbiter_rerank
@@ -1487,9 +1488,9 @@ target_link_libraries(tests_oxr_input_providers_rule PRIVATE xrt-interfaces)
 # by hand, which is exactly why it is worth pinning.
 target_link_libraries(tests_xrt_active_mode_scale PRIVATE xrt-interfaces)
 
-# ADR-065 -- sim_display's two run-time modes (2D + the OUTPUT kind) and its
-# start-up rule (sim_display_modes.h, header-only), checked against the
-# runtime's two-mode rule (util/u_rendering_modes.h). No plug-in load.
+# ADR-066 C1 -- sim_display's declared list, its OUTPUT config (Same as 2D by
+# default) and start-up rule (sim_display_modes.h, header-only), run through
+# the runtime's selection + a live remap (util/u_rendering_modes). No plug-in load.
 target_link_libraries(tests_sim_display_modes PRIVATE xrt-interfaces)
 target_include_directories(tests_sim_display_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
 
@@ -1648,6 +1649,10 @@ target_link_libraries(tests_comp_rear_budget PRIVATE xrt-interfaces aux_os xrt-e
 # lifecycle hysteresis. Pure math -- compiled into the unit like
 # tests_comp_rear_budget instead of linking the Vulkan-gated comp_util.
 target_sources(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
+# ADR-047 Amendment 10: comp_segments_view_size.h (header-only) next to the pure screen-mode rules.
+target_include_directories(tests_u_screen_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# ADR-047 Amendment 10: comp_segments_view_size_update_for_window cuts its own table (comp_segments_compute).
+target_sources(tests_u_screen_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
 target_include_directories(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_link_libraries(tests_comp_segments PRIVATE xrt-interfaces aux_util)
 

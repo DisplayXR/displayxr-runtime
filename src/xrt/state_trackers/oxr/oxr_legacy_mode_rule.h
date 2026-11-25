@@ -104,6 +104,7 @@
 #pragma once
 
 #include "xrt/xrt_device.h"
+#include "util/u_rendering_modes.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -290,7 +291,10 @@ oxr_legacy_compromise_mode_index(const struct xrt_rendering_mode *modes,
 		return legacy_index;
 	}
 	const struct xrt_rendering_mode *m = &modes[legacy_index];
-	if (m->view_count != 1 || m->hardware_display_3d) {
+	// "Already the 3D mode" is positional in a two-slot table (ADR-066 C1.2):
+	// a one-view passthrough slot 1 is the 3D mode too.
+	if (m->view_count != 1 || m->hardware_display_3d ||
+	    u_rendering_modes_index_is_3d(modes, mode_count, legacy_index)) {
 		return legacy_index; // already a 3D mode: size for it
 	}
 	(void)service_mode; // floored the same way: see above

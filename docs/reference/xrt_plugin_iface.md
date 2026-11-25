@@ -672,6 +672,41 @@ The stored value is never rewritten: the Dashboard keeps the control editable an
 no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_SETTING_STATUS`; the runtime reads through
 `xrt_plugin_iface_setting_status()`. Spec: plugin-discovery.md §2.3 *Setting status*.
 
+### `get_rendering_modes_for_monitor` (a screen's own mode list, ADR-047 Amendment 10)
+
+```c
+bool (*get_rendering_modes_for_monitor)(struct xrt_plugin_instance *inst,
+                                        const struct xrt_display_descriptor *display,
+                                        const struct xrt_display_physical *physical,
+                                        struct xrt_rendering_mode *out_modes,
+                                        uint32_t capacity,
+                                        uint32_t *out_count,
+                                        uint32_t *out_default_3d);
+```
+
+Declare the rendering modes you can show on ONE monitor you won (the per-monitor twin of your head
+device's `rendering_modes`), so a screen other than the head's gets its own 3D entries, view
+counts, tile grids and view scales, and its own per-screen 3D mode (`displayxr-cli dp mode set
+--screen <key>`). Same rules as a device table: entry 0 is the flat full-screen 2D entry; the rest
+are 3D entries, each with `view_count`, `view_scale_x/y` in the monitor's native axes,
+`tile_columns/rows`, `hardware_display_3d`, `mode_name` and `mode_flags` (`HAS_TRACKING`,
+`3D_PASSTHROUGH`, `START_UP_ONLY`, `CAN_ROTATE`). Leave the pixel fields 0: the runtime fills them.
+`*out_default_3d` is the entry your own configuration puts in the 3D slot when the user chose
+nothing. Cheap, any thread, re-callable.
+
+The runtime keeps the list for that screen, sizes the instance's worst case over it (and every
+other claimed screen's), and tells a DP made by your `create_dp_vk_for_screen` factory which entry
+to draw through `set_output_entry` (`xrt_display_processor_vk`, and its D3D11 / D3D12 / GL twins
+for a DP made by `create_dp_d3d11_for_screen` / `_d3d12_` / `_gl_`; each gated by `struct_size` and
+announced by `XRT_DP_{VK,D3D11,D3D12,GL}_HAS_OUTPUT_ENTRY`), in THIS list's numbering, before the
+`process_atlas` that hands it an atlas laid out as that entry's tiles.
+
+**NULL is allowed**: the screen's list is then the head device's (the behaviour before the slot).
+Appended per ADR-020 after `get_setting_status` (`offsetof == 304`, `sizeof(struct
+xrt_plugin_iface) == 312` on 64-bit; gated by `struct_size`, no API bump):
+`#ifdef XRT_PLUGIN_IFACE_HAS_RENDERING_MODES_FOR_MONITOR`; the runtime reads through
+`xrt_plugin_iface_has_rendering_modes_for_monitor()`. Reference implementation: sim_display.
+
 ### `get_platform_state` and the platform remedy (ADR-045, Amendment 1)
 
 ```c

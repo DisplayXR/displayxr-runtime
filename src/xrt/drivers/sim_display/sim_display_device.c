@@ -54,21 +54,25 @@
  *
  */
 
-//! The output the DP draws right now: PASSTHROUGH while mode 0 (2D) is active,
-//! the device's 3D kind while mode 1 is (ADR-065). Written by the device at
-//! creation and on every OUTPUT_MODE request; read by the DPs each frame.
+//! The output the DP draws right now: PASSTHROUGH while slot 0 (2D) is active,
+//! the slot-1 entry's kind while slot 1 is (ADR-065, ADR-066 C1). Written by
+//! the device at creation and on every OUTPUT_MODE request; read by the DPs
+//! each frame.
 //!
-//! The default 3D KIND (OUTPUT unset) is ANAGLYPH. It is the only kind that is
-//! position-preserving (per-pixel colour combine, no canvas rearrangement), so
-//! it composites correctly with display-zones and reads as real depth on a flat
-//! panel. The rearranging kinds (SBS / Squeezed / Quad) are deliberately
-//! opt-in — they are view-inspection tools, not a sane default. The DEVICE
-//! starts in 2D whatever the kind (START_3D=1 starts it in the kind).
+//! The default config (OUTPUT unset) is SAME AS 2D: slot 1 is one sharp,
+//! full-resolution view (project lead, 2026-11-23 - an anaglyph on an ordinary
+//! screen looks broken, so a 3D look is chosen on purpose). It is
+//! position-preserving, as anaglyph, interlaced and blend are, so it composes
+//! with display zones. The rearranging kinds (SBS / Squeezed / Quad) are
+//! view-inspection tools. The DEVICE starts in 2D whatever the config
+//! (START_3D=1 starts it in slot 1).
 static xrt_atomic_s32_t g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 static xrt_atomic_s32_t g_sim_display_view_count = 1;
-//! The device's 3D kind (ADR-065), published at creation for the DPs'
-//! sim_display_output_for_tiles(). Anaglyph until a device exists.
-static xrt_atomic_s32_t g_sim_display_kind = SIM_DISPLAY_OUTPUT_ANAGLYPH;
+//! The slot-1 entry's kind (ADR-066 C1), published for the DPs'
+//! sim_display_output_for_tiles(). Follows a live config switch (written on
+//! every CONFIGURED_3D_MODE answer and every OUTPUT_MODE request for slot 1).
+//! Same as 2D until a device exists.
+static xrt_atomic_s32_t g_sim_display_kind = SIM_DISPLAY_DEFAULT_KIND;
 //! The live device's hmd parts (ADR-065, F6), so every consumer resolves the
 //! output from the ACTIVE MODE - which any runtime writer may set directly,
 //! without an OUTPUT_MODE request - rather than from the last request. Set at
@@ -348,10 +352,22 @@ struct sim_display_hmd
 	//! scroll-wheel zoom support.
 	float zoom_scale;
 
-	//! The 3D kind mode 1 draws (ADR-065): chosen by OUTPUT at creation and
-	//! fixed for the device's life. Private driver state — the runtime only
-	//! ever sees mode 0 and mode 1.
+	//! The kind slot 1 draws (ADR-066 C1): the entry OUTPUT names. Follows a
+	//! live config switch. Private driver state - the runtime maps slot 1 to
+	//! the declared entry itself.
 	enum sim_display_output_mode kind;
+
+	//! The listed kinds, in the driver's own numbering (entry 0 = the 2D
+	//! entry), and the count (8; Quad is START_UP_ONLY unless OUTPUT=quad at start).
+	enum sim_display_output_mode entry_kinds[XRT_MAX_RENDERING_MODES];
+	uint32_t entry_count;
+
+	//! The last OUTPUT value WARNed about (unknown, or Quad not declared), so a
+	//! polled config WARNs once per value.
+	char warned_output[32];
+
+	//! Quad was declared at start-up (OUTPUT=quad), not just listed.
+	bool quad_declared;
 
 	enum u_logging_level log_level;
 };
@@ -560,14 +576,22 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
 			return XRT_SUCCESS;
 		}
 
-		// Two run-time modes (ADR-065): 0 = 2D, 1 = this device's 3D kind.
-		if (value < 0 || (uint32_t)value >= xdev->rendering_mode_count) {
+		// ADR-066 C1: the value is an entry of the DECLARED list, in this
+		// driver's numbering (the runtime's wrapper translates slot 1 to the
+		// entry the config maps it to). 0 = 2D.
+		struct sim_display_hmd *sd = sim_display_hmd(xdev);
+		if (value < 0 || (uint32_t)value >= sd->entry_count) {
 			return XRT_ERROR_NOT_IMPLEMENTED;
 		}
 
+		const struct sim_display_kind_desc d = sim_display_kind_desc_get(sd->entry_kinds[value]);
 		xdev->hmd->active_rendering_mode_index = (uint32_t)value;
-		sim_display_set_view_count(xdev->rendering_modes[value].view_count);
-		sim_display_set_output_mode(value == 0 ? SIM_DISPLAY_OUTPUT_PASSTHROUGH : sim_display_hmd(xdev)->kind);
+		if (value >= 1) {
+			sd->kind = sd->entry_kinds[value];
+			xrt_atomic_s32_exchange(&g_sim_display_kind, (int32_t)sd->kind);
+		}
+		sim_display_set_view_count(value == 0 ? 1u : d.view_count);
+		sim_display_set_output_mode(value == 0 ? SIM_DISPLAY_OUTPUT_PASSTHROUGH : sd->kind);
 		return XRT_SUCCESS;
 	}
 	if (property == XRT_DEVICE_PROPERTY_EXT_APP_MODE) {
@@ -582,10 +606,53 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
                               enum xrt_device_property_id property,
                               int32_t *out_value)
 {
+	struct sim_display_hmd *sd = sim_display_hmd(xdev);
 	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
-		// Two run-time modes (ADR-065): 2D while passthrough is drawn, else
-		// the device's one 3D kind.
-		*out_value = (sim_display_resolved_output() == SIM_DISPLAY_OUTPUT_PASSTHROUGH) ? 0 : 1;
+		// The entry in effect, in this driver's numbering: 0 in slot 0, the
+		// slot-1 entry in slot 1 (the wrapper translates it back).
+		const uint32_t slot1 = sim_display_entry_for_kind(sd->kind, sd->entry_count);
+		*out_value = (xdev->hmd->active_rendering_mode_index == 0 || slot1 == 0) ? 0 : (int32_t)slot1;
+		return XRT_SUCCESS;
+	}
+	if (property == XRT_DEVICE_PROPERTY_CONFIGURED_3D_MODE) {
+		// ADR-066 C1.5: the entry the OUTPUT config names NOW - re-read, not
+		// the value cached at creation, so `dp set sim-display OUTPUT <x>` (and
+		// the Dashboard) applies live. The runtime polls this and remaps slot 1.
+		char buf[32];
+		const char *v = sim_display_setting_reread("OUTPUT", buf, sizeof(buf)) ? buf : NULL;
+		enum sim_display_output_mode want = SIM_DISPLAY_DEFAULT_KIND;
+		const bool known = sim_display_kind_parse(v, &want);
+		uint32_t entry = known ? sim_display_entry_for_kind(want, sd->entry_count) : 0;
+		if (entry != 0 && want == SIM_DISPLAY_OUTPUT_QUAD && !sd->quad_declared) {
+			entry = 0; // listed START_UP_ONLY: not selectable on this run
+		}
+		const char *shown = v != NULL ? v : "";
+		if (entry == 0) {
+			if (strcmp(sd->warned_output, shown) != 0) {
+				snprintf(sd->warned_output, sizeof(sd->warned_output), "%s", shown);
+				if (!known) {
+					U_LOG_W("sim_display: unknown OUTPUT '%s' - slot 1 stays '%s'", shown,
+					        sim_display_kind_desc_get(sd->kind).mode_name);
+				} else {
+					U_LOG_W(
+					    "sim_display: OUTPUT=%s applies at the next start - Quad (4 views) is "
+					    "declared "
+					    "only when selected at start-up, so PRIMARY_MULTIVIEW_DXR sessions locate "
+					    "2 views "
+					    "otherwise (ADR-066 C1, interim rule); slot 1 stays '%s'",
+					    shown, sim_display_kind_desc_get(sd->kind).mode_name);
+				}
+			}
+			entry = sim_display_entry_for_kind(sd->kind, sd->entry_count);
+		} else {
+			sd->warned_output[0] = '\0';
+			sd->kind = want;
+			xrt_atomic_s32_exchange(&g_sim_display_kind, (int32_t)want);
+		}
+		if (entry == 0) {
+			return XRT_ERROR_NOT_IMPLEMENTED;
+		}
+		*out_value = (int32_t)entry;
 		return XRT_SUCCESS;
 	}
 	if (property == XRT_DEVICE_PROPERTY_SBS_MODE) {
@@ -611,32 +678,28 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 struct xrt_device *
 sim_display_hmd_create(void)
 {
-	// ADR-065: the 3D kind (OUTPUT) and the start-up mode (START_3D, FORCE_MODE),
-	// read once, here. The kind is fixed for the device's life; the output the
-	// DP draws starts as the start-up mode's (PASSTHROUGH for 2D).
-	enum sim_display_output_mode kind = SIM_DISPLAY_OUTPUT_ANAGLYPH;
+	// ADR-066 C1: the config (OUTPUT) names slot 1's entry; it is read here for
+	// the start-up selection and re-read live through CONFIGURED_3D_MODE. The
+	// start-up mode (START_3D, FORCE_MODE) is read once, here.
+	enum sim_display_output_mode kind = SIM_DISPLAY_DEFAULT_KIND;
 	struct sim_display_start start;
 	{
 		char mode_buf[32];
 		const char *mode_str = sim_display_setting("OUTPUT", mode_buf, sizeof(mode_buf)) ? mode_buf : NULL;
-		bool output_2d = false;
-		if (!sim_display_kind_parse(mode_str, &kind, &output_2d)) {
+		if (!sim_display_kind_parse(mode_str, &kind)) {
 			U_LOG_W(
-			    "sim_display: unknown SIM_DISPLAY_OUTPUT '%s' (want "
-			    "2d|anaglyph|sbs|squeezed|quad|blend|interlaced) — keeping the anaglyph "
-			    "default",
+			    "sim_display: unknown OUTPUT '%s' (want "
+			    "default|same_as_2d|anaglyph|sbs|squeezed|quad|blend|"
+			    "interlaced) - keeping the Same-as-2D default",
 			    mode_str);
 		}
 		const long force = debug_get_num_option_sim_display_force_mode();
-		start = sim_display_resolve_start(output_2d, sim_display_setting_on("START_3D"), force);
+		start = sim_display_resolve_start(sim_display_setting_on("START_3D"), force);
 		if (start.force_ignored) {
 			U_LOG_W(
-			    "sim_display: SIM_DISPLAY_FORCE_MODE=%ld ignored — it takes 0 (2D) or 1 (the 3D kind "
+			    "sim_display: SIM_DISPLAY_FORCE_MODE=%ld ignored — it takes 0 (2D) or 1 (the 3D slot "
 			    "OUTPUT names); -1 = off",
 			    force);
-		}
-		if (start.start_3d_moot) {
-			U_LOG_W("sim_display: START_3D ignored — OUTPUT=%s means start in 2D", mode_str);
 		}
 		sim_display_set_output_mode(start.active == 1 ? kind : SIM_DISPLAY_OUTPUT_PASSTHROUGH);
 	}
@@ -812,29 +875,32 @@ sim_display_hmd_create(void)
 	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Sim 3D Display");
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "sim_display_0");
 
-	// Rendering modes (ADR-065): exactly two at run time — 0 = 2D, 1 = the 3D
-	// kind OUTPUT names (sim_display_modes.h has the table of kinds).
-	hmd->base.rendering_mode_count = 2;
-	sim_display_fill_modes(kind, hmd->base.rendering_modes);
-
+	// Rendering modes (ADR-066 C1): the FULL declared list (sim_display_modes.h
+	// has the table). The runtime keeps all of it as the sizing envelope and
+	// shows apps two slots: 0 = 2D, 1 = the entry OUTPUT names.
+	//
 	// Per-mode tracking capability (#441): sim_display has no real eye
-	// tracker, so every mode stays untracked (mode_flags/reserved are
-	// zero from the calloc'd device). Under the dev-only
-	// SIM_DISPLAY_FAKE_TRACKING toggle the 3D modes claim HAS_TRACKING so
-	// the MANUAL path + tracking-state event are exercisable without
-	// hardware (matches the MANUAL_BIT the plug-in then advertises).
-	// Opt-in webcam tracking (#1855) makes them tracked for real (MANAGED).
-	if (sim_display_fake_tracking_enabled() || sim_display_webcam_tracking_enabled()) {
-		for (uint32_t m = 1; m < hmd->base.rendering_mode_count; m++) {
-			hmd->base.rendering_modes[m].mode_flags |= XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
-		}
-	}
+	// tracker, so every entry stays untracked unless a source is on: under the
+	// dev-only TRACKING toggle the 3D entries claim HAS_TRACKING so the MANUAL
+	// path + tracking-state event are exercisable without hardware (matches
+	// the MANUAL_BIT the plug-in then advertises); opt-in webcam tracking
+	// (#1855) makes them tracked for real (MANAGED). Per entry through
+	// sim_display_entry_tracked(), the seam the per-screen tracking setting
+	// will drive (ADR-066 Part B).
+	hmd->entry_count =
+	    sim_display_fill_declared(kind == SIM_DISPLAY_OUTPUT_QUAD,
+	                              sim_display_fake_tracking_enabled() || sim_display_webcam_tracking_enabled(),
+	                              hmd->base.rendering_modes, hmd->entry_kinds);
+	hmd->base.rendering_mode_count = hmd->entry_count;
+	hmd->quad_declared = kind == SIM_DISPLAY_OUTPUT_QUAD;
+	const uint32_t kind_entry = sim_display_entry_for_kind(kind, hmd->entry_count);
 
-	// view_count = max across the two modes (the kind's view count)
+	// view_count = max across the declared list (the envelope)
 	{
 		uint32_t max_views = 1;
 		for (uint32_t m = 0; m < hmd->base.rendering_mode_count; m++) {
-			if (hmd->base.rendering_modes[m].view_count > max_views)
+			if ((hmd->base.rendering_modes[m].mode_flags & XRT_RENDERING_MODE_FLAG_START_UP_ONLY) == 0 &&
+			    hmd->base.rendering_modes[m].view_count > max_views)
 				max_views = hmd->base.rendering_modes[m].view_count;
 		}
 		hmd->base.hmd->view_count = max_views;
@@ -847,14 +913,22 @@ sim_display_hmd_create(void)
 		U_LOG_W(
 		    "sim_display: SIM_DISPLAY_FORCE_MODE=%u — pinning active mode "
 		    "'%s' (view_count=%u); later mode requests are ignored",
-		    start.active, hmd->base.rendering_modes[start.active].mode_name,
-		    hmd->base.rendering_modes[start.active].view_count);
+		    start.active, hmd->base.rendering_modes[start.active == 1 ? kind_entry : 0].mode_name,
+		    hmd->base.rendering_modes[start.active == 1 ? kind_entry : 0].view_count);
 	}
-	hmd->base.hmd->active_rendering_mode_index = start.active;
+	// The driver's own numbering: slot 1 at start is the configured entry, so
+	// a 3D start marks that entry active (the runtime's selection translates it).
+	const uint32_t start_entry = start.active == 1 ? kind_entry : 0u;
+	hmd->base.hmd->active_rendering_mode_index = start_entry;
 	g_sim_live_hmd = hmd->base.hmd;
-	sim_display_set_view_count(hmd->base.rendering_modes[start.active].view_count);
-	U_LOG_W("sim_display: rendering modes 0 '2D' and 1 '%s' (%u views); starting in mode %u",
-	        hmd->base.rendering_modes[1].mode_name, hmd->base.rendering_modes[1].view_count, start.active);
+	sim_display_set_view_count(hmd->base.rendering_modes[start_entry].view_count);
+	U_LOG_W(
+	    "sim_display: %u declared rendering modes (ADR-066 C1); config OUTPUT -> slot 1 = '%s' (%u views)%s; "
+	    "starting in slot %u",
+	    hmd->entry_count, hmd->base.rendering_modes[kind_entry].mode_name,
+	    hmd->base.rendering_modes[kind_entry].view_count,
+	    hmd->quad_declared ? ", Quad declared (OUTPUT=quad at start-up)" : ", Quad listed start-up-only",
+	    start.active);
 
 	// Initialize per-view eye offsets based on max view_count.
 	// Stored on xrt_hmd_parts so the state tracker can read them generically

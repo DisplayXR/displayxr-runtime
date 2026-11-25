@@ -127,6 +127,52 @@ primary DP weave (the X11 gate of #1831 and the resample reasons of the Wayland
 gate of #1595). On `ds1-linux` both monitors are resampled under XWayland, which is
 why M2 could not be shown there without this.
 
+## Each segment in its own screen's entry; the view size follows the window (ADR-047 Amendment 10)
+
+A segment on another screen is drawn in **that screen's** rendering-mode entry for the app's slot,
+not the session's: its screen's table comes from the per-screen registry (`util/u_screen_modes.h`,
+the owning plug-in's `get_rendering_modes_for_monitor` list and that screen's own 3D-mode choice).
+`comp_segments_view_size_segment_grid` turns the entry into the grid the segment's crop is laid out
+in (one tile for a one-view entry or for one the atlas cannot fill, else the entry's own tiles,
+filled with the session's first views), and the segment DP is told which entry to draw through
+`set_output_entry` slot of its API's DP vtable (`xrt_display_processor_vk` / `_d3d11` / `_d3d12` /
+`_gl`) on change. The primary segment keeps the session's
+grid.
+
+The window's **effective table** — what its app enumerates — is held by the manager
+(`comp_segments_view_size`, header-only): the covered screens after a 0.5 s dwell, the majority
+after a 20 % dead band, then `u_screen_modes_effective`. It is recomputed from the manager's own
+segment table on every weave with a placed window, also when the split update does not run
+(zero-copy on the primary), and published in `xrt_segment_metrics::table`; the state tracker
+answers `xrEnumerateDisplayRenderingModesDXR` from it and queues
+`XrEventDataRenderingModeTableChangedDXR` on a change. vk_native then lays its atlas out from the
+same table (tiles and scale overlaid on the frame's mode), so the app, the compositor and each
+segment DP agree. Built for vk_native (Linux X11 + Wayland, and Windows, where the same code runs)
+and the Windows in-process D3D11 / D3D12 / GL compositors, which hold the same
+`comp_segments_view_size` in their segment managers (`comp_{d3d11,d3d12,gl}_segments_update_view_size`
+/ `_get_effective_table`), overlay it on the frame's mode with `comp_segments_view_size_overlay_mode`,
+crop each non-primary segment in its screen's entry (`comp_d3d11_segments_frame::screen_entries`, and
+the D3D12 / GL twins) and tell its DP through the per-API `set_output_entry` slot (D3D11 slot 36,
+D3D12 slot 27, GL slot 25, VK slot 20). Under the #918 weave-on-scanout split the D3D11 hub
+(`comp_hub_d3d11`, which segments for the D3D11, D3D12, GL and Vulkan sessions it serves) does the same,
+switched by its owner through `comp_hub_d3d11_set_view_size_policy` (off for a legacy app). Every
+manager logs the same change-only WARN (`comp_segments_view_size_log_change`, "view size: ...").
+The D3D11 service, the Metal compositor and the service weave engines are covered separately.
+
+**Out of process.** An IPC client is told its OWN table: the service computes it from where that
+client's window is and keeps it in the client's shared memory (`ipc_shared_memory.hmd.effective_table`,
+its generation written last, beside the head's table that ADR-066 C1 syncs there); the client's state
+tracker reads it at every locate and every `xrPollEvent`, so the enumerate and the table-changed
+event behave as in-process. Sources: the desktop-Linux and macOS (vk backend) weave engines follow a
+present-owner's bound window with the same manager (`comp_vk_native_segments_update_view_size`) and
+draw each other screen's entry for the session's confirmed 2D/3D slot; the D3D11 service follows a
+direct client's app window, a present-owner's bound window and a workspace tile's footprint over the
+presenter screens (ADR-052 D2). A session that weaves nothing — the DisplayXR Browser enumerates
+from its browser process and weaves from its GPU process — is told the table of the session weaving
+the same window (`util/u_weave_peer.h`). On desktop Linux a present-owner's locate of a window or an
+element wholly on a non-primary screen is framed from that screen's own eyes and geometry
+(`u_weave_locate_reframe`), never the session (3D panel) DP's tracked camera.
+
 ## The lens wish follows coverage (#2247)
 
 A screen's DP is asked for the session's 2D/3D mode while the window covers that

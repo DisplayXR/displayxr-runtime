@@ -1842,6 +1842,27 @@ bool
 comp_d3d11_service_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
 
 /*!
+ * ADR-047 Amendment 10 over IPC: the rendering-mode table client @p xc's app
+ * is told, as its last weave / locate computed it from where its window is
+ * (the direct pipeline's app window, the present-owner's bound window, the
+ * workspace tile's footprint), and the window it was framed against
+ * (@p out_key, the HWND as id). Called by the IPC main loop with
+ * global_state.lock held: takes only the client's leaf `seg_mutex`.
+ *
+ * @return true once a table was computed for it (authoritative for that
+ *         window, valid or not; the last one stands while the client is not
+ *         woven); false = never (a peer weaving the same window may answer,
+ *         else the head's table stands).
+ */
+struct u_weave_window_key;
+struct xrt_effective_mode_table;
+bool
+comp_d3d11_service_get_published_table(struct xrt_system_compositor *xsysc,
+                                       struct xrt_compositor *xc,
+                                       struct u_weave_window_key *out_key,
+                                       struct xrt_effective_mode_table *out_table);
+
+/*!
  * XR_DXR_weave v19 cheap split signal (ADR-047 Amendment 4, addendum): the
  * segment count of the table this present-owner's last accepted submit
  * published — what `weave_submit`'s reply carries so the client fetches the

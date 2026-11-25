@@ -65,10 +65,11 @@ void
 cli_status_build_headless(struct xrt_status_snapshot *out);
 
 /*!
- * The status snapshot as `status` gets it: from the running service over DIAG
- * when reachable (returns true), else built headless here (returns false).
+ * The status snapshot `status` would print: the running service's over DIAG,
+ * else the headless build. Returns 1 (service), 0 (headless) or -1 (the
+ * service is wedged: nothing built, cli_ipc_connect said why).
  */
-bool
+int
 cli_status_fetch(struct xrt_status_snapshot *out);
 
 /*!
@@ -79,9 +80,22 @@ cli_status_fetch(struct xrt_status_snapshot *out);
 bool
 cli_screen_key_lookup(const char *key, char *out_key, size_t key_cap, char *out_legacy, size_t legacy_cap);
 
-//! Ask a running service to re-probe the displays (DIAG), silently: 0 = done, 1 = refused, 2 = no service.
+//! What cli_poke_service_reprobe_quiet got.
+enum cli_poke_result
+{
+	CLI_POKE_DONE = 0,         //!< the service re-probed
+	CLI_POKE_REFUSED = 1,      //!< it refused the request (@p out_xret says why)
+	CLI_POKE_NO_SERVICE = 2,   //!< no service reachable
+	CLI_POKE_VERSION_SKEW = 3, //!< a service of another build refused this CLI (the git-tag gate)
+};
+
+//! Ask a running service to re-probe the displays (DIAG), silently: an enum cli_poke_result.
 int
 cli_poke_service_reprobe_quiet(int *out_xret);
+
+//! Say that a service of another build refused this CLI and who sees the stored write.
+void
+cli_poke_say_version_skew(bool live_setting);
 
 int
 cli_cmd_clients(int argc, const char **argv);

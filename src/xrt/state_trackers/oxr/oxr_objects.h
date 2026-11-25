@@ -1720,6 +1720,16 @@ oxr_event_push_XrEventDataReferenceSpaceChangePending(struct oxr_logger *log,
                                                       XrBool32 poseValid,
                                                       const XrPosef *poseInPreviousSpace);
 
+/*!
+ * ADR-066 C1 (XR_DXR_display_info v27): the rendering-mode table changed, the
+ * active index did not. Never the answer to a mode request.
+ */
+XrResult
+oxr_event_push_XrEventDataRenderingModeTableChanged(struct oxr_logger *log,
+                                                    struct oxr_session *sess,
+                                                    uint32_t activeModeIndex,
+                                                    uint64_t flags);
+
 XrResult
 oxr_event_push_XrEventDataRenderingModeChanged(struct oxr_logger *log,
                                                 struct oxr_session *sess,
@@ -3799,6 +3809,29 @@ struct oxr_session
 
 	//! Cached rendering mode index for detecting compositor-driven mode changes.
 	uint32_t last_rendering_mode_index;
+
+	//! ADR-066 C1: the head's slot-table generation this session last told
+	//! the app about (u_device_rendering_modes_generation). A change is a live
+	//! config switch: oxr_session_poll queues an equal-index
+	//! XrEventDataRenderingModeChangedDXR.
+	uint32_t rendering_mode_generation;
+	//! When this session was last sent XrEventDataRenderingModeTableChangedDXR
+	//! (monotonic ns; 0 = never): at most one per second, coalesced.
+	uint64_t rendering_mode_table_event_ns;
+
+	/*!
+	 * ADR-047 Amendment 10: the table this session's app is told — its
+	 * window's screen(s), from the compositor's segment table (each locate
+	 * refreshes it). Invalid = the head device's table (the window is on the
+	 * session screen, or nothing segments it). Answered by
+	 * xrEnumerateDisplayRenderingModesDXR; a change bumps
+	 * @ref eff_table_gen and oxr_session_poll sends
+	 * XrEventDataRenderingModeTableChangedDXR once @ref eff_table_gen_told
+	 * catches up (the same one-per-second rule).
+	 */
+	struct xrt_effective_mode_table eff_table;
+	uint32_t eff_table_gen;
+	uint32_t eff_table_gen_told;
 
 	//! (#1041's end->begin restore memory moved to oxr_system — see
 	//! oxr_system::ended_rendering_mode_index.)

@@ -181,6 +181,10 @@ TEST_CASE("PRIMARY_MULTIVIEW_DXR reports one view set per possible segment", "[o
 	CHECK(oxr_segment_views_multiview_count(4, 2) == 8); // sim_display quad
 	// Capped at XRT_MAX_VIEWS: a device that already fills it gets no second set.
 	CHECK(oxr_segment_views_multiview_count(XRT_MAX_VIEWS, 2) == XRT_MAX_VIEWS);
+	// ADR-066 C1.5: full view sets only - never a partial second set.
+	CHECK(oxr_segment_views_multiview_count(5, 2) == 5);
+	CHECK(oxr_segment_views_multiview_count(3, 2) == 6);
+	CHECK(oxr_segment_views_multiview_count(XRT_MAX_VIEWS + 4, 2) == XRT_MAX_VIEWS);
 }
 
 TEST_CASE("the #1499 mode floor asks one segment's share", "[oxr][segment_views]")

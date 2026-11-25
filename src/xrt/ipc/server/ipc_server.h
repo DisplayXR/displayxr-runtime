@@ -568,6 +568,9 @@ struct ipc_server
 	//! Workspace mode: multi-compositor with shared window for all clients.
 	bool workspace_mode;
 
+	//! ADR-066 C1: the head's slot-table generation last copied into the clients' shm (main loop).
+	uint32_t rendering_mode_generation_synced;
+
 	//! PID of the IPC client that activated workspace mode. Captured at
 	//! ipc_handle_workspace_activate; checked in common_shutdown so that
 	//! abrupt controller-process death (e.g. orchestrator killing the
@@ -791,6 +794,19 @@ ipc_server_set_workspace_pid_provider(ipc_server_workspace_pid_provider_fn fn);
  */
 unsigned long
 ipc_server_get_orchestrator_workspace_pid(void);
+
+/*!
+ * ADR-047 Amendment 10 over IPC: the rendering-mode table client @p ics's app
+ * is told - computed from where its window is (its own weave engine's /
+ * per-client segment manager's table, else that of a session weaving the same
+ * window). Invalid = the head's table. Called by the main loop with
+ * global_state.lock held: leaf compositor locks only.
+ */
+struct xrt_effective_mode_table;
+void
+ipc_server_client_effective_table(struct ipc_server *s,
+                                  volatile struct ipc_client_state *ics,
+                                  struct xrt_effective_mode_table *out);
 
 /*!
  * #960: class-verification provider. The IPC server verifies a client's declared

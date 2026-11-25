@@ -296,6 +296,23 @@ struct ipc_shared_memory
 		uint32_t rendering_mode_count;
 		struct xrt_rendering_mode rendering_modes[XRT_MAX_RENDERING_MODES];
 		uint32_t active_rendering_mode_index;
+		//! ADR-066 C1: how many entries of @ref rendering_modes are the head's
+		//! envelope (its full declared list; >= rendering_mode_count).
+		uint32_t rendering_mode_envelope_count;
+		//! ADR-066 C1: the head's slot-table generation. Bumped (last, after the
+		//! table) when a config switch remaps slot 1; the client re-copies the
+		//! table when it moves (ipc_client_hmd's sync hook).
+		volatile uint32_t rendering_mode_generation;
+		/*!
+		 * ADR-047 Amendment 10: the rendering-mode table THIS client's app
+		 * is told — its window's screen(s), computed by the service from
+		 * where the client's window (or the present-owner window it shares)
+		 * is. Invalid = the head's table above stands. Written by the main
+		 * loop, @ref effective_table_generation LAST; the client re-reads
+		 * when the generation moves (comp_ipc_client_compositor_get_effective_table).
+		 */
+		struct xrt_effective_mode_table effective_table;
+		volatile uint32_t effective_table_generation;
 	} hmd;
 
 	struct xrt_input inputs[IPC_SHARED_MAX_INPUTS];

@@ -16,6 +16,7 @@
 
 #include "math/m_api.h"
 
+#include "util/u_rendering_modes.h"
 #include "util/u_var.h"
 #include "util/u_misc.h"
 #include "util/u_debug.h"
@@ -270,10 +271,63 @@ err_mask_unlock:
 	return XRT_ERROR_IPC_FAILURE;
 }
 
+/*!
+ * ADR-066 C1: copy the head's slot table out of shared memory - the two
+ * presented slots plus the envelope behind them - and publish the envelope
+ * count and generation to u_rendering_modes. Returns the generation copied.
+ * The server writes the generation last; a copy that straddles a rewrite is
+ * caught by the re-read and retried at the next poll.
+ */
+static uint32_t
+ipc_client_hmd_copy_rendering_modes(ipc_client_hmd_t *ich)
+{
+	struct ipc_shared_memory *ism = ich->ipc_c->ism;
+	const uint32_t gen = ism->hmd.rendering_mode_generation;
+	uint32_t env = ism->hmd.rendering_mode_envelope_count;
+	uint32_t count = ism->hmd.rendering_mode_count;
+	if (count > XRT_MAX_RENDERING_MODES) {
+		count = XRT_MAX_RENDERING_MODES;
+	}
+	if (env < count || env > XRT_MAX_RENDERING_MODES) {
+		env = count;
+	}
+	for (uint32_t i = 0; i < env; i++) {
+		ich->base.rendering_modes[i] = ism->hmd.rendering_modes[i];
+	}
+	ich->base.rendering_mode_count = count;
+	u_device_rendering_modes_publish(&ich->base, env, gen);
+	return gen;
+}
+
+//! The u_rendering_modes sync hook: re-copy when the service's generation moved.
+static uint32_t
+ipc_client_hmd_sync_rendering_modes(struct xrt_device *xdev)
+{
+	ipc_client_hmd_t *ich = ipc_client_hmd(xdev);
+	const uint32_t have = u_device_rendering_modes_generation(xdev);
+	const uint32_t gen = ich->ipc_c->ism->hmd.rendering_mode_generation;
+	if (gen == have) {
+		return have;
+	}
+	const uint32_t copied = ipc_client_hmd_copy_rendering_modes(ich);
+	if (ich->ipc_c->ism->hmd.rendering_mode_generation != copied) {
+		// The server rewrote it under us: report the old generation so the
+		// next poll copies again.
+		u_device_rendering_modes_publish(xdev, u_device_rendering_modes_envelope_count(xdev), have);
+		return have;
+	}
+	U_LOG_W(
+	    "IPC client: the head's rendering-mode table changed (generation %u -> %u, slot 1 now '%s') - ADR-066 C1",
+	    have, copied, ich->base.rendering_mode_count > 1 ? ich->base.rendering_modes[1].mode_name : "-");
+	return copied;
+}
+
 static void
 ipc_client_hmd_destroy(struct xrt_device *xdev)
 {
 	ipc_client_hmd_t *ich = ipc_client_hmd(xdev);
+
+	u_device_rendering_modes_forget(xdev);
 
 	// Remove the variable tracking.
 	u_var_remove_root(ich);
@@ -358,11 +412,11 @@ ipc_client_hmd_create(struct ipc_connection *ipc_c, struct xrt_tracking_origin *
 		ich->base.hmd->views[i].display.h_pixels = ipc_c->ism->hmd.views[i].display.h_pixels;
 	}
 
-	// Setup rendering modes (for workspace mode 2D/3D switching via V key).
-	ich->base.rendering_mode_count = ism->hmd.rendering_mode_count;
-	for (uint32_t i = 0; i < ism->hmd.rendering_mode_count && i < XRT_MAX_RENDERING_MODES; i++) {
-		ich->base.rendering_modes[i] = ism->hmd.rendering_modes[i];
-	}
+	// Setup rendering modes (for workspace mode 2D/3D switching via V key):
+	// the two slots plus the envelope behind them (ADR-066 C1), kept current
+	// by the sync hook the state tracker polls.
+	(void)ipc_client_hmd_copy_rendering_modes(ich);
+	u_device_rendering_modes_set_sync_hook(&ich->base, ipc_client_hmd_sync_rendering_modes);
 	ich->base.hmd->active_rendering_mode_index = ism->hmd.active_rendering_mode_index;
 
 	// Distortion information, fills in xdev->compute_distortion().
