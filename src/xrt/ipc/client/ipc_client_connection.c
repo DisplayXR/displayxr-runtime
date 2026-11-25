@@ -69,9 +69,43 @@ static char g_skew_service_git_tag[IPC_VERSION_NAME_LEN];
 
 DEBUG_GET_ONCE_BOOL_OPTION(ipc_ignore_version, "IPC_IGNORE_VERSION", false)
 
-#ifdef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_WINDOWS)
+#define IPC_HANDSHAKE_BOUNDED 1
 #include "os/os_time.h"
 #include "util/u_time.h"
+
+static volatile bool g_handshake_timed_out = false;
+#endif
+
+#ifdef XRT_OS_WINDOWS
+/*
+ * browser#205: Windows bounds the handshake of EVERY client by default. Linux
+ * leaves app clients unbounded because systemd's watchdog restarts a wedged
+ * service (#2515); Windows has no such supervisor, so a service that accepted
+ * the pipe and then never answered blocked xrCreateInstance in ReadFile
+ * forever. The value matches the Linux CLI's bound. Set through
+ * ipc_client_connection_set_handshake_timeout_ms (the CLI), else
+ * DXR_IPC_HANDSHAKE_TIMEOUT_MS; 0 = block forever (the pre-#205 behaviour).
+ */
+#define IPC_HANDSHAKE_TIMEOUT_DEFAULT_MS 5000
+#define IPC_HANDSHAKE_TIMEOUT_UNSET UINT32_MAX
+DEBUG_GET_ONCE_NUM_OPTION(ipc_handshake_timeout_ms, "DXR_IPC_HANDSHAKE_TIMEOUT_MS", IPC_HANDSHAKE_TIMEOUT_DEFAULT_MS)
+static volatile uint32_t g_handshake_timeout_ms = IPC_HANDSHAKE_TIMEOUT_UNSET;
+
+static uint32_t
+ipc_client_handshake_timeout_ms(void)
+{
+	const uint32_t set_ms = g_handshake_timeout_ms;
+	if (set_ms != IPC_HANDSHAKE_TIMEOUT_UNSET) {
+		return set_ms;
+	}
+	// A Windows long is 32-bit, so a positive value always fits below UNSET.
+	const long env_ms = debug_get_num_option_ipc_handshake_timeout_ms();
+	return env_ms > 0 ? (uint32_t)env_ms : 0;
+}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
 #include <sys/time.h> // struct timeval (SO_RCVTIMEO / SO_SNDTIMEO)
 
 /*
@@ -79,7 +113,12 @@ DEBUG_GET_ONCE_BOOL_OPTION(ipc_ignore_version, "IPC_IGNORE_VERSION", false)
  * handshake_timeout_ms). 0 = block forever, the default for every client.
  */
 static volatile uint32_t g_handshake_timeout_ms = 0;
-static volatile bool g_handshake_timed_out = false;
+
+static uint32_t
+ipc_client_handshake_timeout_ms(void)
+{
+	return g_handshake_timeout_ms;
+}
 
 //! Apply (ms > 0) or clear (ms == 0) the per-call send/receive timeouts on @p fd.
 static void
@@ -1217,7 +1256,10 @@ ipc_client_connection_disable_service_launch(void)
 void
 ipc_client_connection_set_handshake_timeout_ms(uint32_t timeout_ms)
 {
-#ifdef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_WINDOWS)
+	// UINT32_MAX is the "never set" sentinel; clamp so a setter never resets.
+	g_handshake_timeout_ms = timeout_ms == IPC_HANDSHAKE_TIMEOUT_UNSET ? timeout_ms - 1 : timeout_ms;
+#elif defined(XRT_OS_LINUX_DESKTOP)
 	g_handshake_timeout_ms = timeout_ms;
 #else
 	(void)timeout_ms;
@@ -1227,7 +1269,7 @@ ipc_client_connection_set_handshake_timeout_ms(uint32_t timeout_ms)
 bool
 ipc_client_connection_handshake_timed_out(void)
 {
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef IPC_HANDSHAKE_BOUNDED
 	return g_handshake_timed_out;
 #else
 	return false;
@@ -1254,8 +1296,8 @@ ipc_client_connection_init(struct ipc_connection *ipc_c,
 	ipc_c->imc.log_level = log_level;
 	ipc_c->ism_handle = XRT_SHMEM_HANDLE_INVALID;
 
-#ifdef XRT_OS_LINUX_DESKTOP
-	const uint32_t hs_timeout_ms = g_handshake_timeout_ms;
+#ifdef IPC_HANDSHAKE_BOUNDED
+	const uint32_t hs_timeout_ms = ipc_client_handshake_timeout_ms();
 	const uint64_t hs_start_ns = os_monotonic_get_ns();
 	g_handshake_timed_out = false;
 #endif
@@ -1291,6 +1333,14 @@ ipc_client_connection_init(struct ipc_connection *ipc_c,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
+#ifdef XRT_OS_WINDOWS
+	// browser#205: bound every handshake read (the pipe-open and service-launch
+	// waits above have deadlines of their own). Writes need no bound: the
+	// service's pipe buffer (IPC_BUF_SIZE) holds each small request whether or
+	// not anyone reads it, and the next write only follows a reply.
+	ipc_c->imc.read_timeout_ms = hs_timeout_ms;
+#endif
+
 	// browser#103 RC-1: MUST precede ipc_client_setup_shm — that is the call
 	// that transfers the first handle, and a declaration afterwards is too late
 	// (the server refuses it). Only an adopted connection sends anything here,
@@ -1317,12 +1367,15 @@ ipc_client_connection_init(struct ipc_connection *ipc_c,
 		goto err_fini; // Already logged.
 	}
 
+	// #2515 / browser#205: the bound covers the handshake only; later calls (a
+	// consent prompt, a long-poll) may legitimately wait longer.
 #ifdef XRT_OS_LINUX_DESKTOP
-	// #2515: the bound covers the handshake only; later calls (a consent
-	// prompt, a long-poll) may legitimately wait longer.
 	if (hs_timeout_ms > 0) {
 		ipc_client_set_socket_timeouts(ipc_c->imc.ipc_handle, 0);
 	}
+#endif
+#ifdef XRT_OS_WINDOWS
+	ipc_c->imc.read_timeout_ms = 0;
 #endif
 
 	return XRT_SUCCESS;
@@ -1334,6 +1387,25 @@ err_fini:
 	if (hs_timeout_ms > 0 &&
 	    os_monotonic_get_ns() - hs_start_ns >= (uint64_t)hs_timeout_ms * U_TIME_1MS_IN_NS * 9u / 10u) {
 		g_handshake_timed_out = true;
+	}
+#endif
+#ifdef XRT_OS_WINDOWS
+	// Exact on Windows: the channel says whether a read gave up on the bound.
+	if (ipc_c->imc.read_timed_out) {
+		g_handshake_timed_out = true;
+	}
+#endif
+#ifdef IPC_HANDSHAKE_BOUNDED
+	if (g_handshake_timed_out) {
+		// At the connection's level: the service link's quiet retries stay quiet.
+		IPC_WARN(
+		    ipc_c,
+		    "displayxr-service accepted the connection but did not answer the IPC handshake within %u ms "
+		    "(%llu ms elapsed) - it is wedged; failing instead of waiting forever (browser#205, #2515). "
+		    "Restart displayxr-service. DXR_IPC_HANDSHAKE_TIMEOUT_MS changes the bound on Windows; 0 waits "
+		    "forever.",
+		    (unsigned)hs_timeout_ms,
+		    (unsigned long long)((os_monotonic_get_ns() - hs_start_ns) / U_TIME_1MS_IN_NS));
 	}
 #endif
 	ipc_client_connection_fini(ipc_c);
