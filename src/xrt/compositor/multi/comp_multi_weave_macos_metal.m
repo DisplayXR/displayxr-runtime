@@ -1109,11 +1109,13 @@ static bool
 mtlb_segs_update(struct multi_compositor *mc, struct weave_metal *wm, const struct comp_multi_weave_macos_params *p)
 {
 	if (!comp_multi_weave_macos_segs_eligible(mc, p) || !mtlb_segs_sync(mc, wm)) {
+		comp_multi_weave_macos_publish(mc, mc->weave.have_geometry, NULL);
 		return false;
 	}
 	struct comp_weave_window_cg win;
 	comp_multi_weave_macos_segs_window(mc, &win);
 	if (!(win.scale > 0.0f)) {
+		comp_multi_weave_macos_publish(mc, true, NULL);
 		return false;
 	}
 	const struct comp_metal_seg_window sw = {
@@ -1123,6 +1125,19 @@ mtlb_segs_update(struct multi_compositor *mc, struct weave_metal *wm, const stru
 	    .px_per_pt = (double)win.scale,
 	};
 	const bool split = comp_metal_segments_update(mtlb_segs(mc), &sw, 0);
+	// ADR-047 Amendment 10: the view size follows the window's screen (the
+	// Vulkan backend's and the desktop-Linux engine's rule): no view cap, the
+	// instance's worst case clamps. From the update's table, in backing px at
+	// the window's scale (the drawable is the output, out_w x out_h).
+	{
+		const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+		(void)comp_metal_segments_update_view_size(mtlb_segs(mc), mc->weave.head_modes,
+		                                           mc->weave.head_mode_count, 0, info->atlas_width_pixels,
+		                                           info->atlas_height_pixels);
+		struct xrt_effective_mode_table eff;
+		(void)comp_metal_segments_get_effective_table(mtlb_segs(mc), &eff);
+		comp_multi_weave_macos_publish(mc, true, &eff);
+	}
 	// Every per-screen DP follows this session's confirmed 2D/3D state.
 	comp_metal_segments_set_display_mode(mtlb_segs(mc), !mc->weave.hw_2d_confirmed);
 	comp_multi_weave_macos_segs_log(mc, comp_metal_segments_get_table(mtlb_segs(mc)), split);
@@ -1272,6 +1287,8 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 			    .transparent_background = false, // every pixel is woven or flat-filled
 			    .primary_dp = dp,
 			    .primary_present_origin = true,
+			    // ADR-047 Amendment 10: each other screen's segment in its own entry.
+			    .active_slot = mc->weave.hw_2d_confirmed ? 0u : 1u,
 			};
 			(void)comp_metal_segments_record(mtlb_segs(mc), &sf);
 		}

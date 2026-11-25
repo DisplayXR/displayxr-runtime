@@ -169,7 +169,9 @@ its generation written last, beside the head's table that ADR-066 C1 syncs there
 tracker reads it at every locate and every `xrPollEvent`, so the enumerate and the table-changed
 event behave as in-process. Sources: the desktop-Linux and macOS (vk backend) weave engines follow a
 present-owner's bound window with the same manager (`comp_vk_native_segments_update_view_size`) and
-draw each other screen's entry for the session's confirmed 2D/3D slot; the D3D11 service follows a
+draw each other screen's entry for the session's confirmed 2D/3D slot; the macOS **metal** backend
+does the same with the Metal manager (`comp_metal_segments_update_view_size`, the window in backing
+px at its own scale, the output as the drawable); the D3D11 service follows a
 direct client's app window, a present-owner's bound window and a workspace tile's footprint over the
 presenter screens (ADR-052 D2). A session that weaves nothing — the DisplayXR Browser enumerates
 from its browser process and weaves from its GPU process — is told the table of the session weaving
