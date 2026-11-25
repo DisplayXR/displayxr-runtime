@@ -79,6 +79,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdint.h>
 
 // Minimal local declarations so this file needs no X11 headers at build time —
@@ -148,21 +149,38 @@ struct x11_fns
 	                            unsigned char **);
 };
 
+/*!
+ * Every Xlib sequence in this file runs under this lock (taken by
+ * x11_fns_load, released by x11_fns_unload). Xlib without XInitThreads() -
+ * which only a process's first Xlib call may make, and this code runs inside
+ * host processes - keeps process-global state unlocked: XOpenDisplay
+ * initialises the resource-manager quark table, the extension list and the
+ * error-handler chain. Two of our threads opening their private connections at
+ * once (the display-hotplug sweep and a session's registry build, both
+ * enumerating monitors) corrupted the heap in exactly that state. The private
+ * connection keeps us off the host's Display; this lock keeps our own threads
+ * off each other.
+ */
+static pthread_mutex_t g_x11_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static bool
 x11_fns_load(struct x11_fns *f)
 {
 	memset(f, 0, sizeof(*f));
+	pthread_mutex_lock(&g_x11_lock);
 
 	// Versioned sonames: the unversioned .so lives in the -dev package, which a
 	// runtime box has no reason to have installed.
 	f->lib_x11 = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
 	if (f->lib_x11 == NULL) {
+		pthread_mutex_unlock(&g_x11_lock);
 		return false;
 	}
 	f->lib_xrandr = dlopen("libXrandr.so.2", RTLD_LAZY | RTLD_LOCAL);
 	if (f->lib_xrandr == NULL) {
 		dlclose(f->lib_x11);
 		f->lib_x11 = NULL;
+		pthread_mutex_unlock(&g_x11_lock);
 		return false;
 	}
 
@@ -197,6 +215,7 @@ fail:
 	dlclose(f->lib_xrandr);
 	dlclose(f->lib_x11);
 	memset(f, 0, sizeof(*f));
+	pthread_mutex_unlock(&g_x11_lock);
 	return false;
 }
 
@@ -206,10 +225,14 @@ x11_fns_unload(struct x11_fns *f)
 	if (f->lib_xrandr != NULL) {
 		dlclose(f->lib_xrandr);
 	}
+	const bool loaded = f->lib_x11 != NULL;
 	if (f->lib_x11 != NULL) {
 		dlclose(f->lib_x11);
 	}
 	memset(f, 0, sizeof(*f));
+	if (loaded) {
+		pthread_mutex_unlock(&g_x11_lock); // taken by the x11_fns_load that succeeded
+	}
 }
 
 /*!
