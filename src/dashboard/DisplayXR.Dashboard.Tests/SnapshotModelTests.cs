@@ -207,43 +207,19 @@ public class SnapshotModelTests
     }
 
     [Fact]
-    public void ViewerTracking_IsRead_AndDrivesTheSelector() {
+    public void ViewerTracking_IsRead_AndDrivesTheSelector()
+    {
         var s = TestData.Parse("""
-        {
-      "schema" : 1, "screens"
-          : [ {
-            "id" : "0x1",
-            "key" : "SDC-423F-0000003F",
-            "viewer_tracking" : {
-              "setting" : "3d",
-              "setting_source" : "user",
-              "effective" : "3d",
-              "tracked" : { "2d" : false, "3d" : true },
-              "current_mode" : "3d",
-              "active" : true,
-              "provider" : "sim-tracking",
-              "available" : true,
-              "reason" : null,
-              "detail" : "webcam 'Integrated Camera'"
-            }
-          },
-              {
-                "id" : "0x2",
-                "key" : "ACR-0001-240EF0B9",
-                "viewer_tracking" : {
-                  "setting" : "default",
-                  "setting_source" : "default",
-                  "effective" : "off",
-                  "tracked" : { "2d" : false, "3d" : false },
-                  "current_mode" : null,
-                  "active" : null,
-                  "provider" : null,
-                  "available" : false,
-                  "reason" : "this display tracks the viewer itself",
-                  "detail" : null
-                }
-              },
-              { "id" : "0x3" }] }
+        { "schema": 1, "screens": [
+          { "id": "0x1", "key": "SDC-423F-0000003F",
+            "viewer_tracking": { "setting": "3d", "setting_source": "user", "effective": "3d",
+              "tracked": { "2d": false, "3d": true }, "current_mode": "3d", "active": true,
+              "provider": "sim-tracking", "available": true, "reason": null, "detail": "webcam 'Integrated Camera'" } },
+          { "id": "0x2", "key": "ACR-0001-240EF0B9",
+            "viewer_tracking": { "setting": "default", "setting_source": "default", "effective": "off",
+              "tracked": { "2d": false, "3d": false }, "current_mode": null, "active": null,
+              "provider": null, "available": false, "reason": "this display tracks the viewer itself", "detail": null } },
+          { "id": "0x3" } ] }
         """);
         var a = s.Screens[0].ViewerTracking!;
         Assert.Equal(("3d", "user", "3d"), (a.Setting, a.SettingSource, a.Effective));
