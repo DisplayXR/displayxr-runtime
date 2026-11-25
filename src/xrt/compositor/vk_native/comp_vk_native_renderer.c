@@ -30,6 +30,7 @@
 #include "comp_vk_native_compositor.h"
 #include "comp_vk_native_swapchain.h"
 #include "comp_vk_native_deposit.h"
+#include "comp_vk_native_lost_latch.h"
 #include "comp_vk_native_equirect2.h"
 
 #include "util/comp_layer_accum.h"
@@ -203,6 +204,9 @@ struct comp_vk_native_renderer
 {
 	//! Vulkan bundle (borrowed).
 	struct vk_bundle *vk;
+
+	//! Compose submits that keep failing mean the device is lost; see the header.
+	struct comp_vk_lost_latch submit_lost;
 
 	//! Command pool for recording blit commands.
 	VkCommandPool cmd_pool;
@@ -2375,7 +2379,7 @@ comp_vk_native_renderer_wait_image_read(struct comp_vk_native_renderer *r, struc
  * app thread sees the tags and the pending fence together.
  */
 static VkResult
-renderer_submit_draw_and_wait(struct comp_vk_native_renderer *r, VkSubmitInfo *submit_info, const char *label)
+renderer_submit_draw_and_wait_inner(struct comp_vk_native_renderer *r, VkSubmitInfo *submit_info, const char *label)
 {
 	struct vk_bundle *vk = r->vk;
 	VkResult res;
@@ -2429,6 +2433,33 @@ renderer_submit_draw_and_wait(struct comp_vk_native_renderer *r, VkSubmitInfo *s
 		U_LOG_E("VK compose: waiting the %s fence failed: %d", label, wres);
 	}
 	return VK_SUCCESS;
+}
+
+/*!
+ * renderer_submit_draw_and_wait_inner() plus the device-lost latch. Logs a
+ * failed submit here, once per run of failures and once more when the latch
+ * trips, so the callers do not log one error per frame on a dead device.
+ */
+static VkResult
+renderer_submit_draw_and_wait(struct comp_vk_native_renderer *r, VkSubmitInfo *submit_info, const char *label)
+{
+	const VkResult res = renderer_submit_draw_and_wait_inner(r, submit_info, label);
+	if (comp_vk_lost_latch_note(&r->submit_lost, res)) {
+		if (r->submit_lost.lost) {
+			U_LOG_E("VK compose: %s submit failed: %d (%u in a row) - treating the Vulkan device as lost",
+			        label, res, r->submit_lost.consecutive_failures);
+		} else {
+			U_LOG_E("VK compose: %s submit failed: %d (further failures in this run are not logged)",
+			        label, res);
+		}
+	}
+	return res;
+}
+
+bool
+comp_vk_native_renderer_is_device_lost(struct comp_vk_native_renderer *renderer)
+{
+	return renderer != NULL && renderer->submit_lost.lost;
 }
 
 /*!
@@ -3664,7 +3695,6 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	// #1905 retry on Android; waits THIS submit's fence, not the queue (#1917).
 	res = renderer_submit_draw_and_wait(r, &submit_info, "renderer_draw_zones");
 	if (res != VK_SUCCESS) {
-		U_LOG_E("VK zones: failed to submit draw commands: %d", res);
 		// The claimed value will never be signalled — give it back, or a
 		// consumer waiting on it waits forever.
 		comp_vk_deposit_abandon_signal(r->deposit);
@@ -4045,7 +4075,6 @@ draw_raw_view_pass(struct comp_vk_native_renderer *r,
 	// #1905 retry on Android; waits THIS submit's fence, not the queue (#1917).
 	res = renderer_submit_draw_and_wait(r, &submit_info, "renderer_draw_raw_view");
 	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to submit renderer commands: %d", res);
 		comp_vk_deposit_abandon_signal(r->deposit);
 		*out_result = XRT_ERROR_VULKAN;
 		return true;
@@ -4472,7 +4501,6 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	// fence, not the queue (#1917).
 	res = renderer_submit_draw_and_wait(r, &submit_info, "renderer_draw");
 	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to submit renderer commands: %d", res);
 		// The claimed value will never be signalled — give it back, or a
 		// consumer waiting on it waits forever.
 		comp_vk_deposit_abandon_signal(r->deposit);

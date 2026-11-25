@@ -10,6 +10,7 @@
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_compositor.h"
 #include "comp_vk_native_swapchain.h"
+#include "comp_vk_native_lost_latch.h"
 
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_vulkan_includes.h"
@@ -544,6 +545,9 @@ struct comp_vk_native_target
 {
 	//! Vulkan bundle (borrowed).
 	struct vk_bundle *vk;
+
+	//! Readback submits that keep failing mean the device is lost; see the header.
+	struct comp_vk_lost_latch rb_submit_lost;
 
 	//! Win32 surface.
 	VkSurfaceKHR surface;
@@ -2604,8 +2608,18 @@ dcomp_present_readback(struct comp_vk_native_target *target, VkQueue queue, VkSe
 	vk->vkResetFences(vk->device, 1, &target->rb_fence[s]);
 	const uint64_t submit_ns = os_monotonic_get_ns();
 	VkResult res = vk->vkQueueSubmit(queue, 1, &si, target->rb_fence[s]);
+	if (comp_vk_lost_latch_note(&target->rb_submit_lost, res)) {
+		if (target->rb_submit_lost.lost) {
+			U_LOG_E("DComp bridge #2708: readback submit failed: %d (%u in a row) - treating the Vulkan "
+			        "device as lost",
+			        res, target->rb_submit_lost.consecutive_failures);
+		} else {
+			U_LOG_E("DComp bridge #2708: readback submit failed: %d (further failures in this run are "
+			        "not logged)",
+			        res);
+		}
+	}
 	if (res != VK_SUCCESS) {
-		U_LOG_E("DComp bridge #2708: readback submit failed: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
 	target->rb_w[s] = width;
@@ -5994,6 +6008,12 @@ bool
 comp_vk_native_target_images_sampled(struct comp_vk_native_target *target)
 {
 	return target != NULL && target->images_sampled;
+}
+
+bool
+comp_vk_native_target_is_device_lost(struct comp_vk_native_target *target)
+{
+	return target != NULL && target->rb_submit_lost.lost;
 }
 
 bool

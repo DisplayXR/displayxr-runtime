@@ -356,6 +356,17 @@ bool
 comp_vk_native_target_images_sampled(struct comp_vk_native_target *target);
 
 /*!
+ * True once the target's readback submits (Windows DComp bridge, CPU-readback
+ * route) have failed often enough in a row that the Vulkan device is treated
+ * as lost (comp_vk_native_lost_latch.h). Never goes back to false; always
+ * false where that route does not exist. Safe to read from any thread.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_target_is_device_lost(struct comp_vk_native_target *target);
+
+/*!
  * #2708 — true when the present carries per-pixel alpha to the window
  * system: a transparent compositeAlpha was granted, or the Windows DComp
  * bridge (either route) presents through its PREMULTIPLIED swapchain. False

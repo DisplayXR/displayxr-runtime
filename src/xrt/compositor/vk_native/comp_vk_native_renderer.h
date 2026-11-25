@@ -251,6 +251,16 @@ int32_t
 comp_vk_native_renderer_get_format(struct comp_vk_native_renderer *renderer);
 
 /*!
+ * True once the renderer's compose submits have failed often enough in a row
+ * that the Vulkan device is treated as lost (comp_vk_native_lost_latch.h).
+ * Never goes back to false. Safe to read from any thread.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_renderer_is_device_lost(struct comp_vk_native_renderer *renderer);
+
+/*!
  * The private linear-blend compose target (#1610), for a pass that must blend
  * in linear light after the projection pass has published the atlas (#1795:
  * window-space layers).

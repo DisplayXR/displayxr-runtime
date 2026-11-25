@@ -53,6 +53,7 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		comp_vk_native_deposit.cpp
 		comp_vk_native_deposit.h
 		comp_vk_native_equirect2.h
+		comp_vk_native_lost_latch.h
 		comp_vk_native_renderer.c
 		comp_vk_native_renderer.h
 		comp_vk_native_swapchain.c
