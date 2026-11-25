@@ -135,6 +135,21 @@ public sealed record ScreenLayout(double WidthM, double HeightM, NominalViewer V
 public sealed record EyeTracking(IReadOnlyList<string> Supported, string? Default, string State,
                                  string? ViewerSource = null, string? ViewerReason = null, string? ViewerPolicy = null);
 
+/// <summary>
+/// ADR-066 Part B: a screen's per-screen viewer-tracking setting
+/// (<c>screens[i].viewer_tracking</c>). <see cref="Setting"/> is what is stored
+/// ("off" / "3d" / "always" / "default"), <see cref="Effective"/> what it
+/// resolved to, <see cref="Available"/> whether it is offered here (else <see
+/// cref="Reason"/> says why); <see cref="Detail"/> what the provider tracks
+/// from when it is.
+/// </summary>
+public sealed record ViewerTracking(string Setting, string SettingSource,
+                                    string Effective, bool Tracked2D,
+                                    bool Tracked3D, string? CurrentMode,
+                                    bool? Active, string? Provider,
+                                    bool Available, string? Reason,
+                                    string? Detail);
+
 public sealed record ScreenMode(int Index, string Name, int Views, bool Is3D);
 
 public sealed record ScreenDp(long ClientId, string Api, string Kind, string Backend);
@@ -142,10 +157,15 @@ public sealed record ScreenDp(long ClientId, string Api, string Kind, string Bac
 public sealed record VendorCell(bool Present, bool Ready, bool Verified, bool Calibrated, string Tracker, string Lens,
                                 string Model, string Serial, StatusWarning? WorstWarning, string? DashboardCommand);
 
-public sealed record Screen(
-    string Id, string? Key, int Index, string DeviceName, string FriendlyName, EdidInfo Edid, DesktopInfo Desktop, NativeMode Native,
-    PhysicalMm PhysicalMm, Roles Roles, Claim Claim, ScreenLayout Layout, EyeTracking EyeTracking, ScreenMode? Mode,
-    IReadOnlyList<ScreenDp> Dps, VendorCell Vendor, IReadOnlyList<StatusWarning> Warnings);
+public sealed record Screen(string Id, string? Key, int Index,
+                            string DeviceName, string FriendlyName,
+                            EdidInfo Edid, DesktopInfo Desktop,
+                            NativeMode Native, PhysicalMm PhysicalMm,
+                            Roles Roles, Claim Claim, ScreenLayout Layout,
+                            EyeTracking EyeTracking, ScreenMode? Mode,
+                            IReadOnlyList<ScreenDp> Dps, VendorCell Vendor,
+                            IReadOnlyList<StatusWarning> Warnings,
+                            ViewerTracking? ViewerTracking = null);
 
 public sealed record ClientFlags(bool Active, bool Visible, bool Focused, bool Overlay);
 
@@ -305,32 +325,67 @@ public static class StatusSnapshotParser
         var ww = v.Obj("worst_warning");
 
         return new Screen(
-            s.Str("id"),
-            s.StrOrNull("key"),
-            s.Int("index"),
-            s.Str("device_name"),
-            s.Str("friendly_name"),
-            new EdidInfo(edid.Str("manufacturer"), edid.Str("product"), edid.Long("serial")),
+            s.Str("id"), s.StrOrNull("key"), s.Int("index"),
+            s.Str("device_name"), s.Str("friendly_name"),
+            new EdidInfo(edid.Str("manufacturer"), edid.Str("product"),
+                         edid.Long("serial")),
             new DesktopInfo(ReadRect(desk), desk.Num("scale", 1)),
-            new NativeMode(nat.Long("width"), nat.Long("height"), nat.Long("refresh_mhz"), nat.Bool("is_native", true)),
-            new PhysicalMm(mm.Num("width"), mm.Num("height"), mm.Str("source", "none")),
-            new Roles(roles.Bool("os_main"), roles.Bool("runtime_default"), roles.Bool("vendor_primary")),
-            new Claim(claim.StrOrNull("plugin_id"), claim.Str("confidence", "NONE"), claim.Int("confidence_value"),
-                      claim.Str("serial"), Strings(claim, "apis"),
-                      claim is { } cl && cl.Has("forced") ? cl.Bool("forced") : null,
-                      claim.StrOrNull("preferred_plugin"), claim.StrOrNull("preferred_source"), claim.StrOrNull("apply")),
+            new NativeMode(nat.Long("width"), nat.Long("height"),
+                           nat.Long("refresh_mhz"),
+                           nat.Bool("is_native", true)),
+            new PhysicalMm(mm.Num("width"), mm.Num("height"),
+                           mm.Str("source", "none")),
+            new Roles(roles.Bool("os_main"), roles.Bool("runtime_default"),
+                      roles.Bool("vendor_primary")),
+            new Claim(
+                claim.StrOrNull("plugin_id"), claim.Str("confidence", "NONE"),
+                claim.Int("confidence_value"), claim.Str("serial"),
+                Strings(claim, "apis"),
+                claim is {} cl && cl.Has("forced") ? cl.Bool("forced") : null,
+                claim.StrOrNull("preferred_plugin"),
+                claim.StrOrNull("preferred_source"), claim.StrOrNull("apply")),
             new ScreenLayout(lay.Num("width_m"), lay.Num("height_m"),
-                             new NominalViewer(viewer.Num("x"), viewer.Num("y"), viewer.Num("z")), lay.Str("source", "none")),
-            new EyeTracking(Strings(et, "supported"), et.StrOrNull("default"), et.Str("state", "UNKNOWN"),
-                            et.StrOrNull("viewer_source"), et.StrOrNull("viewer_reason"), et.StrOrNull("viewer_policy")),
-            mode is { } m ? new ScreenMode(m.Int("index"), m.Str("name"), m.Int("views"), m.Bool("is_3d")) : null,
-            s.Arr("dps").Where(d => d.ValueKind == JsonValueKind.Object)
-             .Select(d => new ScreenDp(d.Long("client_id"), d.Str("api", "?"), d.Str("kind", "primary"), d.Str("backend", "OK")))
-             .ToArray(),
-            new VendorCell(v.Bool("present"), v.Bool("ready"), v.Bool("verified"), v.Bool("calibrated"),
-                           v.Str("tracker", "UNKNOWN"), v.Str("lens", "UNKNOWN"), v.Str("model"), v.Str("serial"),
-                           ww is { } w ? StatusWarning.From(w) : null, v.StrOrNull("dashboard_command")),
-            ReadWarnings(s));
+                             new NominalViewer(viewer.Num("x"), viewer.Num("y"),
+                                               viewer.Num("z")),
+                             lay.Str("source", "none")),
+            new EyeTracking(
+                Strings(et, "supported"), et.StrOrNull("default"),
+                et.Str("state", "UNKNOWN"), et.StrOrNull("viewer_source"),
+                et.StrOrNull("viewer_reason"), et.StrOrNull("viewer_policy")),
+            mode is {} m ? new ScreenMode(m.Int("index"), m.Str("name"),
+                                          m.Int("views"), m.Bool("is_3d"))
+                         : null,
+            s.Arr("dps")
+                .Where(d => d.ValueKind == JsonValueKind.Object)
+                .Select(d => new ScreenDp(
+                            d.Long("client_id"), d.Str("api", "?"),
+                            d.Str("kind", "primary"), d.Str("backend", "OK")))
+                .ToArray(),
+            new VendorCell(
+                v.Bool("present"), v.Bool("ready"), v.Bool("verified"),
+                v.Bool("calibrated"), v.Str("tracker", "UNKNOWN"),
+                v.Str("lens", "UNKNOWN"), v.Str("model"), v.Str("serial"),
+                ww is {} w ? StatusWarning.From(w) : null,
+                v.StrOrNull("dashboard_command")),
+            ReadWarnings(s), ReadViewerTracking(s.Obj("viewer_tracking")));
+    }
+
+    /// <summary>ADR-066 Part B: null from a CLI that predates it, or where the
+    /// builder did not evaluate it.</summary>
+    private static ViewerTracking? ReadViewerTracking(JsonElement? vt) {
+      if (vt is not {} o)
+        return null;
+      var tracked = o.Obj("tracked");
+      bool? active =
+          o.TryGetProperty("active", out var a) &&
+                  a.ValueKind is JsonValueKind.True or JsonValueKind.False
+              ? a.GetBoolean()
+              : null;
+      return new ViewerTracking(
+          o.Str("setting", "default"), o.Str("setting_source", "default"),
+          o.Str("effective", "off"), tracked.Bool("2d"), tracked.Bool("3d"),
+          o.StrOrNull("current_mode"), active, o.StrOrNull("provider"),
+          o.Bool("available"), o.StrOrNull("reason"), o.StrOrNull("detail"));
     }
 
     private static Client ReadClient(JsonElement c)

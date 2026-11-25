@@ -340,6 +340,44 @@ XRT_TRACKING_PLUGIN_ABI_ASSERT(sizeof(struct xrt_tracking_plugin_host_iface) ==
 
 /*
  *
+ * Availability (ADR-066 Part B).
+ *
+ */
+
+//! Why a provider cannot serve, @ref xrt_tracking_availability::reason. Stable values.
+enum xrt_tracking_unavailable_reason
+{
+	XRT_TRACKING_UNAVAILABLE_NONE = 0,               //!< available (or nothing to say)
+	XRT_TRACKING_UNAVAILABLE_NO_CAMERA = 1,          //!< no (matching) camera is present
+	XRT_TRACKING_UNAVAILABLE_NO_ESTIMATOR = 2,       //!< no face / eye estimator built into this binary
+	XRT_TRACKING_UNAVAILABLE_NO_CAPTURE_BACKEND = 3, //!< this OS build has no camera capture backend
+	XRT_TRACKING_UNAVAILABLE_UNLICENSED = 4,         //!< the provider is not licensed
+	XRT_TRACKING_UNAVAILABLE_OTHER = 5,              //!< anything else; see the detail string
+};
+
+//! Bits of @ref xrt_tracking_availability::flags.
+//! The provider's own opt-in is on: serve every screen that has no per-screen viewer-tracking value.
+#define XRT_TRACKING_AVAILABILITY_SERVE_BY_DEFAULT (1u << 0)
+
+/*!
+ * What @ref xrt_tracking_plugin_iface::get_availability reports. The runtime
+ * sets `struct_size` and zero-fills; the provider writes no further than
+ * `struct_size`.
+ */
+struct xrt_tracking_availability
+{
+	uint32_t struct_size;
+	uint32_t available; //!< 1 = it could serve a viewer here (a camera it can open and analyse, or a test source)
+	uint32_t reason;    //!< enum xrt_tracking_unavailable_reason when @ref available is 0
+	uint32_t flags;     //!< XRT_TRACKING_AVAILABILITY_* bits
+	//! Human detail: the source when available ("webcam 'Integrated Camera'"), the cause otherwise.
+	char detail[96];
+	uint32_t reserved[4];
+};
+
+
+/*
+ *
  * Provider vtable.
  *
  */
@@ -426,7 +464,35 @@ struct xrt_tracking_plugin_iface
 	 * @ref XRT_TRACKING_PLUGIN_IFACE_HAS_ACTIVATE.
 	 */
 	xrt_component_activate_fn_t activate;
+
+	/*!
+	 * AVAILABILITY (ADR-066 Part B): could this provider serve a viewer on
+	 * this system if a screen asked it to, and if not, why not, plus its own
+	 * opt-in. Cheap and side-effect free like `probe()`: enumerate, never open
+	 * a camera (no LED). Answers from memory or enumeration, no instance, any
+	 * thread. The runtime asks after `probe()`, whether probe said yes or
+	 * declined, so a declined provider can still say why.
+	 *
+	 * A provider that fills this slot says yes in `probe()` whenever it is
+	 * AVAILABLE, not only when its own opt-in is on: the runtime then starts it
+	 * for a screen whose per-screen viewer-tracking setting asks for it, and
+	 * for a screen with no per-screen value only when the provider sets
+	 * @ref XRT_TRACKING_AVAILABILITY_SERVE_BY_DEFAULT. A provider without the
+	 * slot (NULL, or `struct_size` before it) reads "available, reason
+	 * unknown" when its probe succeeded, and serves by default: the behaviour
+	 * before this slot. Appended under `struct_size` cover (API major stays 1);
+	 * guarded with @ref XRT_TRACKING_PLUGIN_IFACE_HAS. Announced by
+	 * @ref XRT_TRACKING_PLUGIN_IFACE_HAS_GET_AVAILABILITY.
+	 */
+	xrt_result_t (*get_availability)(struct xrt_tracking_availability *out);
 };
+
+/*!
+ * Defined when @ref xrt_tracking_plugin_iface carries `get_availability`
+ * (ADR-066 Part B), so a provider built against an older runtime header can
+ * #ifdef-guard filling it.
+ */
+#define XRT_TRACKING_PLUGIN_IFACE_HAS_GET_AVAILABILITY 1
 
 /*!
  * Defined when @ref xrt_tracking_plugin_iface carries `get_license_state`

@@ -40,6 +40,9 @@
 #include "target_component_loader.h"
 #include "target_tracking_plugin_loader.h"
 
+#include "xrt/xrt_display_status.h"
+#include "util/u_setting.h"
+
 #include <cjson/cJSON.h>
 
 #include <errno.h>
@@ -90,6 +93,9 @@ predict_first(const struct target_tracking_plugin_desc *list, int n, const char 
 	return -1;
 }
 
+static void
+list_screens(cJSON *root);
+
 static int
 cmd_list(int argc, const char **argv)
 {
@@ -133,6 +139,8 @@ cmd_list(int argc, const char **argv)
 			cJSON_AddBoolToObject(p, "first", i == first);
 			cJSON_AddItemToArray(arr, p);
 		}
+		// ADR-066 Part B: every screen's viewer-tracking setting and availability.
+		list_screens(root);
 		char *out = cJSON_Print(root);
 		if (out != NULL) {
 			printf("%s\n", out);
@@ -156,6 +164,7 @@ cmd_list(int argc, const char **argv)
 	}
 	if (n == 0) {
 		P("\t(none — the views of a display that does not track stay on the nominal viewer)\n");
+		list_screens(NULL);
 		return 0;
 	}
 	P("\t  %-20s %-24s %10s  %-18s %-10s %-17s %s\n", "id", "name", "ProbeOrder", "Enabled", "Preferred",
@@ -175,7 +184,8 @@ cmd_list(int argc, const char **argv)
 		P("\t    %s\n", list[i].binary_path);
 	}
 	P("\t('*' = the provider the loader would rank first. It serves a screen only when that display does not\n");
-	P("\t track the viewer itself and declares EXTERNAL_OK — see 'displayxr-cli status' for the viewer source.)\n");
+	P("\t track the viewer itself, declares EXTERNAL_OK and its viewer-tracking setting asks for it.)\n");
+	list_screens(NULL);
 	return 0;
 }
 
@@ -445,6 +455,280 @@ cmd_reset(bool machine)
 	return 0;
 }
 
+/*
+ *
+ * Per-screen viewer tracking (ADR-066 Part B).
+ *
+ */
+
+static const char *
+flag_value(int argc, const char **argv, const char *flag)
+{
+	for (int i = 2; i + 1 < argc; i++) {
+		if (strcmp(argv[i], flag) == 0 && argv[i + 1][0] != '-') {
+			return argv[i + 1];
+		}
+	}
+	return NULL;
+}
+
+//! The first positional argument after the verb that is neither a flag nor a flag's value.
+static const char *
+positional(int argc, const char **argv)
+{
+	for (int i = 3; i < argc; i++) {
+		if (argv[i][0] == '-') {
+			if (strcmp(argv[i], "--screen") == 0) {
+				i++; // its value
+			}
+			continue;
+		}
+		return argv[i];
+	}
+	return NULL;
+}
+
+static bool
+key_ieq(const char *a, const char *b)
+{
+	for (; *a != '\0' && *b != '\0'; a++, b++) {
+		char ca = *a, cb = *b;
+		ca = (char)((ca >= 'A' && ca <= 'Z') ? ca + ('a' - 'A') : ca);
+		cb = (char)((cb >= 'A' && cb <= 'Z') ? cb + ('a' - 'A') : cb);
+		if (ca != cb) {
+			return false;
+		}
+	}
+	return *a == '\0' && *b == '\0';
+}
+
+static int
+machine_write_result(enum u_setting_write_result r, const char *what)
+{
+	switch (r) {
+	case U_SETTING_WRITE_OK: return 0;
+	case U_SETTING_WRITE_DENIED:
+		P("FAIL: %s was denied — run from an elevated terminal (HKLM needs admin).\n", what);
+		return 1;
+	case U_SETTING_WRITE_UNSUPPORTED:
+		P("FAIL: %s — there is no machine-wide store on this platform (drop --machine).\n", what);
+		return 1;
+	case U_SETTING_WRITE_FAILED:
+	default: P("FAIL: %s failed.\n", what); return 1;
+	}
+}
+
+//! After a per-screen write: tell the running service, and say when it applies.
+static void
+note_screen_pickup(void)
+{
+	int xret = 0;
+	switch (cli_poke_service_reprobe_quiet(&xret)) {
+	case CLI_POKE_DONE:
+		P("The running DisplayXR service re-evaluated the screens: the views of running apps follow now.\n");
+		P("(The tracking capability an app was told at its start stays as it was until its next launch.)\n");
+		break;
+	case CLI_POKE_REFUSED:
+		P("The running DisplayXR service refused the re-probe request (xrt_result=%d) — applies at the next "
+		  "session.\n",
+		  xret);
+		break;
+	case CLI_POKE_VERSION_SKEW: cli_poke_say_version_skew(false); break;
+	default:
+		P("No DisplayXR service reachable — applies at the next app launch (in-process apps read it at "
+		  "start).\n");
+		break;
+	}
+}
+
+static int
+cmd_screen_set(const char *key, const char *value, bool machine)
+{
+	const enum u_setting_viewer_tracking v = u_setting_viewer_tracking_parse(value);
+	if (v == U_SETTING_VIEWER_TRACKING_UNSET) {
+		P("error: '%s' is not a viewer-tracking setting: use off | 3d | always ('on' = 3d).\n",
+		  value != NULL ? value : "");
+		return 1;
+	}
+	if (strcmp(key, "all") == 0) {
+		P("error: 'tracking set --screen' needs one screen key ('all' is for 'tracking reset --screen').\n");
+		return 1;
+	}
+	char cur[64];
+	char legacy[64];
+	if (!cli_screen_key_lookup(key, cur, sizeof(cur), legacy, sizeof(legacy))) {
+		P("note: no connected screen has the key '%s' (see 'tracking list'); the setting is stored anyway.\n",
+		  key);
+		legacy[0] = '\0';
+	} else if (!key_ieq(cur, key)) {
+		P("note: '%s' is that screen's legacy key; storing the setting under its current key '%s'.\n", key,
+		  cur);
+		key = cur;
+	}
+	if (machine) {
+		const int rc = machine_write_result(u_setting_machine_set_viewer_tracking_for_screen(key, v),
+		                                    "writing the machine-wide viewer-tracking setting");
+		if (rc != 0) {
+			return rc;
+		}
+		if (legacy[0] != '\0') {
+			(void)u_setting_machine_set_viewer_tracking_for_screen(legacy, U_SETTING_VIEWER_TRACKING_UNSET);
+		}
+		P("Machine-wide viewer tracking for screen '%s': %s (a per-user value for it still wins).\n", key,
+		  u_setting_viewer_tracking_str(v));
+	} else {
+		if (!u_setting_user_set_viewer_tracking_for_screen(key, v)) {
+			P("FAIL: could not write the per-user settings file (invalid key, or I/O error).\n");
+			return 1;
+		}
+		if (legacy[0] != '\0') {
+			(void)u_setting_user_set_viewer_tracking_for_screen(legacy, U_SETTING_VIEWER_TRACKING_UNSET);
+		}
+		char path[512] = {0};
+		(void)u_setting_user_path(path, sizeof(path));
+		P("Viewer tracking for screen '%s': %s (%s).\n", key, u_setting_viewer_tracking_str(v), path);
+	}
+	if (v != U_SETTING_VIEWER_TRACKING_OFF) {
+		P("It takes effect only where it is offered — 'tracking list' shows each screen's availability.\n");
+	}
+	note_screen_pickup();
+	return 0;
+}
+
+static int
+cmd_screen_reset(const char *key, bool machine)
+{
+	const bool all = strcmp(key, "all") == 0;
+	char other[64] = {0};
+	if (!all) {
+		char cur[64];
+		char legacy[64];
+		if (cli_screen_key_lookup(key, cur, sizeof(cur), legacy, sizeof(legacy)) && legacy[0] != '\0') {
+			snprintf(other, sizeof(other), "%s", key_ieq(cur, key) ? legacy : cur);
+		}
+	}
+	if (machine) {
+		const int rc = machine_write_result(
+		    u_setting_machine_set_viewer_tracking_for_screen(all ? NULL : key, U_SETTING_VIEWER_TRACKING_UNSET),
+		    "clearing the machine-wide viewer-tracking setting");
+		if (rc != 0) {
+			return rc;
+		}
+		if (other[0] != '\0') {
+			(void)u_setting_machine_set_viewer_tracking_for_screen(other, U_SETTING_VIEWER_TRACKING_UNSET);
+		}
+	} else {
+		bool ok = all ? u_setting_user_clear_viewer_tracking_per_screen()
+		              : u_setting_user_set_viewer_tracking_for_screen(key, U_SETTING_VIEWER_TRACKING_UNSET);
+		if (ok && other[0] != '\0') {
+			ok = u_setting_user_set_viewer_tracking_for_screen(other, U_SETTING_VIEWER_TRACKING_UNSET);
+		}
+		if (!ok) {
+			P("FAIL: could not update the per-user settings file.\n");
+			return 1;
+		}
+	}
+	P("%s viewer-tracking setting%s cleared%s%s%s (back to the default: off).\n",
+	  machine ? "Machine-wide" : "Per-user", all ? "s" : "", all ? "" : " for screen '", all ? "" : key,
+	  all ? "" : "'");
+	note_screen_pickup();
+	return 0;
+}
+
+static cJSON *
+screen_viewer_json(const struct xrt_status_screen *s)
+{
+	const struct xrt_status_viewer_tracking *vt = &s->eye_tracking.viewer_tracking;
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "key", s->key);
+	cJSON_AddStringToObject(o, "device_name", s->device_name);
+	cJSON_AddStringToObject(o, "friendly_name", s->friendly_name);
+	if (s->eye_tracking.viewer_policy[0] != '\0') {
+		cJSON_AddStringToObject(o, "viewer_policy", s->eye_tracking.viewer_policy);
+	}
+	if (!vt->evaluated) {
+		cJSON_AddNullToObject(o, "viewer_tracking");
+		return o;
+	}
+	cJSON *v = cJSON_AddObjectToObject(o, "viewer_tracking");
+	cJSON_AddStringToObject(v, "setting", vt->setting);
+	cJSON_AddStringToObject(v, "setting_source", vt->setting_source);
+	cJSON_AddStringToObject(v, "effective", vt->effective);
+	cJSON *t = cJSON_AddObjectToObject(v, "tracked");
+	cJSON_AddBoolToObject(t, "2d", vt->tracked_2d);
+	cJSON_AddBoolToObject(t, "3d", vt->tracked_3d);
+	if (s->mode.valid) {
+		cJSON_AddStringToObject(v, "current_mode", s->mode.is_3d ? "3d" : "2d");
+		cJSON_AddBoolToObject(v, "active", s->mode.is_3d ? vt->tracked_3d : vt->tracked_2d);
+	} else {
+		cJSON_AddNullToObject(v, "current_mode");
+		cJSON_AddNullToObject(v, "active");
+	}
+	if (vt->provider[0] != '\0') {
+		cJSON_AddStringToObject(v, "provider", vt->provider);
+	} else {
+		cJSON_AddNullToObject(v, "provider");
+	}
+	cJSON_AddBoolToObject(v, "available", vt->available);
+	if (!vt->available && vt->reason[0] != '\0') {
+		cJSON_AddStringToObject(v, "reason", vt->reason);
+	} else {
+		cJSON_AddNullToObject(v, "reason");
+	}
+	if (vt->available && vt->reason[0] != '\0') {
+		cJSON_AddStringToObject(v, "detail", vt->reason);
+	} else {
+		cJSON_AddNullToObject(v, "detail");
+	}
+	return o;
+}
+
+//! `tracking list`'s per-screen part. @p arr non-NULL = JSON (one object per screen), else text.
+static void
+list_screens(cJSON *root)
+{
+	struct xrt_status_snapshot *snap = (struct xrt_status_snapshot *)calloc(1, sizeof(*snap));
+	if (snap == NULL) {
+		return;
+	}
+	// 1 = the service's, 0 = headless, -1 = the service is wedged (nothing built).
+	const bool from_service = cli_status_fetch(snap) > 0;
+	if (root != NULL) {
+		cJSON_AddStringToObject(root, "screens_source", from_service ? "service" : "headless");
+		cJSON *arr = cJSON_AddArrayToObject(root, "screens");
+		for (uint32_t i = 0; i < snap->screen_count && i < XRT_STATUS_MAX_SCREENS; i++) {
+			cJSON_AddItemToArray(arr, screen_viewer_json(&snap->screens[i]));
+		}
+		free(snap);
+		return;
+	}
+	P("\n :: Viewer tracking per screen (tracking set --screen <key> off|3d|always; from the %s)\n",
+	  from_service ? "running service" : "headless runtime");
+	if (snap->screen_count == 0) {
+		P("\t(no screens)\n");
+	}
+	for (uint32_t i = 0; i < snap->screen_count && i < XRT_STATUS_MAX_SCREENS; i++) {
+		const struct xrt_status_screen *s = &snap->screens[i];
+		const struct xrt_status_viewer_tracking *vt = &s->eye_tracking.viewer_tracking;
+		P("\t%-28s %-10s", s->key[0] ? s->key : "?", s->device_name[0] ? s->device_name : "?");
+		if (!vt->evaluated) {
+			P(" (not evaluated)\n");
+			continue;
+		}
+		P(" setting %-7s (%s) -> %-6s", vt->setting, vt->setting_source, vt->effective);
+		if (vt->tracked_2d || vt->tracked_3d) {
+			P(" provider %s [%s%s%s]", vt->provider, vt->tracked_2d ? "2D" : "",
+			  vt->tracked_2d && vt->tracked_3d ? "+" : "", vt->tracked_3d ? "3D" : "");
+		}
+		if (vt->available) {
+			P("  available%s%s\n", vt->reason[0] ? ": " : "", vt->reason);
+		} else {
+			P("  unavailable: %s\n", vt->reason[0] ? vt->reason : "?");
+		}
+	}
+	free(snap);
+}
+
 //! The class's `activate` slot behind the shared `activate` verb (ADR-054 N5).
 static int
 tracking_activate(
@@ -480,6 +764,14 @@ print_usage(void)
 	P("                               machine-wide (HKLM, admin) with --machine; HKCU wins.\n");
 	P("  use | prefer <id> [--machine] PreferredPlugin override: <id> is ranked first, ahead of ProbeOrder.\n");
 	P("  reset [--machine]            Clear the PreferredPlugin override.\n");
+	P("  set --screen <key> off|3d|always [--machine]\n");
+	P("                               Viewer tracking on that screen (ADR-066 Part B): off (default; the\n");
+	P("                               camera stays closed), 3d (only while the app is in the 3D mode),\n");
+	P("                               always (2D and 3D). 'on' = 3d; 'tracking on|off --screen <key>' too.\n");
+	P("                               Offered only where the display does not track the viewer itself and a\n");
+	P("                               provider has a usable camera: 'tracking list' says why not.\n");
+	P("  reset --screen <key>|all [--machine]\n");
+	P("                               Clear one / every per-screen viewer-tracking setting.\n");
 	P("  calibrate --screen <key> --watch --json | solve --in <f> | apply --screen <k> --camera <k> --pose <p>\n");
 	P("                               Camera-pose calibration (mirror alignment); 'tracking calibrate help'.\n");
 	cli_component_options_usage(&(const struct cli_component_class){.verb = "tracking",
@@ -503,6 +795,32 @@ cli_cmd_tracking(int argc, const char **argv)
 	const bool machine = cli_has_flag(argc, argv, "--machine");
 	if (strcmp(verb, "list") == 0) {
 		return cmd_list(argc, argv);
+	}
+	// ADR-066 Part B: the per-screen viewer-tracking setting (`--screen` routes these verbs).
+	const bool screen_verb = strcmp(verb, "set") == 0 || strcmp(verb, "on") == 0 || strcmp(verb, "off") == 0 ||
+	                         strcmp(verb, "reset") == 0;
+	if (screen_verb && cli_has_flag(argc, argv, "--screen")) {
+		const char *screen = flag_value(argc, argv, "--screen");
+		if (screen == NULL) {
+			P("error: '--screen' needs a screen key (see 'tracking list').\n\n");
+			return print_usage();
+		}
+		if (strcmp(verb, "set") == 0) {
+			const char *value = positional(argc, argv);
+			if (value == NULL) {
+				P("error: 'tracking set --screen <key>' needs off | 3d | always.\n\n");
+				return print_usage();
+			}
+			return cmd_screen_set(screen, value, machine);
+		}
+		if (strcmp(verb, "on") == 0 || strcmp(verb, "off") == 0) {
+			return cmd_screen_set(screen, verb, machine); // shorthands: on = 3d
+		}
+		if (strcmp(verb, "reset") == 0) {
+			return cmd_screen_reset(screen, machine);
+		}
+		P("error: 'tracking %s' takes no --screen (per-screen verbs: set, on, off, reset).\n\n", verb);
+		return print_usage();
 	}
 	if (strcmp(verb, "enable") == 0 || strcmp(verb, "disable") == 0) {
 		if (argc < 4 || argv[3][0] == '-') {

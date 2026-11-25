@@ -281,7 +281,11 @@ eye positions are reported in the panel's frame.
 > `displayxr-cli tracking set sim-tracking ENABLE 1` +
 > `displayxr-cli tracking set sim-tracking SOURCE webcam` (or
 > `DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_SOURCE=webcam`
-> in the hosting process). The provider also publishes the camera-space
+> in the hosting process). Since ADR-066 Part B a user turns it on per screen
+> instead: `displayxr-cli tracking set --screen <key> 3d` (or `always`); with
+> `SOURCE` unset and `ENABLE` off the provider then uses the webcam, and
+> `tracking list` says when it is unavailable ("no face estimator in this
+> build" on the default build). The provider also publishes the camera-space
 > measurement the camera-pose calibration consumes. The `WEBCAM_*` knobs below
 > keep their names there (`DXR_TRACKING_SIM_TRACKING_WEBCAM_DEVICE`, …), and
 > `WEBCAM_ESTIMATOR` (`auto` / `none` / `yunet-onnx`) is new in both hosts.

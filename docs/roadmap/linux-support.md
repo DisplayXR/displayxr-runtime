@@ -597,8 +597,15 @@ build, and a `displayxr.service` unit that could never start (below).
   device and the display processor (a vendor plug-in may run an eye tracker):
   with the socket, a user who never runs a present-owner never starts it, and
   one who does gets it without a login-time cost. `prerm` stops and disables it
-  on remove — not on upgrade, where a live service keeps serving its clients
-  and the next connect after its idle exit starts the new binary.
+  on remove. On upgrade, `postinst` instead **try-restarts a running service**
+  in every user manager (`/usr/lib/displayxr/bin/displayxr-restart-service`,
+  #2811; never starts one that is not running). The earlier rule, "a live
+  service keeps serving its clients and the next connect after its idle exit
+  starts the new binary", left a service that a long-lived client kept busy on
+  the old version, refusing every new-version client at the version gate.
+  Sibling packages that ship something the service loads (display processor,
+  providers) call the same helper from their own `postinst`; the tarball's
+  `install.sh` runs it with `stop` before copying over the binaries.
 - **Service fixes that make it startable detached.** The Linux mainloop now
   reads the socket-activation hand-off itself (`LISTEN_PID`/`LISTEN_FDS`, the
   whole `sd_listen_fds(3)` protocol) — `ipc_server` no longer links libsystemd,

@@ -4889,8 +4889,10 @@ locate_views_one(struct oxr_logger *log,
 		// The primary screen: the session DP's panel. (An IPC client has no
 		// arbitration here — vt NULL — the service spliced its views.)
 		struct xrt_viewer_tracking *vt = sess->sys->xsysd != NULL ? sess->sys->xsysd->viewer_tracking : NULL;
-		if (xrt_viewer_tracking_override_eyes(vt, XRT_VIEWER_SCREEN_PRIMARY, (int64_t)xdisplay_time, &eye_pos,
-		                                      got_eye_positions)) {
+		// ADR-066 Part B: the 2D / 3D slot decides for a screen set to "3d".
+		const enum xrt_viewer_mode vmode = sess->hardware_display_3d ? XRT_VIEWER_MODE_3D : XRT_VIEWER_MODE_2D;
+		if (xrt_viewer_tracking_override_eyes_mode(vt, XRT_VIEWER_SCREEN_PRIMARY, vmode, (int64_t)xdisplay_time,
+		                                           &eye_pos, got_eye_positions)) {
 			got_eye_positions = true;
 			static bool logged_provider = false;
 			if (!logged_provider) {
@@ -6621,8 +6623,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 		const int64_t t =
 		    (int64_t)time_state_ts_to_monotonic_ns(sess->sys->inst->timekeeping, viewLocateInfo->displayTime);
 		for (uint32_t i = 0; vt != NULL && i < m.count && i < XRT_MAX_SEGMENTS; i++) {
-			if (xrt_viewer_tracking_override_eyes(vt, m.seg[i].screen_id, t, &m.seg[i].eyes,
-			                                      m.seg[i].have_eyes)) {
+			if (xrt_viewer_tracking_override_eyes_mode(vt, m.seg[i].screen_id,
+			                                           sess->hardware_display_3d ? XRT_VIEWER_MODE_3D
+			                                                                     : XRT_VIEWER_MODE_2D,
+			                                           t, &m.seg[i].eyes, m.seg[i].have_eyes)) {
 				m.seg[i].have_eyes = true;
 			}
 		}

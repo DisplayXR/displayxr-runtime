@@ -607,8 +607,9 @@ cmd_reset(bool machine)
  * `system_request_display_reprobe`), so the change applies without waiting
  * for a world event. Says what happened.
  */
-static void
-poke_service_ex(bool mode_3d)
+//! The re-probe call alone, the one every per-screen write makes (dp use, dp mode, tracking set).
+static int
+poke_service_quiet(int *out_xret)
 {
 #ifdef CLI_HAVE_IPC
 	struct xrt_instance_info ii;
@@ -619,40 +620,71 @@ poke_service_ex(bool mode_3d)
 	memset(&ipc_c, 0, sizeof(ipc_c));
 	const xrt_result_t cret = cli_ipc_connect(&ipc_c, U_LOGGING_RAW, &ii);
 	if (cret == XRT_ERROR_IPC_VERSION_SKEW) {
-		// A service IS running, but a different build: it refuses this CLI's
-		// connection (the git-tag gate). The write above already landed in the
-		// store; say who sees it and who does not.
-		P("A DisplayXR service is running, but it is a different version than this displayxr-cli (%s) and\n",
-		  u_git_tag);
-		P("refused its connection (the log line above names both versions).\n");
-		if (mode_3d) {
-			P("The choice IS stored. That service, and the IPC apps attached to it, do not see it until it "
-			  "is\n");
-			P("restarted on a build that matches this CLI (and knows per-screen 3D modes, ADR-066 C1);\n");
-			P("in-process apps of this build pick it up within ~1 s.\n");
-		} else {
-			P("The preference IS stored; that service re-reads it at its next start.\n");
-		}
-		return;
+		return CLI_POKE_VERSION_SKEW;
 	}
 	if (cret == XRT_SUCCESS) {
 		const xrt_result_t xret = ipc_call_system_request_display_reprobe(&ipc_c);
 		ipc_client_connection_fini(&ipc_c);
-		if (xret == XRT_SUCCESS) {
-			if (mode_3d) {
-				P("The running DisplayXR service applies it within ~1 s.\n");
-				return;
-			}
-			P("The running DisplayXR service re-probes now: a secondary screen's segment DP\n");
-			P("follows within ~1 s; the primary screen (and in-process apps) at the next session.\n");
+		if (out_xret != NULL) {
+			*out_xret = (int)xret;
+		}
+		return xret == XRT_SUCCESS ? CLI_POKE_DONE : CLI_POKE_REFUSED;
+	}
+#else
+	(void)out_xret;
+#endif
+	return CLI_POKE_NO_SERVICE;
+}
+
+int
+cli_poke_service_reprobe_quiet(int *out_xret)
+{
+	return poke_service_quiet(out_xret);
+}
+
+//! A running service of another build refused this CLI (the git-tag gate): say who sees the stored write.
+void
+cli_poke_say_version_skew(bool live_setting)
+{
+	P("A DisplayXR service is running, but it is a different version than this displayxr-cli (%s) and\n",
+	  u_git_tag);
+	P("refused its connection (the log line above names both versions).\n");
+	if (live_setting) {
+		P("The choice IS stored. That service, and the IPC apps attached to it, do not see it until it is\n");
+		P("restarted on a build that matches this CLI; in-process apps of this build pick it up within ~1 "
+		  "s.\n");
+	} else {
+		P("The preference IS stored; that service re-reads it at its next start.\n");
+	}
+}
+
+/*!
+ * Ask the running service to re-probe now (session-free DIAG RPC
+ * `system_request_display_reprobe`), so the change applies without waiting
+ * for a world event, and say what happened. @p mode_3d: the write was a
+ * per-screen 3D mode (it applies live, ADR-066 C1).
+ */
+static void
+poke_service_ex(bool mode_3d)
+{
+	int xret = 0;
+	switch (poke_service_quiet(&xret)) {
+	case CLI_POKE_DONE:
+		if (mode_3d) {
+			P("The running DisplayXR service applies it within ~1 s.\n");
 			return;
 		}
+		P("The running DisplayXR service re-probes now: a secondary screen's segment DP\n");
+		P("follows within ~1 s; the primary screen (and in-process apps) at the next session.\n");
+		return;
+	case CLI_POKE_REFUSED:
 		P("The running DisplayXR service refused the re-probe request (xrt_result=%d) — applies at the "
 		  "next session.\n",
-		  (int)xret);
+		  xret);
 		return;
+	case CLI_POKE_VERSION_SKEW: cli_poke_say_version_skew(mode_3d); return;
+	default: break;
 	}
-#endif
 	if (mode_3d) {
 		P("No DisplayXR service reachable — running in-process apps pick it up within ~1 s.\n");
 		return;
@@ -1175,4 +1207,10 @@ cli_cmd_dp(int argc, const char **argv)
 	}
 	P("error: unknown 'dp' subcommand '%s'.\n\n", verb);
 	return print_usage();
+}
+
+bool
+cli_screen_key_lookup(const char *key, char *out_key, size_t key_cap, char *out_legacy, size_t legacy_cap)
+{
+	return screen_key_lookup(key, out_key, key_cap, out_legacy, legacy_cap);
 }

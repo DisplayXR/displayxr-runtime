@@ -115,6 +115,9 @@ fence(void)
 #define OFF_PROD_LICENSE_STATE 672u // ADR-054 N5; formerly unused, zero
 #define OFF_PROD_LICENSE_SOURCE 676u
 #define OFF_PROD_LICENSE_EXPIRY 680u // .. 688
+#define OFF_PROD_AVAIL_FLAGS 688u    // ADR-066 Part B; formerly unused, zero
+#define OFF_PROD_AVAIL_REASON 692u
+#define OFF_PROD_AVAIL_DETAIL 696u // .. 760
 
 #define OFF_DEMAND 768u
 
@@ -129,6 +132,7 @@ fence(void)
 #endif
 VPP_ASSERT(OFF_OWNER_PROVIDER + U_VPP_ID_MAX <= OFF_PROD_SEQ, "owner block overflows");
 VPP_ASSERT(OFF_PROD_CAMERA + U_VPP_TEXT_MAX <= OFF_DEMAND, "producer block overflows");
+VPP_ASSERT(OFF_PROD_AVAIL_DETAIL + U_VPP_AVAIL_DETAIL_MAX <= OFF_DEMAND, "producer availability overflows");
 VPP_ASSERT(U_VPP_HEADER_BYTES + U_VPP_RING_SIZE * SLOT_STRIDE <= U_VPP_PAGE_BYTES, "ring does not fit the page");
 
 //! Tries before a reader gives up on a block / slot that keeps changing under it.
@@ -346,6 +350,9 @@ u_vpp_write_producer(void *mem, const struct u_vpp_producer_status *st)
 	put_u32(mem, OFF_PROD_LICENSE_STATE, st->license_state);
 	put_u32(mem, OFF_PROD_LICENSE_SOURCE, st->license_source);
 	put_i64(mem, OFF_PROD_LICENSE_EXPIRY, st->license_expiry_unix_s);
+	put_u32(mem, OFF_PROD_AVAIL_FLAGS, st->avail_flags);
+	put_u32(mem, OFF_PROD_AVAIL_REASON, st->avail_reason);
+	put_str(mem, OFF_PROD_AVAIL_DETAIL, U_VPP_AVAIL_DETAIL_MAX, st->avail_detail);
 	fence();
 	store64(seq, s + 1u);
 }
@@ -464,6 +471,9 @@ u_vpp_read_producer(const void *mem, struct u_vpp_producer_status *out)
 		st.license_state = get_u32(mem, OFF_PROD_LICENSE_STATE);
 		st.license_source = get_u32(mem, OFF_PROD_LICENSE_SOURCE);
 		st.license_expiry_unix_s = get_i64(mem, OFF_PROD_LICENSE_EXPIRY);
+		st.avail_flags = get_u32(mem, OFF_PROD_AVAIL_FLAGS) & 7u;
+		st.avail_reason = get_u32(mem, OFF_PROD_AVAIL_REASON);
+		get_str(mem, OFF_PROD_AVAIL_DETAIL, U_VPP_AVAIL_DETAIL_MAX, st.avail_detail);
 		if (st.license_state > 4u) {
 			st.license_state = 0;
 		}

@@ -261,6 +261,10 @@ public sealed class DisplaysPage : Page
             body.Children.Add(dpRow);
             body.Children.Add(U.Wrapped(DriverExplanation, "desc"));
         }
+        // ADR-066 Part B: viewer tracking per display, on the face (greyed out
+        // with the reason when not offered).
+        if (TrackingRow(s) is {} trackingRow)
+          body.Children.Add(trackingRow);
 
         if (open_)
         {
@@ -294,6 +298,65 @@ public sealed class DisplaysPage : Page
         if (level is Level.Warn or Level.Critical) card.BorderBrush = Tokens.Alpha(Tokens.ColorKey(level), 0.45);
         return card;
     }
+
+    /// <summary>
+    /// ADR-066 Part B: the per-display viewer-tracking selector (Off / In 3D
+    /// only / Always), greyed out with the reason where it is not offered (the
+    /// display tracks the viewer itself, no camera, no face estimator in this
+    /// build, …). Writes `tracking set --screen &lt;key&gt; off|3d|always`; the
+    /// status feed shows the result.
+    /// </summary>
+    private Control? TrackingRow(Screen s) {
+      // A plain monitor (no display driver) has nothing to offer: no row at
+      // all.
+      if (s.ViewerTracking is not {} vt || s.Key is null ||
+          (s.Claim.PluginId is null && !vt.Available))
+        return null;
+      string key = s.Key;
+      int selected = StatusText.TrackingSelected(vt);
+      var combo = new ComboBox {
+        ItemsSource = StatusText.TrackingChoices.Select(c => c.Label).ToList(),
+        SelectedIndex = selected,
+        MinWidth = 200,
+        IsEnabled = vt.Available && !Ctx.ActionRunning,
+        VerticalAlignment = VerticalAlignment.Center,
+      };
+      combo.Classes.Add("field");
+      string? note = StatusText.TrackingNote(vt);
+      if (!vt.Available && note is not null) {
+        ToolTip.SetShowOnDisabled(combo, true);
+        ToolTip.SetTip(combo, note);
+      }
+      Avalonia.Automation.AutomationProperties.SetName(
+          combo, $"Viewer tracking for {StatusText.ScreenName(s)}");
+      combo.DropDownOpened += (_, _) => _openDropDowns++;
+      combo.DropDownClosed += (_, _) => {
+        _openDropDowns = System.Math.Max(0, _openDropDowns - 1);
+        Avalonia.Threading.Dispatcher.UIThread.Post(() => Update());
+      };
+      combo.SelectionChanged += (_, _) => {
+        int i = combo.SelectedIndex;
+        if (i < 0 || i == selected || i >= StatusText.TrackingChoices.Count ||
+            Ctx.ActionRunning)
+          return;
+        _trackingKey = key;
+        _ = Ctx.RunActionsAsync("screen-tracking",
+                                StatusText.TrackingVerb(key, i));
+      };
+      var label = U.Text("Viewer tracking", "label");
+      label.VerticalAlignment = VerticalAlignment.Center;
+      var row = U.Flow(12, 4, label, combo);
+      var col = U.VStack(2, row);
+      col.Margin = new Thickness(0, 6, 0, 0);
+      if (note is not null)
+        col.Children.Add(U.Wrapped(note, "desc"));
+      if (Ctx.LastActionArea == "screen-tracking" && _trackingKey == key &&
+          Ctx.LastAction is {} last && Ctx.LastActionFailed)
+        col.Children.Add(U.Wrapped(last, "soft"));
+      return col;
+    }
+
+    private string? _trackingKey;
 
     /// <summary>What the per-display driver selector does, in plain words.</summary>
     private const string DriverExplanation =

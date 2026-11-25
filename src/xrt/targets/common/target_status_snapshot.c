@@ -431,6 +431,20 @@ fill_viewer_source(struct xrt_status_screen *s, const struct target_viewer_scree
 		s->eye_tracking.supported = sup;
 		s->eye_tracking.default_mode = def;
 	}
+	// ADR-066 Part B: the per-screen setting, its effect per slot, and whether it is offered here.
+	struct xrt_status_viewer_tracking *vt = &s->eye_tracking.viewer_tracking;
+	vt->evaluated = true;
+	snprintf(vt->setting, sizeof(vt->setting), "%s", target_viewer_setting_str(sd->d.setting));
+	snprintf(vt->setting_source, sizeof(vt->setting_source), "%s",
+	         u_setting_source_str((enum u_setting_source)sd->setting_source));
+	snprintf(vt->effective, sizeof(vt->effective), "%s", target_viewer_setting_str(sd->d.effective_setting));
+	vt->tracked_2d = sd->d.source == XRT_VIEWER_SOURCE_PROVIDER && sd->d.tracked_2d;
+	vt->tracked_3d = sd->d.source == XRT_VIEWER_SOURCE_PROVIDER && sd->d.tracked_3d;
+	vt->available = sd->offered;
+	snprintf(vt->reason, sizeof(vt->reason), "%s", sd->offer_reason);
+	snprintf(vt->provider, sizeof(vt->provider), "%s", sd->d.provider_id);
+	snprintf(vt->key, sizeof(vt->key), "%s", sd->key);
+
 	target_viewer_source_label(&sd->d, s->eye_tracking.viewer_source, sizeof(s->eye_tracking.viewer_source));
 	snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason), "%s", sd->d.reason);
 	snprintf(s->eye_tracking.viewer_policy, sizeof(s->eye_tracking.viewer_policy), "%s",

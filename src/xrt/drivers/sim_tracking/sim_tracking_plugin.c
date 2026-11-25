@@ -21,7 +21,7 @@
  * own any more; the legacy `CAMERA_POSE_<n>` settings (and, for the webcam,
  * an explicit `WEBCAM_OFFSET_MM`) are read only as one-release fallbacks.
  *
- * **Opt-in.** `probe()` declines unless the `ENABLE` setting is 1 — being
+ * **Opt-in.** `ENABLE` = 1 serves every screen with no per-screen value (ADR-066 Part B) — being
  * registered is not enough (a scripted head sweeping the views with nothing
  * driving it is not something a user should ever get by accident). Settings
  * come ONLY through the host iface (ADR-054 decision 7): `displayxr-cli
@@ -63,11 +63,11 @@
 
 static const struct xrt_component_setting_desc g_descs[] = {
     {"ENABLE", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
-     "probe() declines unless 1: being registered is not enough (a scripted viewer would drive the views of "
-     "every display that accepts an external viewer)"},
-    {"SOURCE", XRT_COMPONENT_SETTING_TYPE_ENUM, "script",
-     "script (a scripted viewer; see SCRIPT, CAMERA) | webcam (the webcam eye tracker; needs a face estimator "
-     "built in, -DXRT_SIM_WEBCAM_ESTIMATOR=onnx; see WEBCAM_*)"},
+     "1: serve every screen that has no per-screen viewer-tracking value (the legacy opt-in; a screen set to "
+     "3d / always is served without it, ADR-066 Part B)"},
+    {"SOURCE", XRT_COMPONENT_SETTING_TYPE_ENUM, "",
+     "unset = script under ENABLE 1, else webcam | script (a scripted test viewer; see SCRIPT, CAMERA) | webcam "
+     "(the webcam eye tracker; needs a face estimator built in, -DXRT_SIM_WEBCAM_ESTIMATOR=onnx; see WEBCAM_*)"},
     {"SCRIPT", XRT_COMPONENT_SETTING_TYPE_ENUM, "sweep",
      "sweep (the head sweeps left-right, AMPLITUDE_M over PERIOD_MS) | offset (holds still at nominal + "
      "OFFSET_*_M)"},
@@ -164,13 +164,26 @@ webcam_get(void *ctx, const char *key, char *buf, size_t cap)
 
 static const struct sim_webcam_settings g_webcam_settings = {webcam_get, NULL};
 
-//! SOURCE=webcam? (anything else, unset included, is the script)
+//! Is SOURCE set explicitly (to anything)?
+static bool
+source_named(void)
+{
+	char v[16];
+	return setting("SOURCE", v, sizeof(v));
+}
+
+/*!
+ * The source this provider runs (ADR-066 Part B). SOURCE when it is set.
+ * Unset: the scripted viewer under the legacy ENABLE=1 opt-in (what it always
+ * was), else the webcam: a screen whose viewer-tracking setting asks for this
+ * provider wants a real camera, never a scripted head sweeping the views.
+ */
 static bool
 source_is_webcam(void)
 {
 	char v[16];
 	if (!setting("SOURCE", v, sizeof(v))) {
-		return false;
+		return !setting_on("ENABLE");
 	}
 	if (strcmp(v, "webcam") == 0) {
 		return true;
@@ -431,18 +444,48 @@ run(void *ptr)
 	return NULL;
 }
 
+/*!
+ * ADR-066 Part B: could this provider serve, and why not. Enumerates, never
+ * opens a camera. The scripted source is a test source: available whenever
+ * it is the selected one (SOURCE=script, or the legacy ENABLE=1 with SOURCE
+ * unset). ENABLE is this provider's own opt-in: SERVE_BY_DEFAULT, i.e. every
+ * screen with no per-screen viewer-tracking value.
+ */
+static xrt_result_t
+sim_tracking_get_availability(struct xrt_tracking_availability *out)
+{
+	if (out == NULL ||
+	    out->struct_size < offsetof(struct xrt_tracking_availability, detail) + sizeof(out->detail)) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	const bool enable = setting_on("ENABLE");
+	out->flags = enable ? XRT_TRACKING_AVAILABILITY_SERVE_BY_DEFAULT : 0u;
+	if (source_is_webcam()) {
+		// Quiet unless the webcam was asked for (SOURCE=webcam, or the opt-in is on).
+		(void)sim_tracking_webcam_availability(&g_webcam_settings, !source_named() && !enable, out);
+		return XRT_SUCCESS;
+	}
+	out->available = 1;
+	out->reason = XRT_TRACKING_UNAVAILABLE_NONE;
+	snprintf(out->detail, sizeof(out->detail), "scripted viewer (test source, no camera)");
+	return XRT_SUCCESS;
+}
+
 static xrt_result_t
 sim_tracking_probe(struct xrt_tracking_plugin_instance **out_inst)
 {
 	*out_inst = (struct xrt_tracking_plugin_instance *)&g_st;
-	if (!setting_on("ENABLE")) {
-		U_LOG_I(
-		    "sim-tracking: declining — 'displayxr-cli tracking set sim-tracking ENABLE 1' (or "
-		    "DXR_TRACKING_SIM_TRACKING_ENABLE=1 in the hosting process) enables the scripted viewer.");
+	// The availability slot contract: probe says yes whenever the provider is
+	// AVAILABLE; ENABLE only decides whether it serves screens that have no
+	// per-screen viewer-tracking value (SERVE_BY_DEFAULT). Probe must still
+	// never say yes without a usable source.
+	struct xrt_tracking_availability a;
+	memset(&a, 0, sizeof(a));
+	a.struct_size = (uint32_t)sizeof(a);
+	(void)sim_tracking_get_availability(&a);
+	if (a.available == 0) {
+		U_LOG_I("sim-tracking: declining - %s", a.detail);
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
-	}
-	if (source_is_webcam() && !sim_tracking_webcam_probe(&g_webcam_settings)) {
-		return XRT_ERROR_PROBER_NOT_SUPPORTED; // probe must not say yes without a usable source
 	}
 	return XRT_SUCCESS;
 }
@@ -644,6 +687,7 @@ static struct xrt_tracking_plugin_iface g_iface = {
     .describe_settings = describe_settings,
     .get_license_state = get_license_state,
     .activate = activate,
+    .get_availability = sim_tracking_get_availability,
 };
 
 XRT_TRACKING_PLUGIN_EXPORT xrt_result_t

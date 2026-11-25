@@ -126,6 +126,54 @@ void
 target_tracking_plugin_get_scan_result(
     int *out_registered, int *out_enabled, int *out_declined, int *out_failed, int *out_untrusted);
 
+/*!
+ * Availability of a provider as the scan learned it (ADR-066 Part B), or
+ * why there is none.
+ */
+struct target_tracking_availability
+{
+	bool available;        //!< it could serve a viewer here
+	bool serve_by_default; //!< its own opt-in: serve every screen with no per-screen value
+	bool stated;           //!< the provider filled the availability slot (else inferred from probe())
+	uint32_t reason;       //!< enum xrt_tracking_unavailable_reason, or TARGET_TRACKING_UNAVAILABLE_*
+	char detail[96];       //!< the source when available, the cause otherwise ("" = nothing to say)
+};
+
+//! Runtime-side reasons, past the provider's own enum (never collide with it).
+#define TARGET_TRACKING_UNAVAILABLE_NO_PROVIDER 100u //!< no provider is registered
+#define TARGET_TRACKING_UNAVAILABLE_DISABLED 101u    //!< providers are registered but none is enabled
+#define TARGET_TRACKING_UNAVAILABLE_FAILED 102u      //!< enabled rows failed to load / were refused
+#define TARGET_TRACKING_UNAVAILABLE_ENV 103u         //!< DXR_TRACKING_PROVIDERS=0 in this process
+
+/*!
+ * The resident provider at @p index (forces the scan): what its availability
+ * slot said, or (no slot) "available, serves by default". False out of range.
+ */
+bool
+target_tracking_plugin_get_availability(int index, struct target_tracking_availability *out);
+
+/*!
+ * Why no provider is resident (forces the scan): the first declined row's
+ * stated reason in rank order, else unlicensed / failed / disabled / no
+ * provider registered. Meaningful only when the resident count is 0.
+ */
+void
+target_tracking_plugin_get_unavailable(struct target_tracking_availability *out);
+
+//! The stable short spelling of a reason ("no_camera", "no_estimator", "no_provider", ...).
+const char *
+target_tracking_unavailable_reason_str(uint32_t reason);
+
+//! The human line for a reason when the provider gave no detail ("no camera", "no face estimator in this build").
+const char *
+target_tracking_unavailable_reason_text(uint32_t reason);
+
+//! Fill @p out from a provider's slot answer (the absent-slot rule applied when @p a is NULL). Pure.
+void
+target_tracking_availability_from_slot(const struct xrt_tracking_availability *a,
+                                       bool probe_ok,
+                                       struct target_tracking_availability *out);
+
 //! `DXR_TRACKING_PROVIDERS=0` in this process: the scan loads nothing (CTS / test isolation).
 bool
 target_tracking_plugin_disabled_by_env(void);

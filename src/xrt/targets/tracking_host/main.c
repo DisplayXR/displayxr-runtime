@@ -172,6 +172,16 @@ describe_into(const struct xrt_tracking_plugin_iface *iface,
 }
 
 //! The resident provider's licence state into the producer block; true when it changed.
+//! ADR-066 Part B: an availability answer into the producer block's availability fields.
+static void
+avail_into(const struct target_tracking_availability *a, struct u_vpp_producer_status *ps)
+{
+	ps->avail_flags = U_VPP_AVAIL_STATED | (a->available ? U_VPP_AVAIL_AVAILABLE : 0u) |
+	                  (a->serve_by_default ? U_VPP_AVAIL_SERVE_BY_DEFAULT : 0u);
+	ps->avail_reason = a->reason;
+	snprintf(ps->avail_detail, sizeof(ps->avail_detail), "%.*s", (int)sizeof(ps->avail_detail) - 1, a->detail);
+}
+
 static bool
 license_into(int index, struct u_vpp_producer_status *ps)
 {
@@ -253,6 +263,16 @@ main(int argc, char *argv[])
 		}
 	}
 	if (index < 0) {
+		if (a.probe) {
+			// ADR-066 Part B: say why, so the service can report "unavailable: <reason>".
+			struct target_tracking_availability un;
+			target_tracking_plugin_get_unavailable(&un);
+			struct u_vpp_producer_status ps;
+			memset(&ps, 0, sizeof(ps));
+			ps.provider_status = XRT_TRACKING_PROVIDER_STATUS_STOPPED;
+			avail_into(&un, &ps);
+			u_vpp_write_producer(shm.map, &ps);
+		}
 		U_LOG_W("tracking host: provider '%s' is not usable here (%d resident)",
 		        a.provider != NULL ? a.provider : "(any)", count);
 		os_shm_close(&shm);
@@ -270,6 +290,12 @@ main(int argc, char *argv[])
 	// unlicensed / expired provider never gets here: the scan above skipped
 	// it and the next one in rank (or exit 10) answered.
 	license_into(index, &ps);
+	{
+		struct target_tracking_availability av;
+		if (target_tracking_plugin_get_availability(index, &av)) {
+			avail_into(&av, &ps);
+		}
+	}
 
 	if (a.probe) {
 		// The answer the service decides on: who would serve, and what it tracks.

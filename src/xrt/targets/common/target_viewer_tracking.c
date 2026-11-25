@@ -23,6 +23,7 @@
 
 #include "util/u_eye_history.h"
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 #include "util/u_viewer_pose_page.h"
 
 #include "os/os_threading.h"
@@ -79,10 +80,72 @@ target_viewer_source_label(const struct target_viewer_decision *d, char *out, si
 	}
 }
 
+// The per-screen setting mirrors the store's enum value for value.
+_Static_assert((int)TARGET_VIEWER_SETTING_DEFAULT == (int)U_SETTING_VIEWER_TRACKING_UNSET &&
+                   (int)TARGET_VIEWER_SETTING_OFF == (int)U_SETTING_VIEWER_TRACKING_OFF &&
+                   (int)TARGET_VIEWER_SETTING_3D == (int)U_SETTING_VIEWER_TRACKING_3D &&
+                   (int)TARGET_VIEWER_SETTING_ALWAYS == (int)U_SETTING_VIEWER_TRACKING_ALWAYS,
+               "target_viewer_setting must equal u_setting_viewer_tracking");
+
+const char *
+target_viewer_setting_str(uint32_t setting)
+{
+	switch (setting) {
+	case TARGET_VIEWER_SETTING_OFF: return "off";
+	case TARGET_VIEWER_SETTING_3D: return "3d";
+	case TARGET_VIEWER_SETTING_ALWAYS: return "always";
+	case TARGET_VIEWER_SETTING_DEFAULT:
+	default: return "default";
+	}
+}
+
+enum xrt_viewer_source
+target_viewer_source_for_mode(const struct target_viewer_decision *d, uint32_t mode)
+{
+	if (d == NULL) {
+		return XRT_VIEWER_SOURCE_DP;
+	}
+	if (d->source != XRT_VIEWER_SOURCE_PROVIDER) {
+		return d->source;
+	}
+	const bool tracked = mode == XRT_VIEWER_MODE_2D ? d->tracked_2d : d->tracked_3d; // UNKNOWN reads as 3D
+	return tracked ? XRT_VIEWER_SOURCE_PROVIDER : XRT_VIEWER_SOURCE_NOMINAL;
+}
+
+bool
+target_viewer_screen_offered(const struct target_viewer_screen_in *s,
+                             const struct target_viewer_provider_in *provider,
+                             char *reason,
+                             size_t cap)
+{
+	const char *why = NULL;
+	if (s == NULL || !s->has_dp) {
+		why = "no display processor on this screen";
+	} else if (s->dp_tracks) {
+		why = "this display tracks the viewer itself";
+	} else if (s->dp_policy == XRT_PLUGIN_VIEWER_POLICY_OWN) {
+		why = "this display owns the viewer (policy OWN)";
+	} else if (s->dp_policy != XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK) {
+		why = "this display does not accept an external viewer (policy FIXED)";
+	} else if (provider == NULL || !provider->hosted) {
+		why = "viewer-tracking providers are not hosted in this process";
+	} else if (!provider->usable) {
+		why = provider->unavailable != NULL && provider->unavailable[0] != '\0'
+		          ? provider->unavailable
+		          : "no viewer-tracking provider available";
+	}
+	if (reason != NULL && cap > 0) {
+		snprintf(reason, cap, "%s", why != NULL ? why : (provider->detail != NULL ? provider->detail : ""));
+	}
+	return why == NULL;
+}
+
 void
 target_viewer_arbitrate(const struct target_viewer_inputs *in, struct target_viewer_decision *out)
 {
 	memset(out, 0, sizeof(*out));
+	out->setting = in->setting;
+	out->effective_setting = TARGET_VIEWER_SETTING_OFF;
 	const uint32_t policy = in->dp_policy;
 	out->dp_policy = policy;
 	out->dp_tracks = in->dp_tracks;
@@ -113,11 +176,34 @@ target_viewer_arbitrate(const struct target_viewer_inputs *in, struct target_vie
 		snprintf(out->reason, sizeof(out->reason), "viewer-tracking providers are not hosted in this process");
 		return;
 	}
-	// (b) The best enabled provider with a usable source.
+	// (b) The best enabled provider with a usable source — where the screen's
+	// viewer-tracking setting allows it (ADR-066 Part B). DEFAULT (no value)
+	// is OFF unless the provider opts in by itself, then ALWAYS: every mode,
+	// what a provider did before the setting existed.
 	out->provider_available = usable;
+	uint32_t eff = in->setting;
+	if (eff != TARGET_VIEWER_SETTING_OFF && eff != TARGET_VIEWER_SETTING_3D &&
+	    eff != TARGET_VIEWER_SETTING_ALWAYS) {
+		eff = (usable && !in->provider_opt_in_only) ? TARGET_VIEWER_SETTING_ALWAYS : TARGET_VIEWER_SETTING_OFF;
+	}
+	out->effective_setting = eff;
+	if (eff == TARGET_VIEWER_SETTING_OFF) {
+		out->source = XRT_VIEWER_SOURCE_NOMINAL;
+		if (in->setting == TARGET_VIEWER_SETTING_OFF) {
+			snprintf(out->reason, sizeof(out->reason), "viewer tracking is off for this screen");
+		} else if (usable) {
+			snprintf(out->reason, sizeof(out->reason),
+			         "viewer tracking is not turned on for this screen (default: off)");
+		} else {
+			snprintf(out->reason, sizeof(out->reason), "no source");
+		}
+		return;
+	}
 	if (usable) {
 		out->source = XRT_VIEWER_SOURCE_PROVIDER;
 		snprintf(out->provider_id, sizeof(out->provider_id), "%s", in->provider_id);
+		out->tracked_3d = true;
+		out->tracked_2d = eff == TARGET_VIEWER_SETTING_ALWAYS;
 		return;
 	}
 	// (c) Nominal.
@@ -264,7 +350,12 @@ target_viewer_arbitrate_screens(const struct target_viewer_screen_in *screens,
 		in.provider_usable = provider != NULL && provider->usable;
 		in.provider_id = provider != NULL ? provider->id : NULL;
 		in.provider_enabled = provider != NULL && (provider->enabled || provider->usable);
+		in.setting = s->setting;
+		in.provider_opt_in_only = provider != NULL && provider->opt_in_only;
 		target_viewer_arbitrate(&in, &o->d);
+		o->offered = target_viewer_screen_offered(s, provider, o->offer_reason, sizeof(o->offer_reason));
+		o->setting_source = s->setting_source;
+		snprintf(o->key, sizeof(o->key), "%s", s->key);
 		if (!s->has_dp) {
 			// A plain monitor: nothing weaves there, so nothing to follow.
 			snprintf(o->d.reason, sizeof(o->d.reason), "no display processor on this screen");
@@ -296,6 +387,7 @@ target_viewer_provider_state_str(enum target_viewer_provider_state s)
 	case TARGET_VIEWER_PROVIDER_PAUSED: return "paused";
 	case TARGET_VIEWER_PROVIDER_STANDBY: return "standby";
 	case TARGET_VIEWER_PROVIDER_NO_SOURCE: return "no_source";
+	case TARGET_VIEWER_PROVIDER_OFF: return "off";
 	case TARGET_VIEWER_PROVIDER_NONE:
 	default: return "none";
 	}
@@ -318,8 +410,14 @@ target_viewer_provider_state_of(const struct target_viewer_decision *d, bool sta
 		// only when a provider could otherwise have served.
 		return d->provider_available ? TARGET_VIEWER_PROVIDER_STANDBY : TARGET_VIEWER_PROVIDER_NONE;
 	}
+	const bool external = d->dp_policy == XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK && !d->dp_tracks;
+	// ADR-066 Part B: the screen's setting keeps a provider off.
+	if (external && (d->setting == TARGET_VIEWER_SETTING_OFF ||
+	                 (d->provider_available && d->effective_setting == TARGET_VIEWER_SETTING_OFF))) {
+		return TARGET_VIEWER_PROVIDER_OFF;
+	}
 	// Nominal: "no source" only where a provider would be taken.
-	if (d->dp_policy == XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK && !d->dp_tracks && !d->provider_available) {
+	if (external && !d->provider_available) {
 		return TARGET_VIEWER_PROVIDER_NO_SOURCE;
 	}
 	return TARGET_VIEWER_PROVIDER_NONE;
@@ -430,8 +528,39 @@ static bool g_have_geo = false;
 //! Page-mode result of the resolve (the provider the page names).
 static bool g_page_usable = false;
 static char g_page_provider[U_VPP_ID_MAX] = {0};
+//! ADR-066 Part B: the page's availability answer (the host's probe; U_VPP_AVAIL_* bits, 0 = none stated).
+static uint32_t g_page_avail_flags = 0;
+static uint32_t g_page_avail_reason = 0;
+static char g_page_avail_detail[U_VPP_AVAIL_DETAIL_MAX] = {0};
+
+//! ADR-066 Part B: the provider side's availability strings (stable storage for target_viewer_provider_in).
+static char g_prov_unavailable[128] = {0};
+static char g_prov_detail[96] = {0};
+
+//! ADR-066 Part B: the per-screen store generation the last arbitration read.
+static uint64_t g_settings_gen = 0;
+
+//! LOCAL hosting: the last viewer request (the idle stop closes the camera after a 3D -> 2D switch).
+static int64_t g_local_demand_ns = 0;
+
+//! What apply composed from (the DP's honest caps) and which head modes it marked HAS_TRACKING.
+static uint32_t g_dp_supported = 0;
+static uint32_t g_dp_default = 0;
+static uint64_t g_marked_modes = 0;
 
 #ifdef VT_HAVE_PAGE
+//! Copy the page's availability answer (producer block) into the g_page_avail_* cache. Caller holds the lock.
+static void
+page_avail_capture_locked(const void *page)
+{
+	struct u_vpp_producer_status ps;
+	if (page != NULL && u_vpp_read_producer(page, &ps)) {
+		g_page_avail_flags = ps.avail_flags;
+		g_page_avail_reason = ps.avail_reason;
+		snprintf(g_page_avail_detail, sizeof(g_page_avail_detail), "%s", ps.avail_detail);
+	}
+}
+
 static char g_page_name[128] = {0};
 static struct os_shm g_shm; //!< the mapping (owner: created; reader: opened RW for demand)
 static struct target_viewer_host *g_host = NULL;
@@ -517,6 +646,7 @@ reader_attach(void)
 	g_shm = shm;
 	g_owner_created_ns = geo.owner_created_ns;
 	snprintf(g_page_provider, sizeof(g_page_provider), "%s", o.provider_id);
+	page_avail_capture_locked(g_shm.map);
 	memset(&g_reader, 0, sizeof(g_reader));
 	return true;
 }
@@ -553,6 +683,8 @@ resolve_hosting(void)
 			}
 			if (ran) {
 				g_hosting = VT_HOSTING_OWNER_HOST;
+				// ADR-066 Part B: the probe wrote its availability answer (also on "no provider").
+				page_avail_capture_locked(g_shm.map);
 				if (g_page_usable) {
 					struct target_viewer_host_config cfg;
 					memset(&cfg, 0, sizeof(cfg));
@@ -639,9 +771,30 @@ provider_inputs(bool needed, bool count_rows, struct target_viewer_provider_in *
 		// The page's provider (probed by the host, or the service's): nothing loaded here.
 		out->usable = g_page_usable;
 		out->id = g_page_usable ? g_page_provider : NULL;
+		// ADR-066 Part B: what the host's probe said (an older host states nothing: legacy rule).
+		const bool stated = (g_page_avail_flags & U_VPP_AVAIL_STATED) != 0;
+		out->opt_in_only = stated && (g_page_avail_flags & U_VPP_AVAIL_SERVE_BY_DEFAULT) == 0;
+		if (g_page_usable) {
+			snprintf(g_prov_detail, sizeof(g_prov_detail), "%s", stated ? g_page_avail_detail : "");
+			out->detail = g_prov_detail;
+		} else {
+			snprintf(g_prov_unavailable, sizeof(g_prov_unavailable), "%s",
+			         stated && g_page_avail_detail[0] != '\0'
+			             ? g_page_avail_detail
+			             : target_tracking_unavailable_reason_text(
+			                   stated ? g_page_avail_reason
+			                          : (uint32_t)TARGET_TRACKING_UNAVAILABLE_NO_PROVIDER));
+			out->unavailable = g_prov_unavailable;
+		}
 	} else if (needed && target_tracking_plugin_get_count() > 0) {
 		out->usable = true;
 		out->id = target_tracking_plugin_get_row_id(0); // rank order: preferred, then ProbeOrder
+		struct target_tracking_availability a;
+		if (target_tracking_plugin_get_availability(0, &a)) {
+			out->opt_in_only = !a.serve_by_default;
+			snprintf(g_prov_detail, sizeof(g_prov_detail), "%s", a.detail);
+			out->detail = g_prov_detail;
+		}
 #ifdef VT_HAVE_PAGE
 		if (h == VT_HOSTING_OWNER_INPROC && !g_page_usable) {
 			lock();
@@ -651,6 +804,12 @@ provider_inputs(bool needed, bool count_rows, struct target_viewer_provider_in *
 			unlock();
 		}
 #endif
+	} else if (needed) {
+		// ADR-066 Part B: nothing resident — say why.
+		struct target_tracking_availability un;
+		target_tracking_plugin_get_unavailable(&un);
+		snprintf(g_prov_unavailable, sizeof(g_prov_unavailable), "%s", un.detail);
+		out->unavailable = g_prov_unavailable;
 	}
 	out->enabled = out->usable || (count_rows && enabled_rows_exist(false));
 }
@@ -672,7 +831,44 @@ target_viewer_tracking_evaluate(const struct xrt_plugin_iface *plugin,
 	in.provider_usable = p.usable;
 	in.provider_id = p.id;
 	in.provider_enabled = p.enabled;
+	// The primary's per-screen setting is read once the screen table exists
+	// (its key is known then): target_viewer_tracking_update_screens.
+	in.setting = TARGET_VIEWER_SETTING_DEFAULT;
+	in.provider_opt_in_only = p.opt_in_only;
 	target_viewer_arbitrate(&in, out);
+}
+
+//! Mark (or unmark what an earlier compose marked) HAS_TRACKING on @p head's modes for decision @p d.
+static void
+compose_mode_flags(struct xrt_device *head, const struct target_viewer_decision *d, bool mark)
+{
+	if (head == NULL) {
+		return;
+	}
+	// Over the envelope (ADR-066 C1): a live 3D-mode switch copies an envelope
+	// entry into slot 1, so every declared entry carries its flag, not only
+	// the two presented slots.
+	const uint32_t n_modes = u_device_rendering_modes_envelope_count(head);
+	for (uint32_t mi = 0; mi < n_modes && mi < 64; mi++) {
+		struct xrt_rendering_mode *m = &head->rendering_modes[mi];
+		const uint64_t bit = (uint64_t)1 << mi;
+		if ((g_marked_modes & bit) != 0) {
+			m->mode_flags &= ~XRT_RENDERING_MODE_FLAG_HAS_TRACKING; // ours to take back
+			g_marked_modes &= ~bit;
+		}
+		if (!mark || (m->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) != 0) {
+			continue;
+		}
+		const bool is_3d = m->hardware_display_3d || m->view_count > 1;
+		// 3D slots when the provider drives them; the 2D slot only for an explicit
+		// `always` (DEFAULT keeps the advertisement it had before ADR-066 Part B).
+		const bool tracked =
+		    is_3d ? d->tracked_3d : (d->tracked_2d && d->setting == TARGET_VIEWER_SETTING_ALWAYS);
+		if (tracked) {
+			m->mode_flags |= XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
+			g_marked_modes |= bit;
+		}
+	}
 }
 
 void
@@ -706,19 +902,29 @@ target_viewer_tracking_apply(struct xrt_system_compositor_info *info,
 	                                    &supported, &def, &mark);
 	info->supported_eye_tracking_modes = supported;
 	info->default_eye_tracking_mode = def;
-	if (mark && head != NULL) {
-		// Over the envelope (ADR-066 C1): a config switch must not bring in
-		// an entry the composition never marked.
-		const uint32_t n_modes = u_device_rendering_modes_envelope_count(head);
-		for (uint32_t mi = 0; mi < n_modes; mi++) {
-			struct xrt_rendering_mode *m = &head->rendering_modes[mi];
-			if (m->hardware_display_3d || m->view_count > 1) {
-				m->mode_flags |= XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
-			}
-		}
-	}
 
 	lock();
+	g_dp_supported = pdi->supported_eye_tracking_modes;
+	g_dp_default = pdi->default_eye_tracking_mode;
+	// A refresh re-applies: keep the primary's setting once the screen table resolved it.
+	if (g_have_decision && g_decision.setting != TARGET_VIEWER_SETTING_DEFAULT &&
+	    d.source != XRT_VIEWER_SOURCE_DP && d.dp_policy == XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK) {
+		struct target_viewer_inputs in = {0};
+		in.dp_policy = d.dp_policy;
+		in.hosted = true;
+		in.provider_usable = d.provider_available;
+		// Only when one is usable (the scan already ran, or the page names it): never a scan here.
+		in.provider_id = !d.provider_available        ? NULL
+		                 : g_page_provider[0] != '\0' ? g_page_provider
+		                                              : target_tracking_plugin_get_row_id(0);
+		in.setting = g_decision.setting;
+		target_viewer_arbitrate(&in, &d);
+		target_viewer_compose_advertisement(pdi->supported_eye_tracking_modes, pdi->default_eye_tracking_mode,
+		                                    &d, &supported, &def, &mark);
+		info->supported_eye_tracking_modes = supported;
+		info->default_eye_tracking_mode = def;
+	}
+	compose_mode_flags(head, &d, mark);
 	const bool changed =
 	    !g_have_decision || g_decision.source != d.source || strcmp(g_decision.provider_id, d.provider_id) != 0;
 	g_decision = d;
@@ -808,6 +1014,27 @@ target_viewer_screens_from_list(const struct xrt_screen_list *list,
 			s->dp_policy = xrt_plugin_iface_viewer_policy(target_plugin_get_active(),
 			                                              target_plugin_get_active_instance(), NULL);
 		}
+
+		// ADR-066 Part B: the screen's viewer-tracking setting, by its stable key
+		// (the same key `dp use --screen` stores under; the legacy EDID form too).
+		s->setting = TARGET_VIEWER_SETTING_DEFAULT;
+		s->setting_source = (uint32_t)U_SETTING_SOURCE_DEFAULT;
+		if (sc->key[0] != '\0') {
+			snprintf(s->key, sizeof(s->key), "%s", sc->key);
+		}
+		if (s->key[0] != '\0' || target_plugin_get_monitor_key(sc->id, s->key, sizeof(s->key), NULL, 0)) {
+			enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+			enum u_setting_viewer_tracking v = u_setting_get_viewer_tracking_for_screen(s->key, &src);
+			char legacy[64];
+			if (v == U_SETTING_VIEWER_TRACKING_UNSET &&
+			    target_plugin_get_monitor_legacy_key(sc->id, legacy, sizeof(legacy))) {
+				v = u_setting_get_viewer_tracking_for_screen(legacy, &src);
+			}
+			s->setting = (uint32_t)v;
+			s->setting_source = (uint32_t)src;
+		} else {
+			s->key[0] = '\0';
+		}
 	}
 	return n;
 }
@@ -832,9 +1059,11 @@ evaluate_screens(const struct xrt_screen_list *list,
 	provider_inputs(needed, count_rows, &p);
 	const uint32_t m = target_viewer_arbitrate_screens(in, n, &p, out);
 	for (uint32_t i = 0; i < m; i++) {
-		if (out[i].is_primary && primary != NULL) {
+		if (out[i].is_primary && primary != NULL && in[i].setting == primary->setting) {
 			// The primary's answer is the instance's (the advertisement was
-			// composed from it): keep it, whatever the screen list says.
+			// composed from it): keep it, whatever the screen list says —
+			// unless its viewer-tracking setting moved (ADR-066 Part B: the
+			// views follow the setting live; the advertisement stays).
 			out[i].d = *primary;
 			out[i].offset_m[0] = out[i].offset_m[1] = out[i].offset_m[2] = 0.0f;
 			if (count_rows && out[i].d.source == XRT_VIEWER_SOURCE_DP && p.enabled) {
@@ -845,12 +1074,79 @@ evaluate_screens(const struct xrt_screen_list *list,
 	return m;
 }
 
+static bool
+update_screens_impl(const struct xrt_screen_list *list, const struct xrt_dp_factory_registry *reg);
+
 void
 target_viewer_tracking_update_screens(const struct xrt_screen_list *list, const struct xrt_dp_factory_registry *reg)
 {
+	(void)update_screens_impl(list, reg);
+}
+
+bool
+target_viewer_tracking_settings_changed(const struct xrt_screen_list *list, const struct xrt_dp_factory_registry *reg)
+{
 	if (list == NULL) {
+		return false;
+	}
+	const uint64_t gen = u_setting_per_screen_generation();
+	lock();
+	const bool moved = g_have_screens && gen != g_settings_gen;
+	unlock();
+	if (!moved) {
+		return false; // cheap: every client connect refreshes, only a store reload moves this
+	}
+	return update_screens_impl(list, reg);
+}
+
+void
+target_viewer_tracking_recompose(struct xrt_system_compositor_info *info, struct xrt_device *head)
+{
+	if (info == NULL) {
 		return;
 	}
+	lock();
+	struct target_viewer_decision d;
+	bool have = false;
+	for (uint32_t i = 0; g_have_screens && i < g_screen_count; i++) {
+		if (g_screens[i].is_primary) {
+			d = g_screens[i].d;
+			have = true;
+		}
+	}
+	if (!have || !g_have_decision ||
+	    (d.source == g_decision.source && d.setting == g_decision.setting &&
+	     d.tracked_2d == g_decision.tracked_2d && d.tracked_3d == g_decision.tracked_3d)) {
+		unlock();
+		return;
+	}
+	uint32_t supported = 0, def = 0;
+	bool mark = false;
+	target_viewer_compose_advertisement(g_dp_supported, g_dp_default, &d, &supported, &def, &mark);
+	info->supported_eye_tracking_modes = supported;
+	info->default_eye_tracking_mode = def;
+	compose_mode_flags(head, &d, mark);
+	g_decision = d;
+	if (d.source == XRT_VIEWER_SOURCE_PROVIDER) {
+		g_provider_index = 0;
+	}
+	unlock();
+	char label[96];
+	target_viewer_source_label(&d, label, sizeof(label));
+	U_LOG_W(
+	    "viewer tracking (ADR-066 Part B): primary screen setting '%s' -> viewer source = %s%s (advertisement "
+	    "recomposed before any session)",
+	    target_viewer_setting_str(d.setting), label,
+	    mark ? ", XR_DXR_display_info advertises MANAGED|MANUAL" : ", no tracking advertised");
+}
+
+static bool
+update_screens_impl(const struct xrt_screen_list *list, const struct xrt_dp_factory_registry *reg)
+{
+	if (list == NULL) {
+		return false;
+	}
+	const uint64_t gen = u_setting_per_screen_generation();
 	struct target_viewer_decision primary;
 	const bool have_primary = target_viewer_tracking_get_decision(&primary);
 	struct target_viewer_screen_decision now[TARGET_VIEWER_MAX_SCREENS];
@@ -865,6 +1161,7 @@ target_viewer_tracking_update_screens(const struct xrt_screen_list *list, const 
 	memcpy(g_screens, now, sizeof(now));
 	g_screen_count = n;
 	g_have_screens = true;
+	g_settings_gen = gen;
 	g_primary_screen_id = 0;
 	for (uint32_t i = 0; i < n; i++) {
 		if (now[i].is_primary) {
@@ -876,27 +1173,36 @@ target_viewer_tracking_update_screens(const struct xrt_screen_list *list, const 
 	}
 	unlock();
 
-	// One WARN per screen whose answer changed (hotplug / re-probe only — never per frame).
+	// One WARN per screen whose answer changed (hotplug / re-probe / a setting — never per frame).
+	bool any = false;
 	for (uint32_t i = 0; i < n; i++) {
 		bool same = false;
 		for (uint32_t k = 0; had && k < prev_n && !same; k++) {
 			same = prev[k].screen_id == now[i].screen_id && prev[k].d.source == now[i].d.source &&
 			       strcmp(prev[k].d.provider_id, now[i].d.provider_id) == 0 &&
-			       prev[k].offset_m[0] == now[i].offset_m[0] && prev[k].offset_m[1] == now[i].offset_m[1];
+			       prev[k].offset_m[0] == now[i].offset_m[0] && prev[k].offset_m[1] == now[i].offset_m[1] &&
+			       prev[k].d.setting == now[i].d.setting && prev[k].d.tracked_2d == now[i].d.tracked_2d &&
+			       prev[k].d.tracked_3d == now[i].d.tracked_3d;
 		}
 		if (same) {
 			continue;
 		}
+		any = true;
 		char label[96];
 		target_viewer_source_label(&now[i].d, label, sizeof(label));
-		U_LOG_W("viewer tracking (ADR-054 N6): screen 0x%016llx%s viewer source = %s (display policy %s%s%s)",
-		        (unsigned long long)now[i].screen_id, now[i].is_primary ? " (primary)" : "", label,
-		        target_viewer_policy_str(now[i].d.dp_policy), now[i].d.reason[0] ? "; " : "", now[i].d.reason);
+		U_LOG_W(
+		    "viewer tracking (ADR-054 N6): screen 0x%016llx%s viewer source = %s (display policy %s; viewer "
+		    "tracking %s -> %s%s%s)",
+		    (unsigned long long)now[i].screen_id, now[i].is_primary ? " (primary)" : "", label,
+		    target_viewer_policy_str(now[i].d.dp_policy), target_viewer_setting_str(now[i].d.setting),
+		    target_viewer_setting_str(now[i].d.effective_setting), now[i].d.reason[0] ? "; " : "",
+		    now[i].d.reason);
 		if (now[i].d.source == XRT_VIEWER_SOURCE_PROVIDER && !now[i].is_primary) {
 			U_LOG_W("viewer tracking:   offset from the primary's display space = (%.4f, %.4f, %.4f) m",
 			        (double)now[i].offset_m[0], (double)now[i].offset_m[1], (double)now[i].offset_m[2]);
 		}
 	}
+	return any || (had && prev_n != n);
 }
 
 uint32_t
@@ -1130,6 +1436,9 @@ start_locked(void)
 		u_eye_history_init(&g_ring);
 		g_ring_ready = true;
 	}
+	if (g_hosting == VT_HOSTING_LOCAL) {
+		g_local_demand_ns = (int64_t)os_monotonic_get_ns(); // renewed by every viewer request (idle stop)
+	}
 #ifdef VT_HAVE_PAGE
 	if (g_hosting == VT_HOSTING_OWNER_HOST) {
 		if (g_host == NULL) {
@@ -1224,6 +1533,14 @@ lookup_locked(uint64_t screen_id, struct target_viewer_decision *out_d, float ou
 {
 	out_offset[0] = out_offset[1] = out_offset[2] = 0.0f;
 	if (screen_id == XRT_VIEWER_SCREEN_PRIMARY || (g_primary_screen_id != 0 && screen_id == g_primary_screen_id)) {
+		// The primary's table entry: the instance's decision unless its
+		// viewer-tracking setting moved since (ADR-066 Part B: live views).
+		for (uint32_t i = 0; g_have_screens && i < g_screen_count; i++) {
+			if (g_screens[i].is_primary) {
+				*out_d = g_screens[i].d;
+				return true;
+			}
+		}
 		if (!g_have_decision) {
 			return false;
 		}
@@ -1252,6 +1569,88 @@ vt_get_source(struct xrt_viewer_tracking *vt, uint64_t screen_id)
 	const bool have = lookup_locked(screen_id, &d, off);
 	unlock();
 	return have ? d.source : XRT_VIEWER_SOURCE_DP;
+}
+
+/*!
+ * LOCAL hosting has no supervisor: stop the provider (close its camera) once
+ * no viewer was requested for the host's idle-stop time — after a switch to
+ * the 2D slot on a `3d` screen, or a screen turned off live. Driven by the
+ * locate path's own calls, so it runs while an app keeps rendering. The
+ * debounce (the same 10 s as the host's) keeps a quick 2D/3D flip from
+ * cycling the camera. Caller holds the lock.
+ */
+static void
+local_idle_check_locked(int64_t now)
+{
+	if (g_hosting != VT_HOSTING_LOCAL || !g_started || g_provider_index < 0 || g_local_demand_ns == 0) {
+		return;
+	}
+	struct target_vhost_sup_config cfg;
+	target_vhost_sup_config_defaults(&cfg);
+	if (cfg.idle_stop_ns <= 0 || now - g_local_demand_ns < (int64_t)cfg.idle_stop_ns) {
+		return;
+	}
+	const struct xrt_tracking_plugin_iface *iface = target_tracking_plugin_get_iface(g_provider_index);
+	if (iface != NULL) {
+		iface->stop(target_tracking_plugin_get_instance(g_provider_index));
+	}
+	g_started = false;
+	if (g_ring_ready) {
+		u_eye_history_clear(&g_ring);
+	}
+	U_LOG_W(
+	    "viewer tracking: provider '%s' stopped — idle, no viewer requested for %lld s (2D slot of a '3d' "
+	    "screen, or tracking turned off); the next request starts it again",
+	    target_tracking_plugin_get_row_id(g_provider_index),
+	    (long long)((now - g_local_demand_ns) / ((int64_t)1000 * 1000 * 1000)));
+	g_local_demand_ns = 0;
+}
+
+static enum xrt_viewer_source
+vt_get_source_mode(struct xrt_viewer_tracking *vt, uint64_t screen_id, enum xrt_viewer_mode mode)
+{
+	(void)vt;
+	struct target_viewer_decision d;
+	float off[3];
+	lock();
+	const bool have = lookup_locked(screen_id, &d, off);
+	const enum xrt_viewer_source src =
+	    have ? target_viewer_source_for_mode(&d, (uint32_t)mode) : XRT_VIEWER_SOURCE_DP;
+	if (src != XRT_VIEWER_SOURCE_PROVIDER) {
+		local_idle_check_locked((int64_t)os_monotonic_get_ns());
+	}
+	unlock();
+	return src;
+}
+
+bool
+target_viewer_tracking_tracked_modes(uint64_t screen_id, struct xrt_viewer_tracked_modes *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	out->provider = out->tracked_2d = out->tracked_3d = false;
+	struct target_viewer_decision d;
+	float off[3];
+	lock();
+	const bool have = lookup_locked(screen_id, &d, off);
+	unlock();
+	if (!have) {
+		return false;
+	}
+	if (d.source == XRT_VIEWER_SOURCE_PROVIDER) {
+		out->provider = true;
+		out->tracked_2d = d.tracked_2d;
+		out->tracked_3d = d.tracked_3d;
+	}
+	return true;
+}
+
+static bool
+vt_get_tracked_modes(struct xrt_viewer_tracking *vt, uint64_t screen_id, struct xrt_viewer_tracked_modes *out)
+{
+	(void)vt;
+	return target_viewer_tracking_tracked_modes(screen_id, out);
 }
 
 static bool
@@ -1303,6 +1702,8 @@ vt_get_eyes_at(struct xrt_viewer_tracking *vt, uint64_t screen_id, int64_t targe
 static struct xrt_viewer_tracking g_vt = {
     .get_source = vt_get_source,
     .get_eyes_at = vt_get_eyes_at,
+    .get_source_mode = vt_get_source_mode,
+    .get_tracked_modes = vt_get_tracked_modes,
 };
 
 struct xrt_viewer_tracking *
@@ -1495,6 +1896,12 @@ target_viewer_tracking_shutdown(void)
 	g_hosting = VT_HOSTING_UNRESOLVED;
 	g_page_usable = false;
 	g_page_provider[0] = '\0';
+	g_page_avail_flags = 0;
+	g_page_avail_reason = 0;
+	g_page_avail_detail[0] = '\0';
+	g_local_demand_ns = 0;
+	g_settings_gen = 0;
+	g_marked_modes = 0;
 	if (g_ring_ready) {
 		u_eye_history_clear(&g_ring);
 	}

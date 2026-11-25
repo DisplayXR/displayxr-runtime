@@ -8,6 +8,7 @@
 
 #include "target_screen_modes.h"
 #include "target_plugin_loader.h"
+#include "target_viewer_tracking.h" // ADR-066 Part B: each screen's tracked modes
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_device.h"
@@ -192,6 +193,39 @@ list_source_str(uint32_t s)
 	}
 }
 
+/*!
+ * ADR-066 Part B x ADR-047 Amendment 10: each screen's per-entry tracking
+ * capability follows ITS viewer-tracking decision. Where a provider serves the
+ * screen (target_viewer_tracking_tracked_modes), its 3D entries are tracked
+ * iff the provider drives the 3D slot and its 2D entry iff it drives 2D under
+ * an explicit `always` - the rule compose_mode_flags applies to the head
+ * device. Where none does, the display's own per-entry flags stand (its DP's
+ * tracker, sim-display's fake / webcam source).
+ */
+static void
+apply_tracked_modes(struct u_screen_mode_table *tables, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		struct u_screen_mode_table *t = &tables[i];
+		struct xrt_viewer_tracked_modes tm;
+		if (!target_viewer_tracking_tracked_modes(t->screen_id, &tm) || !tm.provider) {
+			continue;
+		}
+		const bool always =
+		    u_setting_get_viewer_tracking_for_screen(t->key, NULL) == U_SETTING_VIEWER_TRACKING_ALWAYS;
+		for (uint32_t j = 0; j < t->count && j < XRT_MAX_RENDERING_MODES; j++) {
+			struct xrt_rendering_mode *m = &t->modes[j];
+			const bool is_3d = m->hardware_display_3d || m->view_count > 1;
+			const bool tracked = is_3d ? tm.tracked_3d : (tm.tracked_2d && always);
+			if (tracked) {
+				m->mode_flags |= XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
+			} else {
+				m->mode_flags &= ~XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
+			}
+		}
+	}
+}
+
 void
 target_screen_modes_publish(const struct xrt_screen_list *list,
                             const struct xrt_dp_factory_registry *reg,
@@ -207,6 +241,7 @@ target_screen_modes_publish(const struct xrt_screen_list *list,
 	}
 	const uint32_t n = target_screen_modes_build(list, reg, head, tables, U_SCREEN_MODES_MAX_SCREENS);
 	apply_stored_choices(tables, n, initial);
+	apply_tracked_modes(tables, n);
 	const uint32_t nb = u_screen_modes_get_all(before, U_SCREEN_MODES_MAX_SCREENS);
 	u_screen_modes_set_choice_resolver(target_screen_modes_choice);
 	u_screen_modes_publish(tables, n);

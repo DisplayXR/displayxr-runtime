@@ -794,8 +794,8 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 
 	const cJSON *sc = cJSON_GetArrayItem(cJSON_GetObjectItem(d.root, "screens"), 0);
 	CHECK(keys(sc) == V{"id", "index", "device_name", "friendly_name", "key", "edid", "desktop", "native",
-	                    "physical_mm", "roles", "claim", "layout", "eye_tracking", "mode", "mode_3d", "dps",
-	                    "vendor", "warnings"});
+	                    "physical_mm", "roles", "claim", "layout", "eye_tracking", "viewer_tracking", "mode",
+	                    "mode_3d", "dps", "vendor", "warnings"});
 	CHECK(str(sc, "id") == "0x8c413a2f61152ce7");
 	CHECK(keys(cJSON_GetObjectItem(sc, "edid")) == V{"manufacturer", "product", "serial"});
 	CHECK(keys(cJSON_GetObjectItem(sc, "desktop")) == V{"left", "top", "width", "height", "scale"});
@@ -1204,4 +1204,51 @@ TEST_CASE("status: text shows the §7 sections", "[status][text]")
 	CHECK(t.find("roles: OS main · runtime default") != std::string::npos);
 	CHECK(t.find("WINDOWS") != std::string::npos);
 	CHECK(t.find("[info] SERVICE_HEADLESS") != std::string::npos);
+}
+
+TEST_CASE("status: per-screen viewer_tracking object (ADR-066 Part B)", "[status][json][viewer_tracking]")
+{
+	auto s = healthy();
+	// Screen A: a laptop-style screen set to 3d, served by the provider, in the 3D mode right now.
+	xrt_status_viewer_tracking &a = s->screens[0].eye_tracking.viewer_tracking;
+	a.evaluated = true;
+	SET(a.setting, "3d");
+	SET(a.setting_source, "user");
+	SET(a.effective, "3d");
+	a.tracked_3d = true;
+	a.available = true;
+	SET(a.reason, "webcam 'Integrated Camera'");
+	SET(a.provider, "sim-tracking");
+	s->screens[0].mode = {true, 1, "3D", 2, true};
+	// Screen B: a panel that tracks the viewer itself: not offered.
+	xrt_status_viewer_tracking &b = s->screens[1].eye_tracking.viewer_tracking;
+	b.evaluated = true;
+	SET(b.setting, "default");
+	SET(b.setting_source, "default");
+	SET(b.effective, "off");
+	SET(b.reason, "this display tracks the viewer itself");
+
+	json_doc d(*s);
+	const cJSON *screens = cJSON_GetObjectItem(d.root, "screens");
+	const cJSON *va = cJSON_GetObjectItem(cJSON_GetArrayItem(screens, 0), "viewer_tracking");
+	CHECK(keys(va) == std::vector<std::string>{"setting", "setting_source", "effective", "tracked", "current_mode",
+	                                           "active", "provider", "available", "reason", "detail"});
+	CHECK(str(va, "setting") == "3d");
+	CHECK(str(va, "effective") == "3d");
+	CHECK(str(va, "current_mode") == "3d");
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(va, "active")));
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(cJSON_GetObjectItem(va, "tracked"), "2d")));
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetObjectItem(va, "tracked"), "3d")));
+	CHECK(str(va, "provider") == "sim-tracking");
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(va, "available")));
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(va, "reason")));
+	CHECK(str(va, "detail") == "webcam 'Integrated Camera'");
+
+	const cJSON *vb = cJSON_GetObjectItem(cJSON_GetArrayItem(screens, 1), "viewer_tracking");
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(vb, "available")));
+	CHECK(str(vb, "reason") == "this display tracks the viewer itself");
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(vb, "detail")));
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(vb, "current_mode"))); // no session on it: no mode
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(vb, "active")));
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(vb, "provider")));
 }

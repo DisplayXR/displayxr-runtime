@@ -1,0 +1,98 @@
+#!/bin/sh
+# displayxr-restart-service — restart a RUNNING displayxr.service (the systemd
+# USER unit, socket-activated by displayxr.socket) so it runs the binaries and
+# plug-ins now on disk. Never starts one that is not running.
+#
+# Why it exists. A package upgrade replaces the runtime and the plug-ins on
+# disk, but a service that is already running keeps the old ones mapped. The
+# client/service version gate then refuses every client of the NEW version
+# ("DisplayXR client library version vB does not match service version vA"),
+# and the running service never goes idle while a long-lived client (a
+# workspace controller, the browser, the dashboard's status watch) keeps it
+# busy. Only a restart fixes that; an idle box is unaffected because the next
+# connect socket-activates the new binary anyway.
+#
+# Who calls it.
+#   * displayxr-runtime's own .deb postinst (configure), after daemon-reload.
+#   * any sibling .deb that ships something the service LOADS (a display
+#     processor, input / conversion / tracking provider), from its postinst
+#     (configure) and postrm (remove), guarded so it is a no-op without the
+#     runtime:
+#         if [ -x /usr/lib/displayxr/bin/displayxr-restart-service ]; then
+#             /usr/lib/displayxr/bin/displayxr-restart-service || true
+#         fi
+#   * the tarball's install.sh, with `stop`, BEFORE it copies over the
+#     binaries (a running executable cannot be overwritten in place).
+#
+# What a restart costs. The clients attached to the old service are cut off.
+# They are old-version clients: a reconnect from the same process would be
+# refused by the new service's version gate too, so they need relaunching
+# after an upgrade whichever way this goes. Restarting makes every NEW launch
+# work immediately instead of failing until the last old client exits.
+#
+# Usage:  displayxr-restart-service [try-restart|stop]     (default try-restart)
+#   As root: acts in every user manager running right now (systemctl --user
+#   --machine=USER@, systemd >= 248; Ubuntu 22.04 has 249). As a user: acts in
+#   that user's own manager. Best effort: always exits 0, so a maintainer
+#   script never fails on it; a box without systemd (a container) is a no-op.
+#
+# DXR_NO_SERVICE_RESTART=1 skips it (prints what it would have done), for an
+# admin who wants to restart a live session by hand later.
+
+ACTION="${1:-try-restart}"
+case "$ACTION" in
+try-restart | stop) : ;;
+-h | --help)
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+*)
+    echo "displayxr-restart-service: unknown action '$ACTION' (try-restart|stop)" >&2
+    exit 0
+    ;;
+esac
+
+# Both overridable ONLY for tests (scripts/linux/test_restart_service.sh: a
+# probe unit in a real user manager, a fake /run/user with fake systemctl).
+UNIT="${DXR_SERVICE_UNIT:-displayxr.service}"
+RUN_USER_DIR="${DXR_RUN_USER_DIR:-/run/user}"
+
+command -v systemctl >/dev/null 2>&1 || exit 0
+
+# $1: label for messages; rest: the systemctl prefix that reaches that manager.
+act_in() {
+    label="$1"
+    shift
+    if ! timeout 10 "$@" is-active --quiet "$UNIT" >/dev/null 2>&1; then
+        return 0 # not running: socket activation starts the new binary on use
+    fi
+    if [ "${DXR_NO_SERVICE_RESTART:-0}" = 1 ]; then
+        echo "displayxr: $UNIT is running for $label on the previous version; NOT restarted (DXR_NO_SERVICE_RESTART=1)."
+        echo "  New DisplayXR clients will be refused until:  systemctl --user restart $UNIT"
+        return 0
+    fi
+    # try-restart, not restart: if it exited between the check and here, leave
+    # it to socket activation. TimeoutStopSec=10s bounds the stop half.
+    if timeout 30 "$@" "$ACTION" "$UNIT" >/dev/null 2>&1; then
+        if [ "$ACTION" = stop ]; then
+            echo "displayxr: stopped $UNIT for $label (the next client starts the new version)"
+        else
+            echo "displayxr: restarted $UNIT for $label on the installed version"
+        fi
+    else
+        echo "displayxr: could not $ACTION $UNIT for $label; run:  systemctl --user restart $UNIT" >&2
+    fi
+}
+
+if [ "$(id -u)" != 0 ]; then
+    act_in "$(id -un 2>/dev/null || echo this user)" systemctl --user
+    exit 0
+fi
+
+command -v loginctl >/dev/null 2>&1 || exit 0
+for dxr_user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+    dxr_uid="$(id -u "$dxr_user" 2>/dev/null)" || continue
+    [ -d "$RUN_USER_DIR/$dxr_uid/systemd" ] || continue
+    act_in "user $dxr_user" systemctl --user --machine="$dxr_user@"
+done
+exit 0

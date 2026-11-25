@@ -59,6 +59,14 @@
 #include "android/android_globals.h"
 #endif // XRT_OS_ANDROID
 
+/*
+ * The service's version when the last ipc_client_connection_init() on this
+ * process was refused by the git-tag gate; empty otherwise. Read by
+ * diagnostics (displayxr-cli) so they can name both versions instead of
+ * reporting "no service reachable" while one is running.
+ */
+static char g_skew_service_git_tag[IPC_VERSION_NAME_LEN];
+
 DEBUG_GET_ONCE_BOOL_OPTION(ipc_ignore_version, "IPC_IGNORE_VERSION", false)
 
 #ifdef XRT_OS_LINUX_DESKTOP
@@ -1080,6 +1088,8 @@ ipc_client_check_git_tag(struct ipc_connection *ipc_c)
 
 	IPC_ERROR(ipc_c, "DisplayXR client library version %s does not match service version %s", u_git_tag,
 	          ipc_c->ism->u_git_tag);
+	snprintf(g_skew_service_git_tag, sizeof(g_skew_service_git_tag), "%.*s", (int)(IPC_VERSION_NAME_LEN - 1),
+	         ipc_c->ism->u_git_tag);
 
 	if (!debug_get_bool_option_ipc_ignore_version()) {
 		IPC_ERROR(ipc_c, "Set IPC_IGNORE_VERSION=1 to ignore this version conflict");
@@ -1224,12 +1234,20 @@ ipc_client_connection_handshake_timed_out(void)
 #endif
 }
 
+const char *
+ipc_client_connection_skew_service_version(void)
+{
+	return g_skew_service_git_tag[0] != '\0' ? g_skew_service_git_tag : NULL;
+}
+
 xrt_result_t
 ipc_client_connection_init(struct ipc_connection *ipc_c,
                            enum u_logging_level log_level,
                            const struct xrt_instance_info *i_info)
 {
 	xrt_result_t xret;
+
+	g_skew_service_git_tag[0] = '\0';
 
 	U_ZERO(ipc_c);
 	ipc_c->imc.ipc_handle = XRT_IPC_HANDLE_INVALID;
