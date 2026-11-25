@@ -179,7 +179,8 @@
           "locations": [
             { "file": "CMakeLists.txt",                "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" },
             { "file": ".github/workflows/build.yml",   "kind": "yaml_env",  "key": "RUNTIME_REF" },
-            { "file": ".github/workflows/release.yml", "kind": "yaml_env",  "key": "RUNTIME_REF" }
+            { "file": ".github/workflows/release.yml", "kind": "yaml_env",  "key": "RUNTIME_REF" },
+            { "file": ".github/workflows/runtime-range.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }
           ]
         }
       }
