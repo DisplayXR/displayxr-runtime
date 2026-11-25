@@ -296,6 +296,22 @@ instance-level `xrWeaveExportIpcConnectionDXR` has no session to lose; its error
 | `XR_ERROR_INSTANCE_LOST` | The IPC connection to the service is **gone** (the service exited, crashed, or was restarted under a live client). | **No.** The session is marked lost. |
 | `XR_ERROR_SESSION_LOST` | Any call *after* an `XR_ERROR_INSTANCE_LOST`. | No. |
 
+**A dead bound window refuses until rebound (Windows, browser-pvt#378).** When the window
+bound with `xrWeaveBindWindowDXR` stops being a window (closed, or its handle now names
+another process's window), every later `xrWeaveSubmitDXR` and
+`xrWeaveSetScreenFlatRegionsDXR` on that session returns `XR_ERROR_RUNTIME_FAILURE` — a
+persistent run of the refusal above, not a one-frame miss. The session is still usable:
+binding a live window on it (`xrWeaveBindWindowDXR` again; replacing the bound window on a
+live session is allowed) clears the refusal at once, and so does the reconnect below, which
+binds afresh. A caller that only counts consecutive refusals reaches its reconnect path this
+way, which is the point: before #378 the service kept accepting submits for the dead window
+at the rect's extent, nothing failed, and a caller that never rebinds never recovered. The
+service logs one WARN per binding (`#378 weave: … bound present-owner window … no longer a
+window`). `DXR_WEAVE_REFUSE_DEAD_WINDOW=0` in the **service's** environment restores the old
+accept-and-weave behaviour (the WARN stays). macOS, Linux and Android are unaffected: their
+services never read the window id (geometry arrives explicitly), so there is no dead-window
+state to detect.
+
 The `INSTANCE_LOST` / `SESSION_LOST` behaviour is what every other IPC-backed OpenXR
 call in the runtime (`xrEndFrame`, `xrLocateViews`, `xrSyncActions`, `xrPollEvent`) has
 always done; the weave entry points joined it in browser#103, having previously reported

@@ -8044,6 +8044,10 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 		// caller is still writing the shared input and the submit is retried
 		// next frame. Reporting XRT_ERROR_IPC_FAILURE would make the state
 		// tracker declare the session lost over a perfectly healthy pipe.
+		// browser-pvt#378: the one PERSISTENT producer — a bound window that
+		// has died refuses every submit until the client rebinds — rides the
+		// same code on purpose: the client's refusal streak is what sends it
+		// to its reconnect path, and the session itself is still healthy.
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	*out_have_output = true;

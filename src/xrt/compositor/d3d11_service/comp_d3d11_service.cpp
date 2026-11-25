@@ -1418,6 +1418,19 @@ struct d3d11_service_compositor
 	//! is sticky (`weave_dp_refused`) and the frames are 60+/s.
 	std::atomic<bool> weave_dp_missing_logged{false};
 
+	//! browser-pvt#378: the bound present-owner window has stopped being a
+	//! window (closed, or its handle now names another process's window). Set by
+	//! svc_weave_bound_window_dead() on the client's own IPC thread, cleared by
+	//! the next weave_bind_window on that same thread — the only two writers and
+	//! readers, so no lock and no atomic. While set, weave_submit and the sticky
+	//! screen-flat latch REFUSE (XRT_ERROR_WEAVE_REFUSED), so a client that never
+	//! rebinds trips its own failure streak and reconnects, instead of weaving
+	//! for a dead rect forever. `weave_hwnd_pid` is the window's owner at bind
+	//! time (0 = unknown): Windows recycles HWND values, so IsWindow alone could
+	//! call a reused handle alive.
+	DWORD weave_hwnd_pid = 0;
+	bool weave_hwnd_dead = false;
+
 	//! Weave-idle release: monotonic ns of this present-owner's last
 	//! xrWeaveSubmitDXR (0 = never). Written by the submit (IPC thread), read by
 	//! the render thread — see pipeline_weave_idle_release_if_due.
@@ -31835,6 +31848,9 @@ comp_d3d11_service_weave_set_overlay_filter_strength(struct xrt_compositor *xc, 
 	c->render.weave_overlay_filter_strength_next = (strength >= 0.0f && strength <= 1.0f) ? strength : -1.0f;
 }
 
+static bool
+svc_weave_bound_window_dead(struct d3d11_service_compositor *c, const char *who);
+
 bool
 comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
                                                  uint32_t rect_count,
@@ -31849,6 +31865,13 @@ comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_service_system *sys = c->sys;
 	if (sys == nullptr) {
+		return false;
+	}
+	// browser-pvt#378: a latch for a dead window can never be republished, and
+	// answering it "success" is what kept an unfixed client's failure streak
+	// from ever tripping (this call repeats while the page is up). Refuse it,
+	// like the submit, until the client binds a live window.
+	if (svc_weave_bound_window_dead(c, "sticky flat latch")) {
 		return false;
 	}
 
@@ -31949,20 +31972,130 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
 		        (void *)(uintptr_t)hwnd);
 		return false;
 	}
-	c->render.weave_hwnd = (HWND)(uintptr_t)hwnd;
-	// #964: binding a window IS the declaration "I am a present-owner". There
-	// is no earlier signal the compositor can see (the session info carries no
-	// present-owner bit), so this is the switch. From here the pipeline never
-	// draws or presents for this client — it only hands it the panel.
-	if (pipeline_always_on(c->sys) && c->render.weave_hwnd != nullptr) {
-		c->presenter = PRESENTER_SELF;
-		U_LOG_W("[pipeline] presenter=SELF (present-owner) hwnd=%p", (void *)c->render.weave_hwnd);
+	// browser-pvt#378: the owner at bind time, so a recycled handle reads dead.
+	// Queried before the lock: neither call sends a message to the window.
+	DWORD pid = 0;
+	if (hwnd != 0) {
+		(void)GetWindowThreadProcessId((HWND)(uintptr_t)hwnd, &pid);
 	}
+
+	/*
+	 * browser-pvt#378: REPLACING the bound window on a live session is legal
+	 * (the browser rebinds a torn-off tab's window), and other threads read
+	 * `render.weave_hwnd` and `presenter` while it happens: the render thread
+	 * (presenter selection, panel lease, focus), and a sibling session's weave /
+	 * snap (svc_weave_snap_owner, the windowless-DP owner search), all under
+	 * render_mutex. So write them under it too.
+	 *
+	 * Lock order: this takes render_mutex with NOTHING held — the IPC handler
+	 * calls in bare, and it runs on this client's own IPC thread, the same one
+	 * that runs its weave_submit, so a bind can never overlap this session's
+	 * own submit at all. Nothing below calls into the vendor SDK or takes
+	 * another lock, so the documented orders (`c->mutex` -> render_mutex ->
+	 * clients_mutex / immediate_ctx_mutex) cannot be inverted from here. The
+	 * screen offer the handler makes after a successful bind runs after this
+	 * function has returned, i.e. outside the lock.
+	 */
+	{
+		render_mutex_fair_lock lock(c->sys);
+		c->render.weave_hwnd = (HWND)(uintptr_t)hwnd;
+		// #964: binding a window IS the declaration "I am a present-owner". There
+		// is no earlier signal the compositor can see (the session info carries no
+		// present-owner bit), so this is the switch. From here the pipeline never
+		// draws or presents for this client — it only hands it the panel.
+		if (pipeline_always_on(c->sys) && c->render.weave_hwnd != nullptr) {
+			c->presenter = PRESENTER_SELF;
+			U_LOG_W("[pipeline] presenter=SELF (present-owner) hwnd=%p", (void *)c->render.weave_hwnd);
+		}
+	}
+	// browser-pvt#378: a live (or cleared) binding ends any dead-window refusal.
+	// Client IPC thread only, like the check that sets it.
+	if (c->weave_hwnd_dead) {
+		U_LOG_W("#378 weave: '%s' rebound to a live window — the dead-window refusal is cleared",
+		        c->slot_app_name);
+	}
+	c->weave_hwnd_dead = false;
+	c->weave_hwnd_pid = pid;
 	// NB: do NOT force 3D here — that would fire before the SR init settle window
 	// (#140 premature-flip → vendor poll demotes it). weave_force_3d_if_needed()
 	// in weave_submit does it deferred + self-healing once frames are flowing.
-	U_LOG_W("#625 weave: bound present-owner window hwnd=%p", (void *)c->render.weave_hwnd);
+	U_LOG_W("#625 weave: bound present-owner window hwnd=%p", (void *)(uintptr_t)hwnd);
 	return true;
+}
+
+/*!
+ * browser-pvt#378: DXR_WEAVE_REFUSE_DEAD_WINDOW (default 1). 0 keeps accepting
+ * a present-owner's submits after its bound window has died (the pre-#378
+ * behaviour: it weaves for a rect nobody can see, and a client that never
+ * rebinds never finds out); the once-per-binding WARN is still logged.
+ */
+static bool
+svc_weave_refuse_dead_window(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_WEAVE_REFUSE_DEAD_WINDOW");
+		on = (e != nullptr && e[0] == '0') ? 0 : 1;
+		if (on == 0) {
+			U_LOG_W(
+			    "DXR_WEAVE_REFUSE_DEAD_WINDOW=0: a present-owner whose bound window has died keeps "
+			    "having its weave submits accepted (#378 refusal off)");
+		}
+	}
+	return on == 1;
+}
+
+/*!
+ * browser-pvt#378: is this present-owner's bound window gone, and should its
+ * weave calls be refused for it?
+ *
+ * A present-owner binds one top-level window (weave_bind_window) and the
+ * service anchors the panel lease, wish mask and phase to it. When that window
+ * is closed while the client keeps submitting — the DisplayXR Browser's tab
+ * torn off into a second window, then the first window closed — nothing used
+ * to notice: GetClientRect failed, the submit fell back to the rect extent and
+ * kept weaving, every sticky latch logged "no usable window rect", and the
+ * client, seeing only successes, never reconnected (its reconnect path is the
+ * one that re-resolves the window). Refusing is the signal it does read:
+ * consecutive XR_ERROR_RUNTIME_FAILUREs trip its failure streak, and the
+ * reconnect binds the window that is alive.
+ *
+ * Client IPC thread only (the submit and the sticky latch both run there, as
+ * does the bind that clears the state). IsWindow / GetWindowThreadProcessId
+ * are user32 handle-table lookups that send no message, so the per-submit cost
+ * is negligible. One WARN per binding, never per frame.
+ *
+ * @return true when the call should be refused (window dead and the refusal
+ *         not disabled by DXR_WEAVE_REFUSE_DEAD_WINDOW=0).
+ */
+static bool
+svc_weave_bound_window_dead(struct d3d11_service_compositor *c, const char *who)
+{
+	HWND h = c->render.weave_hwnd;
+	if (h == nullptr) {
+		return false; // no bound window: nothing to have died (unbound clients unchanged)
+	}
+	if (!c->weave_hwnd_dead) {
+		DWORD pid = 0;
+		const bool is_window = IsWindow(h) != FALSE;
+		if (is_window) {
+			(void)GetWindowThreadProcessId(h, &pid);
+		}
+		if (is_window && (c->weave_hwnd_pid == 0 || pid == c->weave_hwnd_pid)) {
+			return false;
+		}
+		c->weave_hwnd_dead = true;
+		const bool refuse = svc_weave_refuse_dead_window();
+		U_LOG_W(
+		    "#378 weave: '%s' bound present-owner window hwnd=%p is %s (seen at %s) — %s. A client "
+		    "that rebinds a live window (xrWeaveBindWindowDXR) clears this (once per binding)",
+		    c->slot_app_name, (void *)h,
+		    is_window ? "now another process's window (handle recycled)" : "no longer a window", who,
+		    refuse ? "REFUSING its weave submits and sticky flat latches (XRT_ERROR_WEAVE_REFUSED) so "
+		             "it reconnects and re-resolves its window"
+		           : "still accepting them (DXR_WEAVE_REFUSE_DEAD_WINDOW=0)");
+	}
+	return svc_weave_refuse_dead_window();
 }
 
 //! DIAGNOSTIC ONLY (browser#73) — dump a D3D11 texture to %TEMP%\<name>.png.
@@ -33058,6 +33191,15 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// serialized — no concurrent immediate-context / DP use.
 	HANDLE in = (HANDLE)in_handle;
 	if (in == nullptr || in == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+
+	// browser-pvt#378: the bound window is gone. Refuse BEFORE building a DP or
+	// taking the lock — there is nothing to weave for, and the refusal (not a
+	// silent success at the rect's extent) is what makes the client reconnect
+	// and re-resolve its window. The handle owners above close this submit's
+	// handles on the way out.
+	if (svc_weave_bound_window_dead(c, "weave_submit")) {
 		return false;
 	}
 

@@ -277,7 +277,10 @@ typedef enum xrt_result
 	 * writing the shared input): the submit is simply retried on the next
 	 * frame, and a present-owner that treated it as fatal would tear down a
 	 * perfectly good session. Bind / geometry / flat-region refusals ride the
-	 * same code for the same reason.
+	 * same code for the same reason, and so does the one persistent case: a
+	 * present-owner whose bound window has died is refused on every submit
+	 * until it binds a live one (browser-pvt#378) — a run of these, not a
+	 * dead pipe, is what tells such a client to reconnect.
 	 *
 	 * Do NOT use @ref XRT_ERROR_IPC_FAILURE for this — that one means "the
 	 * transport is gone", and @ref OXR_CHECK_XRET maps it to `has_lost` +
