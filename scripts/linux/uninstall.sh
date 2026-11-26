@@ -107,6 +107,22 @@ if [ "$SYSTEM" = 0 ]; then
     fi
 fi
 
+# Hyprland (user-level): the bridge's unit and the managed window rules.
+if [ "$SYSTEM" = 0 ]; then
+    HGB_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/displayxr-hypr-geometry.service"
+    if [ -f "$HGB_UNIT" ]; then
+        if [ -d /run/systemd/system ]; then
+            systemctl --user disable --now displayxr-hypr-geometry.service >/dev/null 2>&1 || true
+        fi
+        rm -f "$HGB_UNIT"
+        [ -d /run/systemd/system ] && systemctl --user daemon-reload >/dev/null 2>&1 || true
+        echo "==> Removed the Hyprland window-geometry bridge"
+    fi
+    if [ -x "$PREFIX/bin/displayxr-hyprland-setup" ]; then
+        "$PREFIX/bin/displayxr-hyprland-setup" --remove || true
+    fi
+fi
+
 # DisplayXR Dashboard menu entry + icon.
 rm -f "$SHARE_ROOT/applications/displayxr-dashboard.desktop" \
     "$SHARE_ROOT/icons/hicolor/256x256/apps/displayxr-dashboard.png"

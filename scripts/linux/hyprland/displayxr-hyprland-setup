@@ -1,0 +1,154 @@
+#!/bin/bash
+# DisplayXR runtime — Hyprland (Omarchy) setup.
+#
+# Writes the DisplayXR window rules into the user's Hyprland config directory,
+# in the syntax the installed Hyprland reads, and checks the output scales.
+# install.sh runs it in a Hyprland session; run it again yourself after a
+# Hyprland upgrade (0.53 changed the window-rule syntax, 0.55 moved the config
+# to Lua).
+#
+#   displayxr-hyprland-setup            write ~/.config/hypr/displayxr.conf (or
+#                                       displayxr.lua) and print how to load it
+#   displayxr-hyprland-setup --source   also add `source = …` to hyprland.conf
+#                                       (hyprlang only) and reload Hyprland
+#   displayxr-hyprland-setup --remove   undo both
+#
+# Never edits hyprland.conf without --source: Omarchy keeps ~/.config/hypr as
+# the user's own files. Only touches files carrying the "managed" marker.
+#
+# Test overrides: DXR_HYPR_VERSION=0.54.0 (skip `hyprctl version`),
+# DXR_HYPR_FLAVOR=hyprlang|legacy|lua.
+# See docs/roadmap/omarchy-support.md.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PREFIX="$(cd "$HERE/.." && pwd)"
+TEMPLATES="$PREFIX/share/hyprland"
+HYPR_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
+MARKER="displayxr-hyprland-setup: managed"
+SOURCE_TAG="# DisplayXR (added by displayxr-hyprland-setup --source)"
+
+DO_SOURCE=0
+DO_REMOVE=0
+for arg in "$@"; do
+    case "$arg" in
+    --source) DO_SOURCE=1 ;;
+    --remove) DO_REMOVE=1 ;;
+    --templates=*) TEMPLATES="${arg#--templates=}" ;;
+    -h | --help) sed -n '2,22p' "$0"; exit 0 ;;
+    *) echo "Unknown option: $arg (supported: --source --remove --templates=DIR)" >&2; exit 2 ;;
+    esac
+done
+
+CONF="$HYPR_DIR/displayxr.conf"
+LUA="$HYPR_DIR/displayxr.lua"
+MAIN_CONF="$HYPR_DIR/hyprland.conf"
+SOURCE_LINE="source = $CONF"
+
+is_managed() { [ -f "$1" ] && grep -qF "$MARKER" "$1"; }
+
+remove_source_line() {
+    [ -f "$MAIN_CONF" ] || return 0
+    if grep -qxF "$SOURCE_LINE" "$MAIN_CONF"; then
+        local tmp
+        tmp="$(mktemp)"
+        grep -vxF -e "$SOURCE_TAG" -e "$SOURCE_LINE" "$MAIN_CONF" >"$tmp" || true
+        cat "$tmp" >"$MAIN_CONF" # keep the file's own inode, mode and symlinks
+        rm -f "$tmp"
+        echo "    removed the DisplayXR source line from $MAIN_CONF"
+    fi
+}
+
+if [ "$DO_REMOVE" = 1 ]; then
+    for f in "$CONF" "$LUA" "$CONF.new" "$LUA.new"; do
+        if is_managed "$f"; then
+            rm -f "$f"
+            echo "==> Removed $f"
+        fi
+    done
+    remove_source_line
+    exit 0
+fi
+
+# --- Which syntax ------------------------------------------------------------
+version="${DXR_HYPR_VERSION:-}"
+if [ -z "$version" ] && command -v hyprctl >/dev/null 2>&1; then
+    version="$(hyprctl version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+fi
+flavor="${DXR_HYPR_FLAVOR:-}"
+if [ -z "$flavor" ]; then
+    if [ -f "$HYPR_DIR/hyprland.lua" ]; then
+        flavor=lua
+    elif [ -n "$version" ]; then
+        minor="$(echo "$version" | cut -d. -f2)"
+        major="$(echo "$version" | cut -d. -f1)"
+        if [ "$major" -eq 0 ] && [ "$minor" -lt 53 ]; then
+            flavor=legacy
+        else
+            flavor=hyprlang
+        fi
+    else
+        flavor=hyprlang # unknown version: the current hyprlang syntax
+    fi
+fi
+case "$flavor" in
+lua) TEMPLATE="$TEMPLATES/displayxr.lua"; TARGET="$LUA"; OTHER="$CONF" ;;
+legacy) TEMPLATE="$TEMPLATES/displayxr-hyprlang-legacy.conf"; TARGET="$CONF"; OTHER="$LUA" ;;
+hyprlang) TEMPLATE="$TEMPLATES/displayxr-hyprlang.conf"; TARGET="$CONF"; OTHER="$LUA" ;;
+*) echo "error: DXR_HYPR_FLAVOR must be hyprlang, legacy or lua" >&2; exit 2 ;;
+esac
+[ -f "$TEMPLATE" ] || { echo "error: template $TEMPLATE not found" >&2; exit 1; }
+
+# --- Write the rules ---------------------------------------------------------
+mkdir -p "$HYPR_DIR"
+OUT="$TARGET"
+if [ -f "$TARGET" ] && ! is_managed "$TARGET"; then
+    OUT="$TARGET.new" # the user took it over: never overwrite their edits
+fi
+sed "s|@PREFIX@|$PREFIX|g" "$TEMPLATE" >"$OUT"
+echo "==> Hyprland window rules (${flavor}${version:+, Hyprland $version}): $OUT"
+if [ "$OUT" != "$TARGET" ]; then
+    echo "    $TARGET has your own edits (no managed marker): compare with the .new file"
+fi
+if is_managed "$OTHER"; then
+    rm -f "$OTHER" # the syntax changed (e.g. Hyprland moved to Lua)
+    [ "$flavor" = lua ] && remove_source_line
+fi
+
+# --- Load them ---------------------------------------------------------------
+if [ "$flavor" = lua ]; then
+    echo "    load it from hyprland.lua, e.g.:"
+    echo "        dofile(\"$LUA\")"
+elif [ "$DO_SOURCE" = 1 ]; then
+    if [ -f "$MAIN_CONF" ] && grep -qxF "$SOURCE_LINE" "$MAIN_CONF"; then
+        echo "    already sourced from $MAIN_CONF"
+    else
+        printf '\n%s\n%s\n' "$SOURCE_TAG" "$SOURCE_LINE" >>"$MAIN_CONF"
+        echo "    sourced from $MAIN_CONF"
+    fi
+    if command -v hyprctl >/dev/null 2>&1 && hyprctl reload >/dev/null 2>&1; then
+        echo "    Hyprland reloaded"
+    fi
+elif ! { [ -f "$MAIN_CONF" ] && grep -qxF "$SOURCE_LINE" "$MAIN_CONF"; }; then
+    echo "    to load it, add this line to $MAIN_CONF (or re-run with --source):"
+    echo "        $SOURCE_LINE"
+fi
+
+# --- Output scales -----------------------------------------------------------
+# XWayland apps (and the runtime's own X11 window) weave only on an output
+# Hyprland shows at scale 1: at any other scale XWayland's pixels are resampled
+# and the runtime presents 2D (the X11 1:1 gate). Native-Wayland apps convert
+# the scale through the geometry bridge, but scale 1 is still the safe setting.
+if command -v hyprctl >/dev/null 2>&1; then
+    scaled="$(hyprctl monitors 2>/dev/null | awk '
+        /^Monitor /{name=$2}
+        /^[ \t]+scale: /{ if ($2+0 != 1) printf "%s (%s) ", name, $2 }' || true)"
+    if [ -n "$scaled" ]; then
+        echo ""
+        echo "note: outputs not at scale 1: $scaled"
+        echo "      If the 3D panel is one of them, give it scale 1 in ~/.config/hypr/monitors.conf, e.g."
+        echo "          monitor = <connector>, preferred, auto, 1"
+        echo "      (displayxr-cli status names the panel's connector.)"
+    fi
+fi

@@ -50,6 +50,11 @@
 #   # green there. (The .deb deliberately ships without GL/EGL — see the Deb
 #   # job's comment.)
 #
+# Prerequisites (Arch Linux, Omarchy, SteamOS dev images): the same set, as
+# the "SteamOS + Omarchy (Arch)" CI job installs it:
+#   sudo pacman -S --needed git cmake ninja pkgconf python binutils #       vulkan-headers vulkan-icd-loader vulkan-validation-layers glslang #       eigen systemd-libs libxcb libx11 libxrandr libxxf86vm wayland dbus #       mesa libglvnd
+#   (dbus here is also what builds the Hyprland and KWin geometry bridges.)
+#
 #   NOTE: install the dependencies BEFORE the first configure. CMake caches a
 #   failed feature probe permanently, so a package installed afterwards is not
 #   picked up — and the mismatch can wedge the tree outright (see --clean).
@@ -106,6 +111,21 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Arch / Omarchy: name the missing build tools before CMake caches a failed probe.
+if [ -f /etc/arch-release ]; then
+    missing=""
+    for t in cmake ninja pkg-config glslangValidator; do
+        command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+    done
+    [ -f /usr/include/dbus-1.0/dbus/dbus.h ] || missing="$missing dbus-headers"
+    if [ -n "$missing" ]; then
+        echo "note: missing on this Arch system:$missing" >&2
+        echo "      sudo pacman -S --needed git cmake ninja pkgconf python binutils vulkan-headers \\" >&2
+        echo "          vulkan-icd-loader vulkan-validation-layers glslang eigen systemd-libs libxcb libx11 \\" >&2
+        echo "          libxrandr libxxf86vm wayland dbus mesa libglvnd" >&2
+    fi
+fi
 # BUILD_DIR is overridable so the tree can be built out-of-source — e.g. the
 # .deb Docker test (scripts/test_deb_linux.sh) builds into a container-local
 # dir to avoid colliding with a host build/ cache on the bind-mounted repo.

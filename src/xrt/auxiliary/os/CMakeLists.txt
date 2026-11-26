@@ -12,6 +12,8 @@
 add_library(
 	aux_os STATIC
 	os_documentation.h
+	os_hyprland.h
+	os_hyprland_parse.c
 	os_hid.h
 	os_hid_hidraw.c
 	os_threading.h
@@ -77,6 +79,9 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# The device mode + compositor scale behind each X11 monitor, by connector
 	# name: Mutter DisplayConfig (libdbus dlopen'd) else DRM sysfs (#1831).
 	target_sources(aux_os PRIVATE os_display_connector_linux.h os_display_connector_linux.c)
+	# Hyprland (Omarchy): the same connector facts from its IPC socket, when
+	# Mutter is not there (docs/roadmap/omarchy-support.md).
+	target_sources(aux_os PRIVATE os_hyprland_ipc_linux.c)
 	# X11 global-scale / placement-quantum detection: RandR rects joined to the
 	# DRM connector modes read from sysfs (no libdrm). See os_display_scale.h.
 	target_sources(aux_os PRIVATE os_display_scale_linux.c)

@@ -1,0 +1,35 @@
+Monitor DP-1 (ID 0):
+	2560x1600@60.00000 at 0x0
+	description: Leia Inc. 3D panel (fixture)
+	make: LEI
+	model: SR-1
+	serial: 
+	active workspace: 1 (1)
+	special workspace: 0 ()
+	reserved: 0 26 0 0
+	scale: 1.00
+	transform: 0
+	focused: yes
+	dpmsStatus: 1
+	vrr: false
+	solitary: 0
+	activelyTearing: false
+	disabled: false
+	currentFormat: XRGB8888
+	mirrorOf: none
+	availableModes: 2560x1600@60.00Hz
+
+Monitor eDP-1 (ID 1):
+	2880x1800@120.00000 at 2560x0
+	description: Laptop panel (fixture)
+	scale: 1.50
+	transform: 0
+	focused: no
+	disabled: false
+
+Monitor DP-2 (ID 2):
+	2560x1600@59.95100 at -1280x0
+	scale: 1.25
+	transform: 1
+	disabled: true
+

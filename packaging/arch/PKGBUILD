@@ -1,0 +1,69 @@
+# Maintainer: The DisplayXR Project
+#
+# DisplayXR runtime for Arch Linux and Omarchy (Arch + Hyprland), built from
+# source. A TEMPLATE: not published to the AUR. See
+# docs/roadmap/omarchy-support.md.
+#
+# It builds the same user-level tarball as scripts/package_linux.sh and unpacks
+# it into /opt/displayxr-runtime. Each user then runs its installer, which
+# writes the per-user OpenXR runtime, the systemd user units and (on
+# Hyprland) the window-geometry bridge and window rules:
+#
+#     /opt/displayxr-runtime/install.sh
+#
+# The package deliberately writes no OpenXR ActiveRuntime: that is a per-user
+# choice (Monado, SteamVR and others claim it too), and install.sh owns it.
+#
+#   makepkg -si                     # from this directory
+#   _branch=feat/omarchy-hyprland makepkg -si   # until it is on main
+
+pkgname=displayxr-runtime-git
+_pkgname=displayxr-runtime
+pkgver=r0
+pkgrel=1
+pkgdesc="OpenXR runtime for glasses-free 3D displays (DisplayXR), with Hyprland support"
+arch=('x86_64')
+url="https://github.com/DisplayXR/displayxr-runtime"
+license=('BSL-1.0')
+depends=('vulkan-icd-loader' 'libxcb' 'libx11' 'libxrandr' 'wayland' 'dbus' 'systemd-libs' 'glibc' 'gcc-libs')
+makedepends=('git' 'cmake' 'ninja' 'pkgconf' 'python' 'vulkan-headers' 'glslang' 'eigen' 'libxxf86vm')
+optdepends=('hyprland: windowed weaving of native-Wayland apps through the geometry bridge'
+            'openxr: the Khronos OpenXR loader for apps that link it dynamically')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+install=displayxr-runtime.install
+_branch="${_branch:-main}"
+source=("$_pkgname::git+$url.git#branch=$_branch")
+sha256sums=('SKIP')
+# The build fetches displayxr-mcp with CMake FetchContent (network in build()).
+
+pkgver() {
+    cd "$_pkgname"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=9 HEAD)"
+}
+
+prepare() {
+    cd "$_pkgname"
+    git submodule update --init --recursive
+}
+
+build() {
+    cd "$_pkgname"
+    CMAKE_BUILD_TYPE=Release ./scripts/build_linux.sh --hybrid --bundled-cjson --no-test
+    ./scripts/package_linux.sh --no-build
+}
+
+check() {
+    cd "$_pkgname"
+    ctest --test-dir build --output-on-failure -R 'tests_hgb_payload|tests_os_hyprland|tests_kwgb_payload'
+}
+
+package() {
+    cd "$_pkgname"
+    local tarball
+    tarball="$(ls -t dist/displayxr-runtime-linux-*.tar.gz | head -1)"
+    install -d "$pkgdir/opt"
+    tar -C "$pkgdir/opt" -xzf "$tarball"
+    mv "$pkgdir/opt/$(basename "$tarball" .tar.gz)" "$pkgdir/opt/$_pkgname"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

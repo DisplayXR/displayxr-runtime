@@ -53,6 +53,12 @@
 #                set up automatically when XDG_CURRENT_DESKTOP says KDE.
 #                User-level only.
 #        --no-kwin  never set it up
+#        --hyprland  set up the Hyprland (Omarchy) window-geometry bridge and
+#                window rules even when this is not run from a Hyprland
+#                session; automatic when one is detected. User-level only.
+#        --no-hyprland  never set it up
+#        --hypr-source  also add `source = ~/.config/hypr/displayxr.conf` to
+#                hyprland.conf (otherwise the line to add is printed)
 
 set -euo pipefail
 
@@ -62,6 +68,8 @@ SYSTEM=0
 NO_SERVICE=0
 NO_GNOME_EXT=0
 KWIN=auto
+HYPRLAND=auto
+HYPR_SOURCE=0
 for arg in "$@"; do
     case "$arg" in
     --system) SYSTEM=1 ;;
@@ -69,7 +77,10 @@ for arg in "$@"; do
     --no-gnome-extension) NO_GNOME_EXT=1 ;;
     --kwin) KWIN=yes ;;
     --no-kwin) KWIN=no ;;
-    *) echo "Unknown option: $arg (supported: --system --no-service --no-gnome-extension --kwin --no-kwin)" >&2; exit 2 ;;
+    --hyprland) HYPRLAND=yes ;;
+    --no-hyprland) HYPRLAND=no ;;
+    --hypr-source) HYPR_SOURCE=1 ;;
+    *) echo "Unknown option: $arg (supported: --system --no-service --no-gnome-extension --kwin --no-kwin --hyprland --no-hyprland --hypr-source)" >&2; exit 2 ;;
     esac
 done
 
@@ -400,6 +411,51 @@ elif [ "$KWIN" = yes ] && [ -x "$PREFIX/bin/displayxr-kwin-geometry-bridge" ] &&
     fi
 fi
 
+# --- Hyprland (Omarchy): window-geometry bridge + window rules ---------------
+# Hyprland has no in-process publisher of org.displayxr.WindowGeometry1.
+# displayxr-hypr-geometry-bridge reads Hyprland's IPC sockets and serves it, as
+# a systemd user service tied to the graphical session (uwsm starts
+# graphical-session.target on Omarchy). No D-Bus activation file: that name is
+# the KDE bridge's, and the runtime re-reads the name when it appears.
+# displayxr-hyprland-setup writes the window rules a weave needs (no border,
+# rounding, blur, ...) in the installed Hyprland's syntax.
+# docs/roadmap/omarchy-support.md.
+IS_HYPRLAND=0
+case ":${XDG_CURRENT_DESKTOP:-}:" in
+*:Hyprland:* | *:hyprland:*) IS_HYPRLAND=1 ;;
+esac
+[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && IS_HYPRLAND=1
+if [ "$HYPRLAND" = auto ]; then
+    [ "$IS_HYPRLAND" = 1 ] && HYPRLAND=yes || HYPRLAND=no
+fi
+HGB_UNIT_IN="$HERE/share/systemd/user/displayxr-hypr-geometry.service.in"
+if [ "$HYPRLAND" = yes ] && [ "$SYSTEM" = 1 ]; then
+    echo "note: the Hyprland setup is user-level; run ./install.sh --hyprland as the user"
+elif [ "$HYPRLAND" = yes ] && [ -x "$PREFIX/bin/displayxr-hypr-geometry-bridge" ] && [ -f "$HGB_UNIT_IN" ] &&
+    [ -d "$HERE/share/hyprland" ]; then
+    mkdir -p "$PREFIX/share" "$CONFIG_ROOT/systemd/user"
+    rm -rf "$PREFIX/share/hyprland"
+    cp -R "$HERE/share/hyprland" "$PREFIX/share/"
+    sed "s|@BRIDGE_BIN@|$PREFIX/bin/displayxr-hypr-geometry-bridge|" "$HGB_UNIT_IN"         >"$CONFIG_ROOT/systemd/user/displayxr-hypr-geometry.service"
+    echo "==> Hyprland window-geometry bridge: $CONFIG_ROOT/systemd/user/displayxr-hypr-geometry.service"
+    if [ -d /run/systemd/system ] && systemctl --user daemon-reload 2>/dev/null; then
+        systemctl --user enable displayxr-hypr-geometry.service >/dev/null 2>&1 || true
+        if [ "$IS_HYPRLAND" = 1 ] && systemctl --user restart displayxr-hypr-geometry.service >/dev/null 2>&1; then
+            echo "    enabled and running"
+        else
+            echo "    enabled; it starts with your next Hyprland session"
+        fi
+    else
+        echo "    (no systemd user session detected — enable later:"
+        echo "     systemctl --user daemon-reload && systemctl --user enable --now displayxr-hypr-geometry.service)"
+    fi
+    if [ "$HYPR_SOURCE" = 1 ]; then
+        "$PREFIX/bin/displayxr-hyprland-setup" --source || true
+    else
+        "$PREFIX/bin/displayxr-hyprland-setup" || true
+    fi
+fi
+
 # --- DisplayXR Dashboard: applications-menu entry ----------------------------
 # The binary went in with bin/ above, beside the displayxr-cli it runs.
 if [ -x "$PREFIX/bin/displayxr-dashboard" ] && [ -f "$HERE/share/applications/displayxr-dashboard.desktop.in" ]; then
@@ -413,6 +469,12 @@ fi
 echo ""
 echo "DisplayXR installed. Sanity check:"
 echo "    $PREFIX/bin/displayxr-cli selftest"
+if [ "$HYPRLAND" = yes ] && [ "$SYSTEM" = 0 ]; then
+    echo ""
+    echo "Hyprland: native-Wayland apps weave windowed through the geometry bridge;"
+    echo "XWayland apps need the panel's output at scale 1. After a Hyprland upgrade,"
+    echo "re-run $PREFIX/bin/displayxr-hyprland-setup to update the window rules."
+fi
 if [ "$IS_STEAMOS" = 1 ]; then
     echo ""
     echo "SteamOS: SteamVR takes the OpenXR ActiveRuntime back when it starts. To run a"

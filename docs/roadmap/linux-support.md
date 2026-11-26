@@ -80,6 +80,8 @@ solver's blind spot, and the assessment of what a truly scale-proof design would
 ## Supported releases
 
 SteamOS is planned, not supported: see [steamos-support.md](steamos-support.md).
+Omarchy (Arch + Hyprland) is written, not hardware-tested: see
+[omarchy-support.md](omarchy-support.md).
 
 **Ubuntu 22.04, 24.04 and 26.04 are supported. On 22.04, use an X11 session:
 GNOME 42 does not implement the Wayland fractional-scale protocol
@@ -767,7 +769,11 @@ source comments and, until this section, in no document at all.
   summary line `DBUS:`) feeds it into the existing
   `get_window_metrics → vk_update_present_origin → DP set_present_origin`
   chain as a third window source next to the two XCB ones. Without it Wayland
-  weaves display-scoped.
+  weaves display-scoped. Other compositors get stand-in publishers of the same
+  interface: KDE Plasma a KWin script plus `displayxr-kwin-geometry-bridge`,
+  Hyprland (Omarchy) `displayxr-hypr-geometry-bridge`, which reads Hyprland's
+  IPC ([wayland-window-geometry.md](../specs/runtime/wayland-window-geometry.md)
+  §4.4 and §4.5). Neither has run on its real compositor yet.
 - **Shipped in the artifacts** — the `.deb` and the tarball are both built with
   `libwayland-dev` + `libdbus-1-dev` (#1565), so the released runtime carries
   both. Only `libdbus-1-3` lands in the `.deb`'s derived `Depends` — no `wl_*`

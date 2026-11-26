@@ -1,0 +1,23 @@
+post_install() {
+    cat <<'MSG'
+==> DisplayXR is unpacked in /opt/displayxr-runtime. As each user who wants it,
+    run (no sudo):
+        /opt/displayxr-runtime/install.sh
+    On Hyprland/Omarchy, add --hypr-source to load the window rules
+    automatically. See docs/roadmap/omarchy-support.md.
+MSG
+}
+
+post_upgrade() {
+    cat <<'MSG'
+==> DisplayXR updated in /opt/displayxr-runtime. Re-run, as each user:
+        /opt/displayxr-runtime/install.sh
+MSG
+}
+
+pre_remove() {
+    cat <<'MSG'
+==> Before removing, each user should run:
+        /opt/displayxr-runtime/uninstall.sh
+MSG
+}

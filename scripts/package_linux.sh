@@ -33,6 +33,9 @@
 #   share/systemd/user/displayxr.socket + displayxr.service.in  (#1744:
 #       install.sh substitutes the service path and enables the socket, so the
 #       service is socket-activated on first use)
+#   bin/displayxr-hypr-geometry-bridge + bin/displayxr-hyprland-setup +
+#       share/hyprland/ + share/systemd/user/displayxr-hypr-geometry.service.in
+#       (Hyprland / Omarchy; install.sh sets them up only on Hyprland)
 #   install.sh / uninstall.sh / README.md / VERSION
 #
 # v1 scope (#705): runtime + sim_display, user-level default. Config files
@@ -226,6 +229,19 @@ if [ -n "$KWGB_BIN" ]; then
     cp "$ROOT/scripts/linux/dbus/org.displayxr.WindowGeometry.service.in" "$STAGE/share/dbus-1/services/"
 else
     echo "note: displayxr-kwin-geometry-bridge not built (no libdbus?) — packaging without the KWin publisher" >&2
+fi
+# Hyprland (Omarchy): the geometry bridge, its systemd user unit, and the
+# window-rule setup with its templates (docs/roadmap/omarchy-support.md).
+# Optional like the KWin bridge; install.sh sets it up only on Hyprland.
+HGB_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-hypr-geometry-bridge -type f 2>/dev/null | head -1 || true)"
+if [ -n "$HGB_BIN" ]; then
+    install -m 0755 "$HGB_BIN" "$STAGE/bin/"
+    install -m 0755 "$ROOT/scripts/linux/hyprland/displayxr-hyprland-setup" "$STAGE/bin/"
+    mkdir -p "$STAGE/share/hyprland"
+    cp "$ROOT/scripts/linux/hyprland/"*.conf "$ROOT/scripts/linux/hyprland/displayxr.lua" "$STAGE/share/hyprland/"
+    cp "$ROOT/scripts/linux/systemd/displayxr-hypr-geometry.service.in" "$STAGE/share/systemd/user/"
+else
+    echo "note: displayxr-hypr-geometry-bridge not built (no libdbus?) — packaging without the Hyprland publisher" >&2
 fi
 cp "$ROOT/scripts/linux/install.sh" "$ROOT/scripts/linux/uninstall.sh" "$STAGE/"
 chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"

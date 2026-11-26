@@ -27,6 +27,7 @@
  */
 
 #include "os_display_connector_linux.h"
+#include "os_hyprland.h"
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -403,6 +404,58 @@ out_lib:
 
 /*
  *
+ * Source 1b: Hyprland (Omarchy) over its request socket.
+ *
+ * Hyprland has no Mutter DisplayConfig; its `monitors` request gives the same
+ * three facts per connector: the current mode (scanout orientation), the
+ * fractional scale and the wl_output transform. No preferred mode.
+ *
+ */
+
+#define HYPR_TIMEOUT_MS 300
+
+static uint32_t
+query_hyprland(struct connector_mode *out, uint32_t max)
+{
+	if (!os_hyprland_session_detected(getenv("XDG_CURRENT_DESKTOP"), getenv("HYPRLAND_INSTANCE_SIGNATURE"))) {
+		return 0;
+	}
+	char dir[512];
+	if (!os_hyprland_socket_dir(dir, sizeof(dir))) {
+		return 0;
+	}
+	char *text = os_hyprland_request(dir, "monitors", HYPR_TIMEOUT_MS);
+	if (text == NULL) {
+		return 0;
+	}
+	struct os_hyprland_monitor mons[MAX_CONNECTORS];
+	const uint32_t n = os_hyprland_parse_monitors_text(text, mons, MAX_CONNECTORS);
+	free(text);
+
+	uint32_t count = 0;
+	for (uint32_t i = 0; i < n && count < max; i++) {
+		if (mons[i].disabled) {
+			continue;
+		}
+		struct connector_mode *c = &out[count];
+		memset(c, 0, sizeof(*c));
+		os_display_connector_normalise(mons[i].name, c->name, sizeof(c->name));
+		if (c->name[0] == '\0') {
+			continue;
+		}
+		c->w = mons[i].mode_w;
+		c->h = mons[i].mode_h;
+		c->scale = mons[i].scale;
+		c->refresh_mhz = mons[i].refresh_mhz;
+		c->transform = mons[i].transform; // wl_output numbering = MetaMonitorTransform's
+		count++;
+	}
+	return count;
+}
+
+
+/*
+ *
  * Source 2: DRM/KMS connectors in sysfs.
  *
  */
@@ -574,7 +627,11 @@ os_display_connector_annotate(struct os_display_desktop_info *mons, uint32_t cou
 	}
 
 	struct connector_mode mutter[MAX_CONNECTORS];
-	const uint32_t mutter_count = query_mutter(mutter, MAX_CONNECTORS);
+	uint32_t mutter_count = query_mutter(mutter, MAX_CONNECTORS);
+	if (mutter_count == 0) {
+		// Not GNOME: the compositor's own answer, where it gives one.
+		mutter_count = query_hyprland(mutter, MAX_CONNECTORS);
+	}
 
 	struct drm_connector drm[MAX_CONNECTORS];
 	const uint32_t drm_count = enumerate_drm(drm, MAX_CONNECTORS);
