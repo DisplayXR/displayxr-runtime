@@ -691,15 +691,21 @@ public sealed class ComponentsPage : Page
             failLine.VerticalAlignment = VerticalAlignment.Center;
             col.Children.Add(U.Flow(10, 6, failLine, retry));
         }
-        var block = options is null ? new OptionsBlock(id, Array.Empty<OptionView>(), Array.Empty<OptionView>()) : OptionViews.Build(id, options);
+        // A display of this driver shows the 3D mode picker on Displays: the setting for the same thing is not offered here too.
+        bool modeOnDisplays = StatusText.DriverHasMode3DPicker(Ctx.Feed.Snapshot, id);
+        var block = options is null
+            ? new OptionsBlock(id, Array.Empty<OptionView>(), Array.Empty<OptionView>())
+            : OptionViews.Build(id, options, modeOnDisplays);
         // The reply to a write whose row is not drawn (the read failed, or the setting went away) stays visible.
         if (Ctx.LastActionArea == OptionCommands.Area && Ctx.LastOptionWrite is { } lw && lw.DriverId == id && Ctx.LastAction is { } la
             && !block.Friendly.Concat(block.More).Any(v => v.Key == lw.Key))
             col.Children.Add(Ctx.LastActionFailed ? U.WarningRow(new StatusWarning("OPTION", WarningLevel.Warn, la)) : U.Wrapped(la, "soft"));
         if (options is null) return col;
+        bool modeLeftOut = modeOnDisplays && options.Settings.Any(s => FriendlyOptions.For(id, s) is { Is3DMode: true });
+        if (modeLeftOut) col.Children.Add(U.Wrapped(OptionViews.Mode3DOnDisplaysNote, "meta"));
         if (block.IsEmpty)
         {
-            col.Children.Add(U.Wrapped(OptionViews.NoOptionsLine, "meta"));
+            if (!modeLeftOut) col.Children.Add(U.Wrapped(OptionViews.NoOptionsLine, "meta"));
             return col;
         }
         foreach (var v in block.Friendly) col.Children.Add(OptionRow(id, driverName, v));

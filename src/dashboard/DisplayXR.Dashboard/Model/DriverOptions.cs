@@ -181,7 +181,9 @@ public sealed record OptionChoice(string Value, string Label);
 /// applies only to a setting declared with <see cref="Type"/>; any other is listed under "More options".
 /// Values match without regard to case. <see cref="NoKindValues"/>: values that choose no kind at all
 /// (shown as <see cref="FriendlyOptions.NoKindText"/>); <see cref="InertWithoutKindOf"/>: the key of the
-/// setting without whose kind this one has no effect.
+/// setting without whose kind this one has no effect. <see cref="Is3DMode"/>: this setting chooses the
+/// display's 3D mode, which the Displays page offers per display where the driver reports its modes; the
+/// Options block then leaves it out, so the same thing is not offered twice.
 /// </summary>
 public sealed record FriendlyOption(string? DriverId, string Key, string Label, OptionControl Control, string Help,
                                     IReadOnlyList<OptionChoice> Choices, int Order, SettingType Type,
@@ -189,7 +191,8 @@ public sealed record FriendlyOption(string? DriverId, string Key, string Label, 
                                     IReadOnlyDictionary<string, string>? Notes = null,
                                     string? PinValue = null,
                                     IReadOnlyList<string>? NoKindValues = null,
-                                    string? InertWithoutKindOf = null);
+                                    string? InertWithoutKindOf = null,
+                                    bool Is3DMode = false);
 
 /// <summary>The settings an owner is expected to touch, in words. Everything else is listed under "More options" by its key.</summary>
 public static class FriendlyOptions
@@ -229,7 +232,7 @@ public static class FriendlyOptions
             }, 10, SettingType.Enum,
             Aliases: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["squeezed_sbs"] = "squeezed", ["interlace"] = "interlaced" },
             Notes: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [FourViewKind] = FourViewNote },
-            NoKindValues: new[] { "2d", "passthrough" }),
+            NoKindValues: new[] { "2d", "passthrough" }, Is3DMode: true),
         new FriendlyOption(SimDisplay, "START_3D", "Start in", OptionControl.TwoWay,
             "How apps start. They can still switch between 2D and the 3D preview.",
             new[] { new OptionChoice("0", "2D"), new OptionChoice("1", "3D preview") }, 20, SettingType.Bool,
@@ -343,14 +346,22 @@ public static class OptionViews
     public static bool IsTrue(string v) =>
         v.Trim().ToLowerInvariant() is "1" or "true" or "on" or "yes";
 
-    /// <summary>The block for one driver: the friendly settings in table order, then every other one by its key, in the driver's order.</summary>
-    public static OptionsBlock Build(string driverId, DriverOptions options)
+    /// <summary>In the block when the 3D mode setting is left out of it (<see cref="FriendlyOption.Is3DMode"/>).</summary>
+    public const string Mode3DOnDisplaysNote = "The 3D mode is chosen for each display, on Displays.";
+
+    /// <summary>
+    /// The block for one driver: the friendly settings in table order, then every other one by its key, in the driver's order.
+    /// <paramref name="modeOnDisplays"/>: a display of this driver shows the 3D mode picker on Displays, so the
+    /// setting that chooses the same thing (<see cref="FriendlyOption.Is3DMode"/>) is left out.
+    /// </summary>
+    public static OptionsBlock Build(string driverId, DriverOptions options, bool modeOnDisplays = false)
     {
         var friendly = new List<(int Order, OptionView View)>();
         var more = new List<OptionView>();
         foreach (var s in options.Settings)
         {
             var entry = FriendlyOptions.For(driverId, s);
+            if (modeOnDisplays && entry is { Is3DMode: true }) continue;
             var view = View(s, entry, options.EnvPrefix);
             if (entry is not null) friendly.Add((entry.Order, view));
             else more.Add(view);
