@@ -44,3 +44,62 @@ TEST_CASE("u_file_copy_unix_socket_path")
 		CHECK_FALSE(u_file_copy_unix_socket_path(nullptr, 108, "/x"));
 	}
 }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <stdlib.h>
+
+namespace {
+// Save/restore one environment variable around a test.
+struct EnvGuard
+{
+	std::string name;
+	bool had;
+	std::string value;
+	explicit EnvGuard(const char *n) : name(n)
+	{
+		const char *v = getenv(n);
+		had = v != nullptr;
+		value = had ? v : "";
+	}
+	~EnvGuard()
+	{
+		if (had) {
+			setenv(name.c_str(), value.c_str(), 1);
+		} else {
+			unsetenv(name.c_str());
+		}
+	}
+};
+} // namespace
+
+TEST_CASE("u_file_get_runtime_dir fallbacks (Linux)")
+{
+	EnvGuard rt("XDG_RUNTIME_DIR"), cache("XDG_CACHE_HOME"), home("HOME");
+	char out[256];
+
+	SECTION("XDG_RUNTIME_DIR wins")
+	{
+		setenv("XDG_RUNTIME_DIR", "/run/user/1000", 1);
+		REQUIRE(u_file_get_runtime_dir(out, sizeof(out)) > 0);
+		CHECK(std::string(out) == "/run/user/1000");
+	}
+
+	SECTION("no XDG dirs: $HOME/.cache, never a literal tilde")
+	{
+		unsetenv("XDG_RUNTIME_DIR");
+		unsetenv("XDG_CACHE_HOME");
+		setenv("HOME", "/home/deck", 1);
+		REQUIRE(u_file_get_runtime_dir(out, sizeof(out)) > 0);
+		CHECK(std::string(out) == "/home/deck/.cache");
+	}
+
+	SECTION("no XDG dirs and no HOME: /tmp")
+	{
+		unsetenv("XDG_RUNTIME_DIR");
+		unsetenv("XDG_CACHE_HOME");
+		unsetenv("HOME");
+		REQUIRE(u_file_get_runtime_dir(out, sizeof(out)) > 0);
+		CHECK(std::string(out) == "/tmp");
+	}
+}
+#endif

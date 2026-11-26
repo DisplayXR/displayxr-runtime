@@ -34,7 +34,18 @@
 # the sim-display one; lower probe_order wins. Nothing here assumes sim-display
 # is the only display processor.
 #
-# Flags: --system  system-wide (needs root)
+# Every install also writes openxr_displayxr.json, a runtime manifest at a
+# fixed path ($PREFIX/ user-level, /usr/local/share/displayxr/ for --system). It lets one app use DisplayXR via
+# XR_RUNTIME_JSON without it being the ActiveRuntime. On SteamOS that is the
+# Steam launch option `XR_RUNTIME_JSON=<that path> %command%`: SteamVR claims
+# the user's ActiveRuntime back whenever it starts, so the ActiveRuntime alone
+# is not a stable way to select DisplayXR there.
+#
+# SteamOS (and any other image-based distro with a read-only /usr): only the
+# user-level default works. --system is refused there, since /usr/local and
+# /etc/xdg are on the read-only OS image or are reset by OS updates.
+#
+# Flags: --system  system-wide (needs root; not on SteamOS)
 #        --no-service  skip the systemd user units (displayxr-service)
 #        --no-gnome-extension  skip the GNOME Shell extension
 
@@ -58,6 +69,28 @@ done
     echo "error: run install.sh from the unpacked tarball root (lib/openxr_displayxr.so not found)" >&2
     exit 1
 }
+
+# --- SteamOS / read-only OS image -------------------------------------------
+# DXR_OS_RELEASE overrides the os-release path (CI tests the SteamOS branch in
+# a plain container with it).
+OS_RELEASE="${DXR_OS_RELEASE:-/etc/os-release}"
+IS_STEAMOS=0
+if [ -r "$OS_RELEASE" ] && grep -Eq '^(ID|ID_LIKE)=("?)steamos("?)$' "$OS_RELEASE"; then
+    IS_STEAMOS=1
+fi
+if [ "$SYSTEM" = 1 ]; then
+    if [ "$IS_STEAMOS" = 1 ]; then
+        echo "error: --system is not supported on SteamOS: /usr/local is on the read-only" >&2
+        echo "       OS image and OS updates replace it. Run ./install.sh without --system" >&2
+        echo "       (a user-level install into ~/.local/share/displayxr, no root needed)." >&2
+        exit 1
+    fi
+    if [ -d /usr/local ] && ! [ -w /usr/local ] && [ "$(id -u)" = 0 ]; then
+        echo "error: /usr/local is read-only on this system (an image-based OS?)." >&2
+        echo "       Run ./install.sh without --system for a user-level install." >&2
+        exit 1
+    fi
+fi
 
 if [ "$SYSTEM" = 1 ]; then
     [ "$(id -u)" = 0 ] || { echo "error: --system needs root (use sudo)" >&2; exit 1; }
@@ -125,6 +158,17 @@ cat > "$ACTIVE" <<EOF
 }
 EOF
 echo "==> OpenXR ActiveRuntime: $ACTIVE"
+
+# The same manifest at a fixed path in the install tree, for XR_RUNTIME_JSON
+# (per-app selection; see the header). uninstall.sh removes it.
+if [ "$SYSTEM" = 1 ]; then
+    RUNTIME_JSON=/usr/local/share/displayxr/openxr_displayxr.json
+else
+    RUNTIME_JSON="$PREFIX/openxr_displayxr.json"
+fi
+mkdir -p "$(dirname "$RUNTIME_JSON")"
+cp "$ACTIVE" "$RUNTIME_JSON"
+echo "==> Per-app runtime manifest (XR_RUNTIME_JSON): $RUNTIME_JSON"
 
 # --- Display-processor discovery manifest ----------------------------------
 mkdir -p "$DP_ROOT"
@@ -293,3 +337,11 @@ fi
 echo ""
 echo "DisplayXR installed. Sanity check:"
 echo "    $PREFIX/bin/displayxr-cli selftest"
+if [ "$IS_STEAMOS" = 1 ]; then
+    echo ""
+    echo "SteamOS: SteamVR takes the OpenXR ActiveRuntime back when it starts. To run a"
+    echo "Steam game on DisplayXR regardless, set its launch options (Properties > General):"
+    echo "    XR_RUNTIME_JSON=$RUNTIME_JSON PRESSURE_VESSEL_FILESYSTEMS_RW=\$XDG_RUNTIME_DIR/displayxr_comp_ipc %command%"
+    echo "(64-bit OpenXR games only. Windows games under Proton need more; see"
+    echo " docs/roadmap/steamos-support.md, WS6.)"
+fi

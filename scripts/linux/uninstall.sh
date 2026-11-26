@@ -98,7 +98,8 @@ if [ "$SYSTEM" = 1 ]; then
     rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" "$PREFIX/bin/displayxr-conversion-host" "$PREFIX/bin/displayxr-tracking-host" "$PREFIX/bin/displayxr-dashboard" \
         "$PREFIX/bin/displayxr-gnome-extension-enable" \
         "$PREFIX/lib/openxr_displayxr.so" "$PREFIX/lib/libVkLayer_DXR_queue_lock.so" \
-        "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
+        "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so" \
+        /usr/local/share/displayxr/openxr_displayxr.json
     rmdir -p "$PREFIX/lib/displayxr/plugins" 2>/dev/null || true
 else
     rm -rf "$PREFIX"

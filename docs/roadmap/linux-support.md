@@ -79,6 +79,8 @@ solver's blind spot, and the assessment of what a truly scale-proof design would
 
 ## Supported releases
 
+SteamOS is planned, not supported: see [steamos-support.md](steamos-support.md).
+
 **Ubuntu 22.04, 24.04 and 26.04 are supported. On 22.04, use an X11 session:
 GNOME 42 does not implement the Wayland fractional-scale protocol
 (`wp_fractional_scale_v1`), so a native-Wayland window cannot be guaranteed 1:1
