@@ -57,13 +57,30 @@ VS_OUTPUT main(uint id : SV_VertexID) {
 }
 )";
 
-// SBS pixel shader: pass-through (identity) so all modes go through the same path
+// Cropped SBS pixel shader: each eye is a full-FOV view (Cropped SBS: 0.5 x 0.5, packed
+// 1x2 in sim_display_modes.h); its centre 50% horizontally goes to its half of the output,
+// so the picture is cropped, not squeezed. Unpacks any tile layout (view i at col i % cols,
+// row i / cols), as the GL / Metal / Vulkan SBS shaders do. Was an identity pass-through,
+// which only looked right for a 2x1 atlas and showed a 1x2 one as top/bottom.
 static const char *ps_sbs_source = R"(
 Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
 
+cbuffer TileParams : register(b0) {
+	float tile_cols_inv;
+	float tile_rows_inv;
+	float tile_cols;
+	float tile_rows;
+};
+
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-	return atlas_tex.Sample(samp, uv);
+	float eye_index = (uv.x < 0.5) ? 0.0 : 1.0;
+	float eye_u = (uv.x < 0.5) ? (uv.x / 0.5) : ((uv.x - 0.5) / 0.5);
+	uint col = (uint)eye_index % (uint)tile_cols;
+	uint row = (uint)eye_index / (uint)tile_cols;
+	float src_u = (0.25 + eye_u * 0.5 + col) * tile_cols_inv;
+	float src_v = (uv.y + row) * tile_rows_inv;
+	return atlas_tex.Sample(samp, float2(src_u, src_v));
 }
 )";
 
