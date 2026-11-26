@@ -695,6 +695,21 @@ TEST_CASE("viewCount 0 follows the weave: resized behind the same handle", "[ipc
  * the background, so the Explore that follows finds the model loaded (on the
  * win box: Explore 20 s cold -> ~2.8 s). DXR_CONV_PREWARM_SPLATS=0 turns it off.
  */
+//! Portable: set (or, with NULL / "", clear) an environment variable.
+static void
+prewarm_set_env(const char *name, const char *value)
+{
+#ifdef _WIN32
+	(void)_putenv_s(name, value != nullptr ? value : "");
+#else
+	if (value != nullptr && value[0] != ' ') {
+		(void)setenv(name, value, 1);
+	} else {
+		(void)unsetenv(name);
+	}
+#endif
+}
+
 static uint32_t
 fake_cap_state(conv_fake_provider &f, uint32_t cap_id)
 {
@@ -713,7 +728,7 @@ TEST_CASE("a live lift stream warms the splats capability", "[ipc_conv_v4]")
 {
 	for (const bool off : {false, true}) {
 		CAPTURE(off);
-		_putenv(off ? "DXR_CONV_PREWARM_SPLATS=0" : "DXR_CONV_PREWARM_SPLATS=");
+		prewarm_set_env("DXR_CONV_PREWARM_SPLATS", off ? "0" : nullptr);
 		conv_fake_provider f;
 		conv_fake_init(&f, "fake");
 		conv_fake_cap *v = conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM,
@@ -740,5 +755,5 @@ TEST_CASE("a live lift stream warms the splats capability", "[ipc_conv_v4]")
 		}
 		conv_fake_fini(&f);
 	}
-	_putenv("DXR_CONV_PREWARM_SPLATS=");
+	prewarm_set_env("DXR_CONV_PREWARM_SPLATS", nullptr);
 }
