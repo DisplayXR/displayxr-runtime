@@ -105,13 +105,35 @@ void
 conv_splat_facts_scale_intrinsics(cJSON *facts, double sx, double sy);
 
 /*!
+ * Re-express a camera block's `intrinsics` in the caller's pixels, in place,
+ * with EXACTLY the rule conv_splat_facts_scale_intrinsics applies to the facts
+ * (fx, cx, width by @p sx; fy, cy, height by @p sy; width / height rounded), so
+ * the block and the facts of one lift result agree to the same digits (#2836).
+ * Only `intrinsics` changes: every other key, and the key order, is kept.
+ *
+ * No change (false) when @p block is not an object, it has no `intrinsics`,
+ * the scale is 1, 1 (or not positive), or the intrinsics are malformed (not an
+ * object, or one of the six keys present but not a finite number: logged once
+ * as a WARN, the block is left exactly as authored). True when rescaled.
+ */
+bool
+conv_camera_block_scale_intrinsics(cJSON *block, double sx, double sy);
+
+/*!
  * The camera block a lift caller receives with a GAUSSIANS blob (XR_DXR_lift
  * spec 6): the SAME v2 object `conv run --camera-block auto` writes into a SOG,
  * built by the RUNTIME from the common facts schema whatever provider made the
  * splats, so a consumer parses it exactly like a SOG's `meta.json` camera.
  *
+ * @p facts are already in the caller's pixels; @p src_scale_x / @p src_scale_y
+ * are the scale they were given (conv_splat_facts_scale_intrinsics; 1, 1 when
+ * the photo was not downscaled).
+ *
  *  - A SOG blob that already carries an AUTHORED camera block (any `camera`
- *    whose `source` is not "auto"): that block, verbatim.
+ *    whose `source` is not "auto"): that block, with only its `intrinsics`
+ *    re-expressed in the caller's pixels (conv_camera_block_scale_intrinsics
+ *    with @p src_scale_x / @p src_scale_y; verbatim at 1, 1). The result is a
+ *    view of the file: the blob itself is never rewritten (#2836).
  *  - Else conv_camera_block_from_facts(); when the facts lack intrinsics, the
  *    same block without `intrinsics` (a viewer estimates them; never a
  *    nominal field of view).
@@ -124,8 +146,14 @@ conv_splat_facts_scale_intrinsics(cJSON *facts, double sx, double sy);
  * caller frees with cJSON_Delete); NULL with @p err for other formats.
  */
 cJSON *
-conv_lift_camera_block(
-    const cJSON *facts, const uint8_t *blob, size_t size, uint32_t conv_blob_format, char *err, size_t err_size);
+conv_lift_camera_block(const cJSON *facts,
+                       double src_scale_x,
+                       double src_scale_y,
+                       const uint8_t *blob,
+                       size_t size,
+                       uint32_t conv_blob_format,
+                       char *err,
+                       size_t err_size);
 
 #ifdef __cplusplus
 }

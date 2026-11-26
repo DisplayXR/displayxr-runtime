@@ -9,6 +9,8 @@
 #include "conv_camera_block.h"
 #include "conv_splat_focus.h"
 
+#include "util/u_logging.h"
+
 #include <cjson/cJSON.h>
 
 #include <math.h>
@@ -838,6 +840,32 @@ conv_splat_facts_scale_intrinsics(cJSON *facts, double sx, double sy)
 	scale_num(in, "height", sy, true);
 }
 
+bool
+conv_camera_block_scale_intrinsics(cJSON *block, double sx, double sy)
+{
+	if (!cJSON_IsObject(block) || !(sx > 0.0) || !(sy > 0.0) || (sx == 1.0 && sy == 1.0)) {
+		return false;
+	}
+	const cJSON *in = cJSON_GetObjectItemCaseSensitive(block, "intrinsics");
+	if (in == NULL) {
+		return false; // nothing to re-express: a viewer estimates them
+	}
+	bool ok = cJSON_IsObject(in);
+	const char *keys[6] = {"fx", "fy", "cx", "cy", "width", "height"};
+	for (int i = 0; ok && i < 6; i++) {
+		const cJSON *v = cJSON_GetObjectItemCaseSensitive(in, keys[i]);
+		ok = v == NULL || (cJSON_IsNumber(v) && isfinite(v->valuedouble));
+	}
+	if (!ok) {
+		U_LOG_W("[conv] authored camera block: malformed intrinsics, kept as authored (scale %.4g x %.4g)", sx,
+		        sy);
+		return false;
+	}
+	// The facts' own rule, so the two agree to the digit.
+	conv_splat_facts_scale_intrinsics(block, sx, sy);
+	return true;
+}
+
 //! The `camera` object of a SOG's meta.json, or NULL; *@p authored when its source is not "auto".
 static cJSON *
 sog_camera(const uint8_t *blob, size_t size, bool *authored)
@@ -869,8 +897,14 @@ sog_camera(const uint8_t *blob, size_t size, bool *authored)
 }
 
 cJSON *
-conv_lift_camera_block(
-    const cJSON *facts, const uint8_t *blob, size_t size, uint32_t conv_blob_format, char *err, size_t err_size)
+conv_lift_camera_block(const cJSON *facts,
+                       double src_scale_x,
+                       double src_scale_y,
+                       const uint8_t *blob,
+                       size_t size,
+                       uint32_t conv_blob_format,
+                       char *err,
+                       size_t err_size)
 {
 	if (err != NULL && err_size > 0) {
 		err[0] = 0;
@@ -886,7 +920,11 @@ conv_lift_camera_block(
 		bool authored = false;
 		sog_cam = sog_camera(blob, size, &authored);
 		if (authored) {
-			return sog_cam; // the author's block: verbatim, never rewritten
+			// The author's block, never rewritten in the file; the caller
+			// gets it with its intrinsics in the caller's pixels, as the
+			// facts are (#2836). Verbatim when nothing was downscaled.
+			(void)conv_camera_block_scale_intrinsics(sog_cam, src_scale_x, src_scale_y);
+			return sog_cam;
 		}
 	}
 	cJSON *empty = NULL;
