@@ -236,6 +236,19 @@ public class ConverterWordingTests
     // ── (a) names ───────────────────────────────────────────────────────────
 
     [Fact]
+    public void TheConversionServicesAnswer_IsNotAConverterInTheDisplayDriver()
+    {
+        // The conversion service answers lift_caps with backend "conversion" when a provider is ready.
+        // The display driver has no converter then, and the card must not show one.
+        var info = ModuleInfo("""
+            { "lift_caps": { "probed": true, "malformed": false, "note": "", "modes": 3, "state": 2, "backend": "conversion" } }
+            """);
+        var section = Components.Conversion(info);
+        Assert.Equal("none available", section.ConnectedLine);
+        Assert.NotEqual(PlainState.Ready, Assert.Single(section.Items).State);
+    }
+
+    [Fact]
     public void TheConversionModule_IsNamedConverter_ItsBackendIdIsInDetailsOnly()
     {
         var info = ModuleInfo("""
