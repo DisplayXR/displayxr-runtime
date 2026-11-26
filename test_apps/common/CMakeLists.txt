@@ -71,7 +71,12 @@ FetchContent_Declare(
     #   +[NSCursor hide] there, which gave a double cursor (displayxr-common#83).
     # v2.36.0: DxrLinuxWindow drains XR_DXR_workspace_client_input, so the app gets
     #   mouse + keyboard under the Linux workspace (displayxr-common#93, runtime#2779).
-    GIT_TAG v2.36.0
+    # v2.37.1: PollEvents handles XrEventDataRenderingModeTableChangedDXR and re-reads the
+    #   table into the renderingMode* arrays (displayxr-common#94), so a live 3D-mode change
+    #   (Dashboard picker, ADR-066 C1) reaches the apps' mono/stereo + tile decisions; without it
+    #   an app that began on a 1-view entry kept rendering one eye into every tile (runtime#2852).
+    #   Also the signed mouse-coordinate drag fix (displayxr-common#96).
+    GIT_TAG v2.37.1
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
