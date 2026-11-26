@@ -155,11 +155,15 @@ drm_matches_mm(const struct os_display_drm_connector *c, uint32_t w_mm, uint32_t
 	       mm_close(c->edid.cm_width_mm, c->edid.cm_height_mm, w_mm, h_mm);
 }
 
+//! The kernel lists modes in scanout orientation, and @p w x @p h is the
+//! desktop's view of the output, so a quarter-turned output (the Steam Deck's
+//! 800x1280 panel under a 1280x800 desktop) has its mode transposed: accept
+//! either orientation.
 static bool
 drm_has_mode(const struct os_display_drm_connector *c, uint32_t w, uint32_t h)
 {
 	for (uint32_t i = 0; i < c->mode_count; i++) {
-		if (c->mode_w[i] == w && c->mode_h[i] == h) {
+		if ((c->mode_w[i] == w && c->mode_h[i] == h) || (c->mode_w[i] == h && c->mode_h[i] == w)) {
 			return true;
 		}
 	}
@@ -231,13 +235,12 @@ apply_drm(struct os_display_edid_monitor *m, const struct os_display_drm_connect
 	}
 	if (m->native_width == 0 && c->mode_count > 0) {
 		// The kernel lists the preferred mode first; the RandR rect when it
-		// is itself a mode (the device mode on an unscaled X screen).
-		m->native_width = c->mode_w[0];
-		m->native_height = c->mode_h[0];
-		if (drm_has_mode(c, m->pixel_width, m->pixel_height)) {
-			m->native_width = m->pixel_width;
-			m->native_height = m->pixel_height;
-		}
+		// is itself a mode (the device mode on an unscaled X screen), or its
+		// transpose on a quarter-turned output (Steam Deck). Presented
+		// orientation, as os_display_connector_annotate stores it.
+		bool quarter = false;
+		(void)os_display_drm_pick_mode(c->mode_w, c->mode_h, c->mode_count, m->pixel_width, m->pixel_height,
+		                               &m->native_width, &m->native_height, &quarter);
 	}
 	// The preferred timing's refresh, only when it is the mode in use. The
 	// current refresh is not in sysfs; this is the best a file read can do.
