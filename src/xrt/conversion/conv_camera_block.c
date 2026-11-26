@@ -866,6 +866,41 @@ conv_camera_block_scale_intrinsics(cJSON *block, double sx, double sy)
 	return true;
 }
 
+bool
+conv_intrinsics_uncrop(cJSON *obj, double ox, double oy, uint32_t full_w, uint32_t full_h)
+{
+	cJSON *in = cJSON_GetObjectItemCaseSensitive(obj, "intrinsics");
+	if (!cJSON_IsObject(in) || full_w == 0 || full_h == 0 || !isfinite(ox) || !isfinite(oy)) {
+		return false;
+	}
+	const char *keys[4] = {"cx", "cy", "width", "height"};
+	cJSON *v[4];
+	for (int i = 0; i < 4; i++) {
+		v[i] = cJSON_GetObjectItemCaseSensitive(in, keys[i]);
+		if (v[i] != NULL && !(cJSON_IsNumber(v[i]) && isfinite(v[i]->valuedouble))) {
+			return false;
+		}
+	}
+	const bool same_size = (v[2] == NULL || (uint32_t)v[2]->valuedouble == full_w) &&
+	                       (v[3] == NULL || (uint32_t)v[3]->valuedouble == full_h);
+	if (ox == 0.0 && oy == 0.0 && same_size) {
+		return false;
+	}
+	if (v[0] != NULL) {
+		cJSON_SetNumberValue(v[0], v[0]->valuedouble + ox);
+	}
+	if (v[1] != NULL) {
+		cJSON_SetNumberValue(v[1], v[1]->valuedouble + oy);
+	}
+	if (v[2] != NULL) {
+		cJSON_SetNumberValue(v[2], (double)full_w);
+	}
+	if (v[3] != NULL) {
+		cJSON_SetNumberValue(v[3], (double)full_h);
+	}
+	return true;
+}
+
 //! The `camera` object of a SOG's meta.json, or NULL; *@p authored when its source is not "auto".
 static cJSON *
 sog_camera(const uint8_t *blob, size_t size, bool *authored)

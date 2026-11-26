@@ -538,3 +538,41 @@ TEST_CASE("lift camera block: a SOG whose meta.json does not parse falls back to
 	cJSON_Delete(b);
 	cJSON_Delete(facts);
 }
+
+
+TEST_CASE("conv_intrinsics_uncrop: a cropped photo's intrinsics are put back in the full frame",
+          "[conv_lift_camera]")
+{
+	// The provider saw the 1440x1080 picture of a 1920x1080 frame (bars of 240 px
+	// left and right): its principal point moves by the crop offset, the size
+	// becomes the full frame, the focal stays.
+	cJSON *o = cJSON_Parse(
+	    R"({"rig":"camera","intrinsics":{"fx":1500,"fy":1500,"cx":720,"cy":540,"width":1440,"height":1080},)"
+	    R"("focus":{"point":[0,0,2]}})");
+	REQUIRE(o != nullptr);
+	REQUIRE(conv_intrinsics_uncrop(o, 240.0, 0.0, 1920, 1080));
+	const cJSON *in = cJSON_GetObjectItemCaseSensitive(o, "intrinsics");
+	CHECK(cJSON_GetObjectItemCaseSensitive(in, "fx")->valuedouble == 1500.0);
+	CHECK(cJSON_GetObjectItemCaseSensitive(in, "fy")->valuedouble == 1500.0);
+	CHECK(cJSON_GetObjectItemCaseSensitive(in, "cx")->valuedouble == 960.0);
+	CHECK(cJSON_GetObjectItemCaseSensitive(in, "cy")->valuedouble == 540.0);
+	CHECK(cJSON_GetObjectItemCaseSensitive(in, "width")->valuedouble == 1920.0);
+	CHECK(cJSON_GetObjectItemCaseSensitive(in, "height")->valuedouble == 1080.0);
+	// every other key is untouched
+	CHECK(cJSON_GetObjectItemCaseSensitive(o, "focus") != nullptr);
+	CHECK(std::string(cJSON_GetObjectItemCaseSensitive(o, "rig")->valuestring) == "camera");
+	cJSON_Delete(o);
+
+	// nothing to do, no intrinsics, malformed: left exactly as it was
+	cJSON *same = cJSON_Parse(R"({"intrinsics":{"fx":1,"cx":2,"cy":3,"width":10,"height":20}})");
+	CHECK_FALSE(conv_intrinsics_uncrop(same, 0.0, 0.0, 10, 20));
+	cJSON_Delete(same);
+	cJSON *none = cJSON_Parse(R"({"rig":"camera"})");
+	CHECK_FALSE(conv_intrinsics_uncrop(none, 5.0, 5.0, 100, 100));
+	cJSON_Delete(none);
+	cJSON *bad = cJSON_Parse(R"({"intrinsics":{"cx":"x","width":10,"height":20}})");
+	CHECK_FALSE(conv_intrinsics_uncrop(bad, 5.0, 0.0, 30, 20));
+	CHECK(std::string(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(bad, "intrinsics"), "cx")
+	                      ->valuestring) == "x");
+	cJSON_Delete(bad);
+}

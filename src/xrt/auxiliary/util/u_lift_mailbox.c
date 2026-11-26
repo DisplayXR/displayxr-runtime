@@ -10,6 +10,7 @@
 
 #include "util/u_lift_mailbox.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static bool
@@ -703,4 +704,49 @@ u_lift_letterbox_profile_from_lines(const uint8_t *col_px,
 	if (row_px != NULL) {
 		lb_axis(row_px, w, nc, bgra, cols);
 	}
+}
+
+bool
+u_lift_letterbox_measure_still(
+    const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, bool bgra, struct u_lift_crop *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (px == NULL || w == 0 || h == 0 || stride < w * 4u) {
+		return false;
+	}
+	const uint32_t n = U_LIFT_LETTERBOX_LINE_SAMPLES;
+	uint8_t *col_px = (uint8_t *)malloc((size_t)n * h * 4u);
+	uint8_t *row_px = (uint8_t *)malloc((size_t)n * w * 4u);
+	float *rows = (float *)malloc(sizeof(float) * U_LIFT_LETTERBOX_BINS_MAX);
+	float *cols = (float *)malloc(sizeof(float) * U_LIFT_LETTERBOX_BINS_MAX);
+	bool active = false;
+	if (col_px != NULL && row_px != NULL && rows != NULL && cols != NULL) {
+		// The sampled lines, laid out as u_lift_letterbox_profile_from_lines reads them.
+		for (uint32_t k = 0; k < n; k++) {
+			const uint32_t x = u_lift_letterbox_sample_pos(k, w);
+			for (uint32_t y = 0; y < h; y++) {
+				memcpy(col_px + ((size_t)k * h + y) * 4u, px + (size_t)y * stride + (size_t)x * 4u, 4u);
+			}
+			const uint32_t y = u_lift_letterbox_sample_pos(k, h);
+			memcpy(row_px + (size_t)k * w * 4u, px + (size_t)y * stride, (size_t)w * 4u);
+		}
+		uint32_t nr = 0, nc = 0;
+		u_lift_letterbox_profile_from_lines(col_px, row_px, w, h, bgra, rows, &nr, cols, &nc);
+		// One frame, held: the live policy's settle rule then commits exactly the
+		// crop it would commit for a video that showed this frame long enough.
+		struct u_lift_letterbox lb;
+		memset(&lb, 0, sizeof(lb));
+		for (uint32_t i = 0; i <= U_LIFT_LETTERBOX_SETTLE_FRAMES; i++) {
+			(void)u_lift_letterbox_update(&lb, w, h, rows, nr, cols, nc);
+		}
+		active = u_lift_crop_active(&lb.committed);
+		if (active) {
+			*out = lb.committed;
+		}
+	}
+	free(cols);
+	free(rows);
+	free(row_px);
+	free(col_px);
+	return active;
 }
