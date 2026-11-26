@@ -414,6 +414,14 @@ conv_core_stream_input_kinds(struct conv_core *core,
                              uint32_t *out_memory_kinds,
                              uint32_t *out_sync_kinds);
 
+/*!
+ * The content hint @p stream_id was created with (XRT_CONV_CONTENT_*), so a
+ * producer can tell a PHOTO stream (whose unchanged input the core dedupes,
+ * #2030) from a video one. 0 = no such stream.
+ */
+uint32_t
+conv_core_stream_content_hint(struct conv_core *core, uint64_t stream_id);
+
 
 /*
  *
