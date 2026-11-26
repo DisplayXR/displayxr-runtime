@@ -862,6 +862,32 @@ ipc_server_conv_lift_properties(struct ipc_server_conv *sc, struct xrt_dp_lift_c
 	memcpy(out->backend, "conversion", sizeof("conversion"));
 }
 
+/*!
+ * A live lift stream was just asked for (Convert to 3D on a picture or a video):
+ * warm the photo -> splats capability now, so the user's Explore on the same
+ * element finds the model loaded instead of waiting for it. On the win box a
+ * cold SHARP warm took ~10 s and a first job on a fresh host ~8 s; Explore is
+ * one click away from every converted element, and the conversion that makes
+ * it possible has just started. conv_core_warm_task picks the provider that
+ * would serve the task (licence gate included: a research-only model is warmed
+ * only where research-only is allowed) and is a no-op when it is warm already.
+ * DXR_CONV_PREWARM_SPLATS=0 turns it off.
+ */
+static void
+prewarm_splats_for_lift(struct ipc_server_conv *sc)
+{
+	static bool logged = false;
+	const char *env = getenv("DXR_CONV_PREWARM_SPLATS");
+	if (env != NULL && strcmp(env, "0") == 0) {
+		return;
+	}
+	if (conv_core_warm_task(sc->core, XRT_CONV_TASK_SPLATS_MONO) == XRT_SUCCESS && !logged) {
+		logged = true;
+		U_LOG_W("[conv] splats-mono warm requested at a live lift stream (Explore will find it loaded; "
+		        "DXR_CONV_PREWARM_SPLATS=0 turns it off)");
+	}
+}
+
 xrt_result_t
 ipc_server_conv_lift_stream_create(struct ipc_server_conv *sc,
                                    uint64_t client_id,
@@ -881,6 +907,9 @@ ipc_server_conv_lift_stream_create(struct ipc_server_conv *sc,
 	const bool gaussians = mode == XRT_DP_LIFT_MODE_GAUSSIANS;
 	if (gaussians ? !gaussians_routable(sc, &io) : !mode_routable(mode)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	if (!gaussians) {
+		prewarm_splats_for_lift(sc);
 	}
 	struct sc_stream st;
 	memset(&st, 0, sizeof(st));
@@ -2317,6 +2346,9 @@ ipc_server_conv_v5_stream_create(struct ipc_server_conv *sc,
 	}
 	if ((d.lanes & XRT_CONV_LANE_STREAM) == 0 || !v4_task_is_stream_task(task)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // a job-lane task (spec 5)
+	}
+	if (task == XRT_CONV_TASK_VIEWS_MONO || task == XRT_CONV_TASK_DEPTH_VIDEO) {
+		prewarm_splats_for_lift(sc); // a live Convert to 3D stream (see the helper)
 	}
 	if ((d.input_kinds & input_kind) == 0 && d.input_kinds != 0) {
 		return XRT_ERROR_INPUT_UNSUPPORTED;
