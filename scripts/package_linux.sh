@@ -256,7 +256,7 @@ fi
 cat > "$STAGE/README.md" <<EOF
 # DisplayXR runtime for Linux ($VERSION)
 
-Lightweight OpenXR runtime for 3D displays — Linux x86_64 build with the
+Lightweight OpenXR runtime for 3D displays — Linux $ARCH build with the
 vendor-neutral sim-display display processor.
 
 ## Install (user-level, no root)

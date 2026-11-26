@@ -402,6 +402,54 @@ jobs:
           # Nothing outside $HOME was written.
           test ! -e /usr/local/share/displayxr
 
+  # Linux arm64 (docs/roadmap/steamos-support.md, WS7): SteamOS also runs on
+  # arm64 (Steam Frame) and Linux ARM boxes are common. Build + headless
+  # selftest + tarball install on GitHub's arm64 runner. Not a required check,
+  # and nothing is released for arm64 from it: no arm64 vendor plug-in (Leia SR
+  # is x86_64 only) exists to test against.
+  Arm64:
+    name: Linux arm64 (build only)
+    needs: DetectChanges
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libdbus-1-dev \
+            libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
+
+      - name: Build (hybrid) + headless selftest
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./scripts/build_linux.sh --hybrid
+
+      - name: Package + user-level install + selftest from installed paths
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          ./scripts/package_linux.sh --no-build
+          ls dist/displayxr-runtime-linux-aarch64-*.tar.gz
+          tar -C /tmp -xzf dist/displayxr-runtime-linux-aarch64-*.tar.gz
+          cd /tmp/displayxr-runtime-linux-aarch64-*/
+          ./install.sh --no-gnome-extension
+          unset XRT_PLUGIN_SEARCH_PATH
+          "$HOME/.local/share/displayxr/bin/displayxr-cli" selftest
+          ./uninstall.sh
+
   # Newest-toolchain gate (#1656): the Package job used to build in the NEXT-LTS
   # container and moved to 22.04 so the tarball it produces is portable, so the
   # "does the tree still compile on the newest release" coverage lives here.
