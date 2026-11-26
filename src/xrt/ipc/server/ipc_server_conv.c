@@ -1508,10 +1508,12 @@ gaussians_describe(struct ipc_server_conv *sc,
 	if (facts == NULL) {
 		return;
 	}
-	conv_splat_facts_scale_intrinsics(facts, st->job_scale_x > 0.0 ? st->job_scale_x : 1.0,
-	                                  st->job_scale_y > 0.0 ? st->job_scale_y : 1.0);
+	const double sx = st->job_scale_x > 0.0 ? st->job_scale_x : 1.0;
+	const double sy = st->job_scale_y > 0.0 ? st->job_scale_y : 1.0;
+	conv_splat_facts_scale_intrinsics(facts, sx, sy);
 	char err[160] = {0};
-	cJSON *block = conv_lift_camera_block(facts, blob, (size_t)size, jr->blob_format, err, sizeof(err));
+	// The same scale reaches an authored SOG block's intrinsics (#2836).
+	cJSON *block = conv_lift_camera_block(facts, sx, sy, blob, (size_t)size, jr->blob_format, err, sizeof(err));
 	if (block != NULL) {
 		*out_camera = cJSON_PrintUnformatted(block);
 		const cJSON *focus = cJSON_GetObjectItemCaseSensitive(block, "focus");

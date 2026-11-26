@@ -742,9 +742,14 @@ Rules, all runtime-side and provider-agnostic (a consumer never branches on the 
   own auto block.)
 - **An authored block is never rewritten**: a SOG blob whose `meta.json` already carries a
   `camera` that is not `"source": "auto"` — written by the provider or by a person — returns that
-  block verbatim, and the runtime merges nothing into it. Only an `auto` block is rebuilt (its
-  focus is kept). Known gap: such a block's `intrinsics` stay in the pixels the provider was
-  handed even when the runtime downscaled the photo, while `facts` are scaled back (#2836).
+  block as authored, and the runtime merges nothing into it. Only an `auto` block is rebuilt (its
+  focus is kept). The returned `camera` is a **view of the file**, not the file: when the runtime
+  downscaled the photo, its `intrinsics` are re-expressed in the caller's pixels with exactly the
+  scale the `facts` get (`fx`, `cx`, `width` × the x scale; `fy`, `cy`, `height` × the y scale;
+  `width` / `height` rounded), so `camera` and `facts` carry the same numbers; every other key
+  (focus in metres, `rest`, `rig`, `convention`, `dxr`, unknown keys) is the author's, and the blob
+  bytes are never rewritten. Unscaled, or a block without `intrinsics`, comes back unchanged
+  (#2836).
 - Strings use the two-call idiom per string (counts include the NUL), but a too-small string
   capacity is **not** an error — the blob call's own result and latch rules are unchanged — so a
   caller sizes both strings on the blob's size query. A spec-5 runtime ignores the struct

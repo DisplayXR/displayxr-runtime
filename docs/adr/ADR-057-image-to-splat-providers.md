@@ -303,8 +303,10 @@ author's, and a provider that builds the container is the author of that file's 
   - **PLY + facts** (today's GAUSSIANS lift path, which asks for PLY): the runtime builds the
     block from the facts, as before.
   - **An authored block** (any `camera` without a top-level `"source": "auto"`, a provider's or a
-    person's): passed through unchanged. The lift path returns it verbatim; `conv camera-block`
-    and `conv run --camera-block auto` leave the file byte for byte (`kept-authored`).
+    person's): passed through unchanged. `conv camera-block` and `conv run --camera-block auto`
+    leave the file byte for byte (`kept-authored`). The lift path returns it as authored, with one
+    re-expression: when it downscaled the photo, the block's `intrinsics` come back in the
+    caller's pixels, scaled exactly as the `facts` are (#2836); the file is never rewritten.
   - **An `auto` block**: the only kind the runtime rewrites. The convenience writer replaces it;
     the lift path builds its own block from the facts and keeps the auto block's focus.
 - **Authority when both exist.** A provider-authored block in the file wins over anything the
@@ -314,11 +316,13 @@ author's, and a provider that builds the container is the author of that file's 
   does.
 
 What does not change: the runtime still never writes or rewrites an authored block, display-time
-behaviour stays runtime policy (§3), and no ABI, struct or enum moves. Known gap: when the lift
-path downscaled the photo, a provider-authored SOG block comes back with intrinsics in the
-downscaled pixels while `facts` are scaled to the caller's
-([#2836](https://github.com/DisplayXR/displayxr-runtime/issues/2836); the lift path asks for PLY,
-so today only the open provider's `SPLAT_FORMAT=sog` test switch reaches it).
+behaviour stays runtime policy (§3), and no ABI, struct or enum moves. Resolved
+([#2836](https://github.com/DisplayXR/displayxr-runtime/issues/2836)): when the lift path
+downscaled the photo, a provider-authored SOG block used to come back with intrinsics in the
+downscaled pixels while `facts` were scaled to the caller's. The lift result's camera block is now
+a view of the file: only its `intrinsics` are re-expressed in the caller's pixels, with the scale
+the `facts` get, and the file is never rewritten. (The lift path asks for PLY, so today only the
+open provider's `SPLAT_FORMAT=sog` test switch reaches it.)
 
 ## Consequences
 

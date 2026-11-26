@@ -224,7 +224,8 @@ TEST_CASE("lift camera block: no facts at all -> the runtime's focus from the sp
 {
 	const std::vector<uint8_t> ply = make_ply(photo_cloud(0.6f, false));
 	char err[128] = {0};
-	cJSON *b = conv_lift_camera_block(nullptr, ply.data(), ply.size(), XRT_CONV_BLOB_PLY_3DGS, err, sizeof(err));
+	cJSON *b =
+	    conv_lift_camera_block(nullptr, 1.0, 1.0, ply.data(), ply.size(), XRT_CONV_BLOB_PLY_3DGS, err, sizeof(err));
 	REQUIRE(b != nullptr);
 	CHECK(str(b, "source") == "auto");
 	CHECK(str(b, "rig") == "camera");
@@ -248,7 +249,8 @@ TEST_CASE("lift camera block: no facts at all -> the runtime's focus from the sp
 	cJSON_Delete(b);
 
 	// Not a splat format: no block.
-	CHECK(conv_lift_camera_block(nullptr, ply.data(), ply.size(), XRT_CONV_BLOB_SPZ, err, sizeof(err)) == nullptr);
+	CHECK(conv_lift_camera_block(nullptr, 1.0, 1.0, ply.data(), ply.size(), XRT_CONV_BLOB_SPZ, err, sizeof(err)) ==
+	      nullptr);
 }
 
 TEST_CASE("lift camera block: facts without a focus suggestion -> intrinsics kept, runtime focus", "[conv_lift_camera]")
@@ -265,7 +267,7 @@ TEST_CASE("lift camera block: facts without a focus suggestion -> intrinsics kep
 	// The facade downscaled a 1536 x 1024 photo by 2: re-express in the caller's pixels.
 	conv_splat_facts_scale_intrinsics(facts, 2.0, 2.0);
 	const std::vector<uint8_t> ply = make_ply(photo_cloud(0.6f, false));
-	cJSON *b = conv_lift_camera_block(facts, ply.data(), ply.size(), XRT_CONV_BLOB_PLY_3DGS, nullptr, 0);
+	cJSON *b = conv_lift_camera_block(facts, 1.0, 1.0, ply.data(), ply.size(), XRT_CONV_BLOB_PLY_3DGS, nullptr, 0);
 	REQUIRE(b != nullptr);
 	const cJSON *in = cJSON_GetObjectItemCaseSensitive(b, "intrinsics");
 	REQUIRE(cJSON_IsObject(in));
@@ -304,7 +306,7 @@ TEST_CASE("lift camera block: the provider's focus suggestion wins, exactly as t
 	sr.focus_source = XRT_CONV_FOCUS_SOURCE_CONVERGENCE;
 	cJSON *facts = conv_splat_facts_to_json(&si, &sr);
 	const std::vector<uint8_t> ply = make_ply(photo_cloud(3.0f, false)); // splats disagree: ignored
-	cJSON *b = conv_lift_camera_block(facts, ply.data(), ply.size(), XRT_CONV_BLOB_PLY_3DGS, nullptr, 0);
+	cJSON *b = conv_lift_camera_block(facts, 1.0, 1.0, ply.data(), ply.size(), XRT_CONV_BLOB_PLY_3DGS, nullptr, 0);
 	REQUIRE(b != nullptr);
 	cJSON *ref = conv_camera_block_from_facts(facts, nullptr, 0);
 	REQUIRE(ref != nullptr);
@@ -334,7 +336,7 @@ TEST_CASE("lift camera block: a SOG's authored block is returned verbatim", "[co
 	si.grid_width = 1000;
 	si.grid_height = 800;
 	cJSON *facts = conv_splat_facts_to_json(&si, nullptr);
-	cJSON *b = conv_lift_camera_block(facts, sog.data(), sog.size(), XRT_CONV_BLOB_SOG, nullptr, 0);
+	cJSON *b = conv_lift_camera_block(facts, 1.0, 1.0, sog.data(), sog.size(), XRT_CONV_BLOB_SOG, nullptr, 0);
 	REQUIRE(b != nullptr);
 	CHECK(str(b, "source") == "author");
 	CHECK(str(b, "rig") == "display");
@@ -346,10 +348,193 @@ TEST_CASE("lift camera block: a SOG's authored block is returned verbatim", "[co
 	    "{\"count\":1,\"camera\":{\"source\":\"auto\",\"focus\":{\"point\":[0,0,1.25],"
 	    "\"subject_m\":1.25,\"source\":\"auto\"}}}";
 	const std::vector<uint8_t> sog2 = tiny_zip(autob);
-	b = conv_lift_camera_block(facts, sog2.data(), sog2.size(), XRT_CONV_BLOB_SOG, nullptr, 0);
+	b = conv_lift_camera_block(facts, 1.0, 1.0, sog2.data(), sog2.size(), XRT_CONV_BLOB_SOG, nullptr, 0);
 	REQUIRE(b != nullptr);
 	CHECK(num(cJSON_GetObjectItemCaseSensitive(b, "intrinsics"), "fx") == Catch::Approx(1000.0));
 	CHECK(num(cJSON_GetObjectItemCaseSensitive(b, "focus"), "subject_m") == Catch::Approx(1.25));
+	cJSON_Delete(b);
+	cJSON_Delete(facts);
+}
+
+/*
+ * #2836: an authored SOG block reaches a lift caller with its intrinsics in the
+ * caller's pixels (the facts' scale), every other field as authored; the blob
+ * itself is never rewritten.
+ */
+
+namespace {
+
+//! A provider-authored block in the pixels the provider was handed (a 768 x 512
+//! downscale of the caller's 1536 x 1024 photo), with keys the runtime does not know.
+const char *const kAuthoredMeta =
+    "{\"count\":1,\"camera\":{\"version\":2,\"source\":\"provider\",\"convention\":\"opencv\","
+    "\"rig\":\"camera\",\"rest\":{\"position\":[0,0,0],\"rotation\":[0,0,0,1]},"
+    "\"intrinsics\":{\"fx\":600.5,\"fy\":601.25,\"cx\":383.75,\"cy\":255.5,\"width\":768,\"height\":511,"
+    "\"model\":\"pinhole\"},"
+    "\"focus\":{\"point\":[0,0,0.75],\"subject_m\":0.75},\"dxr\":{\"vendor_key\":\"x\"}}}";
+
+//! The facts the same provider reports for that job (its own pixels).
+cJSON *
+provider_facts()
+{
+	xrt_conv_splat_info si{};
+	si.coords = XRT_CONV_COORDS_OPENCV;
+	si.intrinsics_source = XRT_CONV_INTRINSICS_ESTIMATED;
+	si.fx = 600.5f;
+	si.fy = 601.25f;
+	si.cx = 383.75f;
+	si.cy = 255.5f;
+	si.grid_width = 768;
+	si.grid_height = 511;
+	return conv_splat_facts_to_json(&si, nullptr);
+}
+
+std::string
+print(const cJSON *o)
+{
+	char *p = cJSON_PrintUnformatted(o);
+	std::string s = p != nullptr ? p : "";
+	std::free(p);
+	return s;
+}
+
+std::string
+print_without_intrinsics(const cJSON *o)
+{
+	cJSON *d = cJSON_Duplicate(o, true);
+	cJSON_DeleteItemFromObjectCaseSensitive(d, "intrinsics");
+	std::string s = print(d);
+	cJSON_Delete(d);
+	return s;
+}
+
+} // namespace
+
+TEST_CASE("lift camera block: an authored block's intrinsics follow the facts into the caller's pixels",
+          "[conv_lift_camera]")
+{
+	const std::vector<uint8_t> sog = tiny_zip(kAuthoredMeta);
+	const std::vector<uint8_t> sog_before = sog;
+	cJSON *meta = cJSON_Parse(kAuthoredMeta);
+	const cJSON *authored = cJSON_GetObjectItemCaseSensitive(meta, "camera");
+
+	// The facade downscaled 1536 x 1024 to 768 x 512 (511 rows after the provider's crop):
+	// caller pixels = provider pixels x 2 (job_scale_x / job_scale_y).
+	const double sx = 2.0, sy = 1024.0 / 512.0;
+	cJSON *facts = provider_facts();
+	conv_splat_facts_scale_intrinsics(facts, sx, sy);
+	cJSON *b = conv_lift_camera_block(facts, sx, sy, sog.data(), sog.size(), XRT_CONV_BLOB_SOG, nullptr, 0);
+	REQUIRE(b != nullptr);
+
+	const cJSON *in = cJSON_GetObjectItemCaseSensitive(b, "intrinsics");
+	REQUIRE(cJSON_IsObject(in));
+	CHECK(num(in, "fx") == 1201.0);
+	CHECK(num(in, "fy") == 1202.5);
+	CHECK(num(in, "cx") == 767.5);
+	CHECK(num(in, "cy") == 511.0);
+	CHECK(num(in, "width") == 1536.0);
+	CHECK(num(in, "height") == 1022.0);
+	CHECK(str(in, "model") == "pinhole"); // an unknown intrinsics key is kept
+
+	// The block and the facts carry the same numbers, printed the same way.
+	const cJSON *fin = cJSON_GetObjectItemCaseSensitive(facts, "intrinsics");
+	for (const char *k : {"fx", "fy", "cx", "cy", "width", "height"}) {
+		INFO(k);
+		CHECK(print(cJSON_GetObjectItemCaseSensitive(in, k)) ==
+		      print(cJSON_GetObjectItemCaseSensitive(fin, k)));
+	}
+
+	// Everything else is the author's, key order included.
+	CHECK(print_without_intrinsics(b) == print_without_intrinsics(authored));
+	std::string order;
+	const cJSON *it = nullptr;
+	cJSON_ArrayForEach(it, b)
+	{
+		order += std::string(it->string) + ",";
+	}
+	CHECK(order == "version,source,convention,rig,rest,intrinsics,focus,dxr,");
+
+	// The file is never rewritten: the blob bytes are untouched.
+	CHECK(sog == sog_before);
+	char *meta_after = conv_sog_read_meta_mem(sog.data(), sog.size(), nullptr, 0);
+	REQUIRE(meta_after != nullptr);
+	CHECK(std::string(meta_after) == kAuthoredMeta);
+	std::free(meta_after);
+
+	cJSON_Delete(b);
+	cJSON_Delete(facts);
+	cJSON_Delete(meta);
+}
+
+TEST_CASE("lift camera block: an authored block is verbatim when nothing was downscaled", "[conv_lift_camera]")
+{
+	const std::vector<uint8_t> sog = tiny_zip(kAuthoredMeta);
+	cJSON *meta = cJSON_Parse(kAuthoredMeta);
+	cJSON *facts = provider_facts();
+	cJSON *b = conv_lift_camera_block(facts, 1.0, 1.0, sog.data(), sog.size(), XRT_CONV_BLOB_SOG, nullptr, 0);
+	REQUIRE(b != nullptr);
+	CHECK(print(b) == print(cJSON_GetObjectItemCaseSensitive(meta, "camera")));
+	cJSON_Delete(b);
+	cJSON_Delete(facts);
+	cJSON_Delete(meta);
+}
+
+TEST_CASE("conv_camera_block_scale_intrinsics: no intrinsics, unit scale and malformed blocks are left alone",
+          "[conv_lift_camera]")
+{
+	// No intrinsics: untouched (a viewer estimates them).
+	cJSON *b = cJSON_Parse("{\"source\":\"author\",\"rig\":\"display\",\"focus\":{\"subject_m\":2}}");
+	const std::string before = print(b);
+	CHECK_FALSE(conv_camera_block_scale_intrinsics(b, 2.0, 2.0));
+	CHECK(print(b) == before);
+	cJSON_Delete(b);
+
+	// Unit / invalid scale: untouched.
+	b = cJSON_Parse("{\"source\":\"author\",\"intrinsics\":{\"fx\":600,\"cx\":300,\"width\":601}}");
+	const std::string before2 = print(b);
+	CHECK_FALSE(conv_camera_block_scale_intrinsics(b, 1.0, 1.0));
+	CHECK_FALSE(conv_camera_block_scale_intrinsics(b, 0.0, 2.0));
+	CHECK_FALSE(conv_camera_block_scale_intrinsics(b, 2.0, -1.0));
+	CHECK(print(b) == before2);
+	// A partial block scales the keys it has, by the facts' rule (width rounded).
+	CHECK(conv_camera_block_scale_intrinsics(b, 1.5, 3.0));
+	const cJSON *in = cJSON_GetObjectItemCaseSensitive(b, "intrinsics");
+	CHECK(num(in, "fx") == 900.0);
+	CHECK(num(in, "cx") == 450.0);
+	CHECK(num(in, "width") == 902.0); // 901.5 rounds half up, as the facts do
+	cJSON_Delete(b);
+
+	// Malformed: intrinsics not an object, or a key that is not a number. As authored, never partly scaled.
+	for (const char *j : {"{\"source\":\"author\",\"intrinsics\":[600,600,300,200]}",
+	                      "{\"source\":\"author\",\"intrinsics\":\"pinhole\"}",
+	                      "{\"source\":\"author\",\"intrinsics\":{\"fx\":600,\"cx\":\"300\",\"width\":600}}",
+	                      "{\"source\":\"author\",\"intrinsics\":{\"fx\":600,\"cy\":null}}"}) {
+		INFO(j);
+		cJSON *m = cJSON_Parse(j);
+		REQUIRE(m != nullptr);
+		const std::string mb = print(m);
+		CHECK_FALSE(conv_camera_block_scale_intrinsics(m, 2.0, 2.0));
+		CHECK(print(m) == mb);
+		cJSON_Delete(m);
+	}
+
+	// Not an object at all, or NULL: no crash, no change.
+	cJSON *arr = cJSON_Parse("[1,2,3]");
+	CHECK_FALSE(conv_camera_block_scale_intrinsics(arr, 2.0, 2.0));
+	cJSON_Delete(arr);
+	CHECK_FALSE(conv_camera_block_scale_intrinsics(nullptr, 2.0, 2.0));
+}
+
+TEST_CASE("lift camera block: a SOG whose meta.json does not parse falls back to the facts' block",
+          "[conv_lift_camera]")
+{
+	const std::vector<uint8_t> sog = tiny_zip("{\"count\":1,\"camera\":{\"source\":\"provider\",\"intrin");
+	cJSON *facts = provider_facts();
+	conv_splat_facts_scale_intrinsics(facts, 2.0, 2.0);
+	cJSON *b = conv_lift_camera_block(facts, 2.0, 2.0, sog.data(), sog.size(), XRT_CONV_BLOB_SOG, nullptr, 0);
+	REQUIRE(b != nullptr);
+	CHECK(str(b, "source") == "auto");
+	CHECK(num(cJSON_GetObjectItemCaseSensitive(b, "intrinsics"), "fx") == 1201.0); // facts, not doubled twice
 	cJSON_Delete(b);
 	cJSON_Delete(facts);
 }
