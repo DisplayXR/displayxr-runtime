@@ -1015,6 +1015,11 @@ glue_rb_read(void *ud,
 		return false;
 	}
 	bool fresh = false;
+	// The extent the returned samples were COPIED at. The re-issue below may
+	// move rb->w / rb->h to a resized depth texture in this same call; the
+	// samples are still the old copy (#2843: reading them at the new extent
+	// ran past the buffer and crashed the service).
+	uint32_t fresh_w = 0, fresh_h = 0;
 	const uint64_t now = os_monotonic_get_ns();
 	if (rb->pending && rb->staging != nullptr) {
 		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
@@ -1037,6 +1042,8 @@ glue_rb_read(void *ud,
 				}
 				l->svc_context->Unmap(rb->staging, 0);
 				fresh = true;
+				fresh_w = rb->w;
+				fresh_h = rb->h;
 			}
 		}
 	}
@@ -1072,9 +1079,9 @@ glue_rb_read(void *ud,
 	}
 	if (fresh) {
 		*out_samples = rb->samples.data();
-		*out_w = rb->w;
-		*out_h = rb->h;
-		*out_stride_floats = rb->w;
+		*out_w = fresh_w;
+		*out_h = fresh_h;
+		*out_stride_floats = fresh_w;
 	}
 	glue_leave(l);
 	return fresh;

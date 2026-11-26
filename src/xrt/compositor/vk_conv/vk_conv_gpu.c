@@ -1620,6 +1620,9 @@ glue_rb_read(void *ud,
 		os_mutex_unlock(&g->tab_mtx);
 	}
 	bool fresh = false;
+	// The extent the returned samples were COPIED at: the re-issue below may
+	// move rb_w / rb_h to a resized depth image in this same call (#2843).
+	uint32_t fresh_w = 0, fresh_h = 0;
 	if (s != NULL && s->rb_pending && vk->vkGetFenceStatus(vk->device, s->rb_fence) == VK_SUCCESS) {
 		s->rb_pending = false;
 		cmd_free(g, s->rb_cmd);
@@ -1640,6 +1643,8 @@ glue_rb_read(void *ud,
 				}
 			}
 			fresh = true;
+			fresh_w = s->rb_w;
+			fresh_h = s->rb_h;
 		}
 	}
 	const uint64_t now = os_monotonic_get_ns();
@@ -1690,9 +1695,9 @@ glue_rb_read(void *ud,
 	}
 	if (fresh) {
 		*out_samples = s->samples;
-		*out_w = s->rb_w;
-		*out_h = s->rb_h;
-		*out_stride_floats = s->rb_w;
+		*out_w = fresh_w;
+		*out_h = fresh_h;
+		*out_stride_floats = fresh_w;
 	}
 	os_mutex_unlock(&g->work_mtx);
 	gate_leave(g);
