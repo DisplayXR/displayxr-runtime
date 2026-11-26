@@ -1252,3 +1252,154 @@ TEST_CASE("status: per-screen viewer_tracking object (ADR-066 Part B)", "[status
 	CHECK(cJSON_IsNull(cJSON_GetObjectItem(vb, "active")));
 	CHECK(cJSON_IsNull(cJSON_GetObjectItem(vb, "provider")));
 }
+
+#if defined(DXR_TEST_HAVE_TARGET_LISTS) && !defined(_WIN32)
+#include "target_status_snapshot.h"
+#include "util/u_setting.h"
+
+#include <cstdlib>
+#include <unistd.h>
+
+namespace {
+
+void
+add_choice(
+    xrt_status_mode_3d &m, const char *name, const char *label, uint32_t views, uint32_t applies, const char *reason)
+{
+	xrt_status_mode_3d_choice &c = m.choices[m.choice_count++];
+	SET(c.name, name);
+	SET(c.label, label);
+	c.views = views;
+	c.passthrough = views == 1;
+	c.applies = applies;
+	SET(c.reason, reason);
+}
+
+//! sim-display's table as a running instance reports it: Quad declared only at start-up.
+void
+sim_mode_3d(xrt_status_mode_3d &m)
+{
+	std::memset(&m, 0, sizeof(m));
+	m.valid = true;
+	SET(m.active, "same_as_2d");
+	m.source = XRT_STATUS_MODE_3D_SOURCE_DRIVER_DEFAULT;
+	add_choice(m, "same_as_2d", "Same as 2D", 1, XRT_STATUS_MODE_3D_APPLIES_NOW, "");
+	add_choice(m, "anaglyph", "Anaglyph", 2, XRT_STATUS_MODE_3D_APPLIES_NOW, "");
+	add_choice(m, "cropped_sbs", "Cropped SBS", 2, XRT_STATUS_MODE_3D_APPLIES_NOW, "");
+	add_choice(m, "quad", "Quad", 4, XRT_STATUS_MODE_3D_APPLIES_RESTART_APP,
+	           "declared only at start-up: restart the app to apply");
+}
+
+std::string
+mode_3d_json(const xrt_status_mode_3d &m)
+{
+	cJSON *j = u_status_mode_3d_to_cjson(&m);
+	char *txt = cJSON_PrintUnformatted(j);
+	std::string out = txt != nullptr ? txt : "";
+	cJSON_free(txt);
+	cJSON_Delete(j);
+	return out;
+}
+
+} // namespace
+
+TEST_CASE("status: a stored 3D mode the driver does not offer is reported, with a reason, until reset",
+          "[status][mode_3d]")
+{
+	char tmpl[] = "/tmp/dxr_m3d_cfg_XXXXXX";
+	REQUIRE(mkdtemp(tmpl) != nullptr);
+	const char *old_cfg = getenv("XDG_CONFIG_HOME");
+	const std::string saved = old_cfg != nullptr ? old_cfg : "";
+	setenv("XDG_CONFIG_HOME", tmpl, 1);
+
+	auto s = healthy();
+	const std::string key = s->screens[0].key;
+	sim_mode_3d(s->screens[0].mode_3d);
+
+	SECTION("not in the table: setting = the stored name, source = its store, active = what is drawn")
+	{
+		REQUIRE(u_setting_user_set_mode_3d_for_screen(key.c_str(), "lenticular_9"));
+		target_status_snapshot_fill_mode_3d_setting(s.get());
+		const xrt_status_mode_3d &m = s->screens[0].mode_3d;
+		CHECK(std::string(m.setting) == "lenticular_9");
+		CHECK(m.source == XRT_STATUS_MODE_3D_SOURCE_USER);
+		CHECK(std::string(m.active) == "same_as_2d");
+		CHECK(std::string(m.reason) ==
+		      "the chosen 3D mode 'lenticular_9' is not offered by this display's driver; the default is used");
+		std::printf("stale-choice mode_3d JSON: %s\n", mode_3d_json(m).c_str());
+
+		// Headless says the same: a name it cannot find is never shown as active.
+		sim_mode_3d(s->screens[0].mode_3d);
+		s->source = XRT_STATUS_SOURCE_HEADLESS;
+		target_status_snapshot_fill_mode_3d_setting(s.get());
+		CHECK(std::string(m.active) == "same_as_2d");
+		CHECK(m.reason[0] != '\0');
+
+		// `dp mode reset --screen <key>` (the same writer, NULL) clears it.
+		REQUIRE(u_setting_user_set_mode_3d_for_screen(key.c_str(), nullptr));
+		sim_mode_3d(s->screens[0].mode_3d);
+		target_status_snapshot_fill_mode_3d_setting(s.get());
+		CHECK(m.setting[0] == '\0');
+		CHECK(m.reason[0] == '\0');
+		CHECK(m.source == XRT_STATUS_MODE_3D_SOURCE_DRIVER_DEFAULT);
+	}
+	SECTION("a restart_app choice is chosen and waiting: setting != active, no top-level reason")
+	{
+		REQUIRE(u_setting_user_set_mode_3d_for_screen(key.c_str(), "quad"));
+		target_status_snapshot_fill_mode_3d_setting(s.get());
+		const xrt_status_mode_3d &m = s->screens[0].mode_3d;
+		CHECK(std::string(m.setting) == "quad");
+		CHECK(m.source == XRT_STATUS_MODE_3D_SOURCE_USER);
+		CHECK(std::string(m.active) == "same_as_2d");
+		CHECK(m.reason[0] == '\0');
+		CHECK(m.choices[3].applies == XRT_STATUS_MODE_3D_APPLIES_RESTART_APP);
+		std::printf("restart_app-waiting mode_3d JSON: %s\n", mode_3d_json(m).c_str());
+	}
+	SECTION("a live choice, headless: shown active, its row `now` with no reason")
+	{
+		REQUIRE(u_setting_user_set_mode_3d_for_screen(key.c_str(), "anaglyph"));
+		s->source = XRT_STATUS_SOURCE_HEADLESS;
+		target_status_snapshot_fill_mode_3d_setting(s.get());
+		const xrt_status_mode_3d &m = s->screens[0].mode_3d;
+		CHECK(std::string(m.active) == "anaglyph");
+		CHECK(m.choices[1].applies == XRT_STATUS_MODE_3D_APPLIES_NOW);
+		CHECK(m.choices[1].reason[0] == '\0');
+	}
+
+	(void)u_setting_user_clear_mode_3d_per_screen();
+	const std::string f = std::string(tmpl) + "/displayxr/settings.json";
+	std::remove(f.c_str());
+	rmdir((std::string(tmpl) + "/displayxr").c_str());
+	rmdir(tmpl);
+	if (old_cfg != nullptr) {
+		setenv("XDG_CONFIG_HOME", saved.c_str(), 1);
+	} else {
+		unsetenv("XDG_CONFIG_HOME");
+	}
+}
+
+TEST_CASE("status: the active 3D mode's row reads `now` with no reason", "[status][mode_3d]")
+{
+	// An instance that started with the start-up-only Quad chosen: Quad is
+	// declared and drawn. Its row is not "restart the app to apply".
+	xrt_status_mode_3d m;
+	sim_mode_3d(m);
+	SET(m.active, "quad");
+	m.choices[3].applies = XRT_STATUS_MODE_3D_APPLIES_NOW; // declared for this instance
+	m.choices[3].reason[0] = '\0';
+	SET(m.choices[3].reason, "4 views: stereo apps show 2D");
+	u_status_mode_3d_mark_active(&m);
+	CHECK(m.choices[3].applies == XRT_STATUS_MODE_3D_APPLIES_NOW);
+	CHECK(m.choices[3].reason[0] == '\0');
+	// The others are live switches away from it.
+	for (uint32_t k = 0; k < 3; k++) {
+		CHECK(m.choices[k].applies == XRT_STATUS_MODE_3D_APPLIES_NOW);
+		CHECK(m.choices[k].reason[0] == '\0');
+	}
+	// Moving `active` again restores the caveat on the row left behind.
+	SET(m.active, "anaglyph");
+	u_status_mode_3d_mark_active(&m);
+	CHECK(std::string(m.choices[3].reason) == "4 views: stereo apps show 2D");
+	CHECK(m.choices[1].reason[0] == '\0');
+}
+#endif

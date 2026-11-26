@@ -12,6 +12,7 @@
 #include "util/u_rendering_modes.h"
 #include "util/u_logging.h"
 #include "util/u_setting.h"
+#include "util/u_status_snapshot.h"
 
 #include "xrt/xrt_display_status.h"
 
@@ -824,6 +825,9 @@ u_device_rendering_modes_fill_status(struct xrt_device *xdev, struct xrt_status_
 	if (r != NULL) {
 		record_unlock(r);
 	}
+	// The entry slot 1 maps to is in effect: its row reads `now`, no reason
+	// (a start-up-only entry this instance declared at start included).
+	u_status_mode_3d_mark_active(out);
 }
 
 void

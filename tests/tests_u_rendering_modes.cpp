@@ -18,6 +18,7 @@
 #include "catch_amalgamated.hpp"
 
 #include "util/u_rendering_modes.h"
+#include "util/u_status_snapshot.h"
 #include "util/u_tiling.h"
 #include "xrt/xrt_display_status.h"
 
@@ -25,6 +26,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <cjson/cJSON.h>
 
 namespace {
 
@@ -1174,6 +1177,65 @@ TEST_CASE("C1: the per-screen choice outranks the driver's default", "[u_renderi
 		CHECK(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
 		CHECK(std::string(d.xdev.rendering_modes[1].mode_name) == "Same as 2D");
 	}
+	u_rendering_modes_set_choice_resolver(nullptr);
+	g_choice[0] = '\0';
+}
+
+TEST_CASE("C1: an instance started with the start-up-only Quad chosen reports it truthfully",
+          "[u_rendering_modes][adr066][device]")
+{
+	// target_instance.c's start order: enforce, then declare the stored
+	// start-up-only choice (promote), then the refresh honours it.
+	config_driver d(sim_like_list(false), 1);
+	u_rendering_modes_set_choice_resolver(test_resolver);
+	std::snprintf(g_choice, sizeof(g_choice), "%s", "quad");
+	g_choice_source = XRT_STATUS_MODE_3D_SOURCE_USER;
+	REQUIRE(u_device_enforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+	REQUIRE(d.hmd.view_count == 2); // Quad not declared yet: outside the envelope
+	REQUIRE(u_device_rendering_modes_promote_choice(&d.xdev, "quad"));
+	CHECK(d.hmd.view_count == 4); // C1: this instance locates 4 views, for its whole life
+	CHECK(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+	REQUIRE(std::string(d.xdev.rendering_modes[1].mode_name) == "Quad");
+
+	xrt_status_mode_3d st{};
+	u_device_rendering_modes_fill_status(&d.xdev, &st);
+	CHECK(std::string(st.active) == "quad");
+	CHECK(std::string(st.setting) == "quad");
+	CHECK(st.source == XRT_STATUS_MODE_3D_SOURCE_USER);
+	REQUIRE(st.choice_count == 4);
+	// The active row: in effect - `now`, no reason (not "restart the app").
+	CHECK(std::string(st.choices[3].name) == "quad");
+	CHECK(st.choices[3].applies == XRT_STATUS_MODE_3D_APPLIES_NOW);
+	CHECK(st.choices[3].reason[0] == '\0');
+	// Every other row is a live switch: Quad is now inside the envelope, the
+	// view count stays 4, a 1- or 2-view entry under-fills it (C1.4).
+	for (uint32_t k = 0; k < 3; k++) {
+		INFO(st.choices[k].name);
+		CHECK(st.choices[k].applies == XRT_STATUS_MODE_3D_APPLIES_NOW);
+		CHECK(st.choices[k].reason[0] == '\0');
+	}
+	{
+		cJSON *j = u_status_mode_3d_to_cjson(&st);
+		char *txt = cJSON_PrintUnformatted(j);
+		std::printf("quad-active mode_3d JSON: %s\n", txt);
+		cJSON_free(txt);
+		cJSON_Delete(j);
+	}
+
+	// Switching away really is live, and back again too, in this instance.
+	std::snprintf(g_choice, sizeof(g_choice), "%s", "anaglyph");
+	CHECK(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+	CHECK(std::string(d.xdev.rendering_modes[1].mode_name) == "Anaglyph");
+	CHECK(d.hmd.view_count == 4);
+	u_device_rendering_modes_fill_status(&d.xdev, &st);
+	CHECK(std::string(st.active) == "anaglyph");
+	CHECK(st.choices[1].reason[0] == '\0');
+	CHECK(st.choices[3].applies == XRT_STATUS_MODE_3D_APPLIES_NOW);
+	CHECK(std::string(st.choices[3].reason) == "4 views: stereo apps show 2D");
+	std::snprintf(g_choice, sizeof(g_choice), "%s", "quad");
+	CHECK(u_device_rendering_modes_refresh_config(&d.xdev, "sim-display"));
+	CHECK(std::string(d.xdev.rendering_modes[1].mode_name) == "Quad");
+
 	u_rendering_modes_set_choice_resolver(nullptr);
 	g_choice[0] = '\0';
 }

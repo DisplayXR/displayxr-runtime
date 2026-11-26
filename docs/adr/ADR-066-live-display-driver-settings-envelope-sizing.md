@@ -253,7 +253,10 @@ other kinds are explicit choices.
 - Slot 0 is the full-screen 2D entry in every case.
 - **Quad stays out of the declared list unless it is selected at start-up** (interim decision). It
   is the only entry with more than two views, and leaving it out keeps sim_display's maximum view
-  count at 2 (C1.8). Choosing Quad on a running system therefore reports `applies: restart_app`.
+  count at 2 (C1.8). Choosing Quad on a running system therefore reports `applies: restart_app`:
+  the choice is stored, and the next instance that starts declares Quad (ADR-047 Amendment 10). In
+  that instance Quad is part of the declared list and the located view count is 4 for the
+  instance's life, so every entry, Quad included, switches live there (C1.3).
 - The `OUTPUT` value names `2d` and `passthrough` currently mean "anaglyph, and start in 2D"
   (`sim_display_settings.c:51-54`). With "Same as 2D" as the default, they become aliases of it.
   The entry's own name must not reuse them, and must not collide with #2576's `sbs_full` (a
@@ -261,37 +264,67 @@ other kinds are explicit choices.
 
 **C1.3 The CLI, status and Dashboard contract for the 3D mode** (agreed with the Dashboard owner):
 - **`displayxr-cli dp mode list [--screen <key>] [--json]`** lists each screen's choices.
-- **`displayxr-cli dp mode set <name> --screen <key> [--machine]`** applies live, through the DIAG
-  call. It is refused with a reason when it cannot apply (`applies` is not `now`).
-- **`displayxr-cli dp mode reset --screen <key>|all [--machine]`** clears the choice. It is distinct
-  from `dp reset --screen`, which resets the screen's display-processor preference.
+- **`displayxr-cli dp mode set <name> --screen <key> [--machine]`** stores the choice. A `now`
+  choice applies live, through the DIAG call. A `restart_app` choice is **stored** and applied at
+  the next start of the app (and of the service, for apps attached to it); running apps keep their
+  current 3D mode, and the CLI says so. Only a `not_supported` choice, or a name that is not one of
+  the screen's choices, is refused, with the reason, and nothing is written.
+- **`displayxr-cli dp mode reset --screen <key>|all [--machine]`** clears the choice, including a
+  stored name the driver no longer offers. It is distinct from `dp reset --screen`, which resets the
+  screen's display-processor preference.
 - **`status --json`, per screen row:**
   ```json
   "mode_3d": {
-    "active": "<name>",
+    "active": "<name>" | null,
     "setting": "<name>" | null,
     "source": "user|machine|driver_default|runtime_default",
+    "reason": "…" | null,
     "choices": [{"name": "…", "label": "…", "views": 2, "tracked": true, "passthrough": false,
-                 "applies": "now|restart_app|not_supported", "reason": "…"}]
+                 "applies": "now|restart_app|not_supported", "reason": "…" | null}]
   }
   ```
-  `label` comes from the driver's declared entry (`mode_name`).
-- **The runtime computes `applies` and `reason`.** The 3D mode is a runtime-owned choice, so no
-  driver `get_setting_status` speaks for it (the "Not supported here" chip in the Dashboard's driver
-  options comes from that slot, ADR-054 Amendment 3). The rule:
-  - `now`: the entry is in the declared list of the screen's driver;
-  - `restart_app`: the entry is declared only at start-up (sim_display's Quad today), or it needs
-    more views than a running instance can locate (C3). The reason names which;
-  - `not_supported`: the driver's `get_setting_status` for the setting that would declare the entry
-    says so. Its note becomes the reason.
+  - `label` comes from the driver's declared entry (`mode_name`).
+  - `active` is the entry slot 1 maps to now: what is drawn. It is null only when the screen's
+    driver declares no 3D modes now.
+  - `setting` is the stored per-screen choice, null when none is stored. **`setting` different from
+    `active` means "chosen, waiting for a restart"** (a `restart_app` choice), unless the top-level
+    `reason` says the choice is not honoured at all.
+  - `source` says what chose slot 1: `user` or `machine` whenever a choice is stored (the store a
+    `dp mode reset`, with or without `--machine`, must clear), else `driver_default` (the driver's
+    own setting, sim_display's `OUTPUT`) or `runtime_default` (nothing chose: ADR-065's trim).
+  - The top-level `reason` is null unless a stored choice cannot be honoured: "the chosen 3D mode
+    '<name>' is not offered by this display's driver; the default is used" (a name the table does
+    not list: an entry the driver no longer declares, or a hand-written typo), "… cannot apply here;
+    the default is used" (a `not_supported` entry), or "this display's driver declares no 3D modes
+    now" (no table; `active` null, `choices` empty). A reader offers a reset on a non-null reason.
+- **The runtime computes `applies` and `reason` itself**, in `u_device_rendering_modes_fill_status`
+  (the head device) and `u_screen_modes_fill_status` (every other screen). The 3D mode is a
+  runtime-owned choice, so no driver `get_setting_status` speaks for it (the "Not supported here"
+  chip in the Dashboard's driver options comes from that slot, ADR-054 Amendment 3). The rule, per
+  row:
+  - the row of the **active** entry is always `now` with a null reason: choosing it changes
+    nothing. This holds for a start-up-only entry the running instance declared at its start
+    (sim_display's Quad after a restart with Quad stored);
+  - `not_supported`: the entry needs more views than can be presented (`XRT_MAX_VIEWS`, C1.1);
+  - `restart_app`: the entry is declared only at start-up and this instance did not declare it
+    (sim_display's Quad today), or it lies outside what the running instance was sized for (C3, a
+    screen that came after the apps were sized). The reason names which;
+  - `now`: everything else, an entry of the declared list.
 
-  A choice whose entry a running stereo session cannot fill is still `now`: that session is floored
-  to 2D (C1.7), and the reason says so ("stereo apps show 2D").
+  A `now` choice whose entry a running stereo session cannot fill stays `now`: that session is
+  floored to 2D (C1.7), and the reason says so ("<N> views: stereo apps show 2D").
+
+  In an instance started with a start-up-only entry chosen (Quad), that entry is part of the
+  declared list and the located view count is its 4 for the instance's life (C1.4). Every other
+  row is then `now`: switching away from Quad and back is a live remap (a 1- or 2-view entry
+  under-fills the 4 located views), not a restart.
 - **Dashboard.**
   - Each screen card gets a "3D mode" picker, shown only when the screen's driver has more than one
     entry that can be slot 1.
-  - The picker says "Applies now to running apps" and greys out a `restart_app` or `not_supported`
-    choice with its reason.
+  - The picker says "Applies now to running apps" for a `now` choice. A `restart_app` choice stays
+    selectable, with its reason: selecting it stores it, and the picker shows it as chosen and
+    waiting for a restart while `setting` differs from `active`. A `not_supported` choice is
+    greyed out with its reason. A non-null top-level `reason` is shown with a reset.
   - The existing driver-options note, "Changes apply the next time a 3D app starts"
     (`src/dashboard/DisplayXR.Dashboard/Model/DriverOptions.cs:297`), stays under the Components
     options block, where it remains true for driver settings. It must not appear next to the 3D-mode
@@ -744,7 +777,8 @@ event and the worst-case statement.**
     picker. Each switch lands within about 1 s with a table-changed event, no `xrCreateSwapchain` in
     the app's log, and no service or app restart.
   - Anaglyph is tracked, with the eye-tracking-state event, when stage 2's tracking is on.
-  - `dp mode set quad` is refused with `restart_app` and its reason. With Quad selected at start-up,
+  - `dp mode set quad` reports `restart_app` and its reason, and stores the choice (`setting`
+    "quad", `active` unchanged) for the next start. With Quad selected at start-up,
     a `PRIMARY_STEREO` app facing it is floored to 2D with the denial event, and a
     `PRIMARY_MULTIVIEW_DXR` app locates 4 views and reports `activeViewCount` 1 / 2 / 4.
   - V toggles between the two slots in every 3D mode, including Same as 2D.

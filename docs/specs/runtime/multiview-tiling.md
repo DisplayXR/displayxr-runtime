@@ -111,7 +111,10 @@ whole declared list is sized for (ADR-066 C1, which restored the pre-ADR-065 rul
 driver's runtime-side allocation is the largest over every entry it declares, and v28 states it to
 apps (`maxAtlasWidthPixels` / `maxAtlasHeightPixels`; `maxImageRect*` covers the largest view).
 An entry the driver lists as start-up-only
-(`XRT_RENDERING_MODE_FLAG_START_UP_ONLY`) is outside the envelope and cannot be switched to live.
+(`XRT_RENDERING_MODE_FLAG_START_UP_ONLY`) is outside the envelope and cannot be switched to live
+(`applies: restart_app`), unless it is the screen's stored 3D-mode choice when the instance starts:
+then it is declared for that instance, sizes the envelope, and it and every other entry switch
+live for the instance's life.
 
 ---
 

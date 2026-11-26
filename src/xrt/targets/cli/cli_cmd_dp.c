@@ -44,7 +44,8 @@
  *   dp mode reset --screen <key>|all [--machine]
  *                      ADR-066 C1: a screen's 3D mode — which entry of its
  *                      driver's declared list the 3D slot maps to. Stored per
- *                      screen like `dp use --screen`; applies live.
+ *                      screen like `dp use --screen`; a `now` choice applies
+ *                      live, a `restart_app` one at the next start.
  *
  *   dp use <id> --screen <key> [--machine]
  *   dp reset --screen <key>|all [--machine]
@@ -874,7 +875,10 @@ cmd_reset_screen(const char *key, bool machine)
  * driver's declared list. The choice is per screen and runtime-owned, stored
  * like `dp use --screen` (per user, or --machine); with none, the driver's own
  * default applies (sim-display: its OUTPUT setting). The running service (and
- * every in-process app) re-reads it within ~1 s and remaps live.
+ * every in-process app) re-reads it within ~1 s and remaps live; a
+ * `restart_app` choice (a start-up-only entry) is stored and declared at the
+ * next start. A stored name the driver does not list is reported with a
+ * top-level `reason` and never honoured; `dp mode reset` clears it.
  *
  */
 
@@ -923,6 +927,14 @@ mode_print_row(const struct xrt_status_screen *sc)
 	P("    slot 0: 2D (full screen, not configurable)\n");
 	P("    slot 1 (3D mode): %s  [source: %s%s%s%s]\n", m->active, u_status_mode_3d_source_str(m->source),
 	  m->setting[0] != '\0' ? ", setting '" : "", m->setting, m->setting[0] != '\0' ? "'" : "");
+	if (m->reason[0] != '\0') {
+		// A stored choice that is not honoured (not offered, cannot apply).
+		P("    note: %s - clear it with: displayxr-cli dp mode reset --screen %s%s\n", m->reason, sc->key,
+		  m->source == XRT_STATUS_MODE_3D_SOURCE_MACHINE ? " --machine" : "");
+	} else if (m->setting[0] != '\0' && strcmp(m->setting, m->active) != 0) {
+		P("    note: '%s' is chosen and applies at the next start; '%s' is drawn until then\n", m->setting,
+		  m->active);
+	}
 	for (uint32_t k = 0; k < m->choice_count; k++) {
 		const struct xrt_status_mode_3d_choice *c = &m->choices[k];
 		P("      %c %-16s %-16s %u view%s%s%s  applies: %s%s%s\n", strcmp(c->name, m->active) == 0 ? '*' : ' ',
@@ -977,7 +989,8 @@ cmd_mode_list(const char *screen, bool json)
 				mode_print_row(&snap->screens[i]);
 			}
 		}
-		P("Set one with: displayxr-cli dp mode set <name> --screen <key>   (applies live)\n");
+		P("Set one with: displayxr-cli dp mode set <name> --screen <key>   (a 'now' choice applies live; a "
+		  "'restart_app' one is stored and applies at the next start)\n");
 	}
 	free(snap);
 	return 0;

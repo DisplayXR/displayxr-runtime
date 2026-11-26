@@ -28,7 +28,8 @@ types it advertises, how many views each reports, what `xrLocateViews` and
 > 3D-mode switch remaps slot 1 live (`XrEventDataRenderingModeTableChangedDXR`) and
 > never changes the located count; the active slot's view count moves, and
 > `XrViewActivityStateDXR.activeViewCount` reports it. On sim-display the default
-> list tops out at 2 views (Quad is declared only when `OUTPUT=quad` at start-up),
+> list tops out at 2 views (Quad is declared only when it is the 3D mode at start-up:
+> `OUTPUT=quad`, or a stored `dp mode set quad` choice),
 > so nothing changes there by default. A stereo session against a 4-view slot 1 has
 > no 2-view 3D mode to fall back to: the floor below takes it to **2D** (also at a
 > live switch, with a 1 → 0 mode-changed event), and a request for mode 1 is denied.

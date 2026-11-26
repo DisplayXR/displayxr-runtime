@@ -87,7 +87,11 @@ screen's stored `dp mode set quad` choice (then it behaves as before); otherwise
 as start-up-only (`XRT_RENDERING_MODE_FLAG_START_UP_ONLY`) and `dp mode list` reports it
 `applies: restart_app`. `dp mode set quad` then **stores** the choice and exits 0 ("stored; applies
 the next time the app starts"): running apps keep drawing their current 3D mode (`mode_3d.active`),
-`mode_3d.setting` is `quad`, and the next start declares Quad for that screen. A stereo session (`PRIMARY_STEREO`, every legacy app, the engine
+`mode_3d.setting` is `quad`, and the next start declares Quad for that screen. In that started
+instance `mode_3d.active` is `quad` and its row reads `applies: now` with a null reason; every other
+entry is `now` too (the located view count stays 4, so switching away from Quad and back is live).
+A stored name the driver does not list is reported with a top-level `mode_3d.reason` and cleared by
+`dp mode reset --screen <key>`. A stereo session (`PRIMARY_STEREO`, every legacy app, the engine
 plug-ins, the browser) cannot fill four tiles: the session-begin floor drops it to 2D, a request
 for slot 1 is denied, and a live switch to Quad while it is in 3D floors it to 2D with an index
 1 → 0 event. A `PRIMARY_MULTIVIEW_DXR` session fills all four. To hold a stereo app in Quad anyway

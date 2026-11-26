@@ -632,6 +632,12 @@ target_include_directories(tests_ipc_app_group PRIVATE ${PROJECT_SOURCE_DIR}/src
 # ADR-051 -- the display status snapshot: §4 warning rules, §3 JSON shape, §7
 # text formatter (util/u_status_snapshot.h). Pure; synthetic snapshots only.
 target_link_libraries(tests_status_snapshot PRIVATE xrt-interfaces)
+# ADR-066 C1 -- the per-screen 3D-mode choice as `mode_3d` reports it
+# (target_status_snapshot_fill_mode_3d_setting over the real per-user store).
+if(TARGET target_lists)
+	target_link_libraries(tests_status_snapshot PRIVATE target_lists aux_util)
+	target_compile_definitions(tests_status_snapshot PRIVATE DXR_TEST_HAVE_TARGET_LISTS=1)
+endif()
 
 # ADR-051 D3 (phase 2) -- the snapshot crosses the DIAG IPC path as head + one
 # screen row per system_get_status_snapshot reply + one client row per

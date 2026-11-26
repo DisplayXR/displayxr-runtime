@@ -215,6 +215,23 @@ u_status_mode_3d_applies_str(uint32_t applies)
 	}
 }
 
+void
+u_status_mode_3d_mark_active(struct xrt_status_mode_3d *m3)
+{
+	if (m3 == NULL || !m3->valid) {
+		return;
+	}
+	for (uint32_t i = 0; i < m3->choice_count && i < XRT_STATUS_MAX_MODE_3D_CHOICES; i++) {
+		struct xrt_status_mode_3d_choice *c = &m3->choices[i];
+		if (m3->active[0] != '\0' && strcmp(c->name, m3->active) == 0) {
+			c->applies = XRT_STATUS_MODE_3D_APPLIES_NOW;
+			c->reason[0] = '\0';
+		} else if (c->applies == XRT_STATUS_MODE_3D_APPLIES_NOW && c->views > 2 && c->reason[0] == '\0') {
+			(void)snprintf(c->reason, sizeof(c->reason), "%u views: stereo apps show 2D", c->views);
+		}
+	}
+}
+
 cJSON *
 u_status_mode_3d_to_cjson(const struct xrt_status_mode_3d *m3)
 {
