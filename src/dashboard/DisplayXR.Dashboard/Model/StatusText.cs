@@ -566,7 +566,7 @@ public static class StatusText
     /// <summary>What the 3D mode picker does, in plain words.</summary>
     public const string Mode3DExplanation =
         "How this display shows a 3D app. Most changes apply right away, also to apps that are already running. " +
-        "Some apply the next time an app starts.";
+        "Some apply the next time an app starts (for an app that runs through the DisplayXR service, the next time the service starts).";
 
     /// <summary>
     /// Whether a display card shows the 3D mode picker: only when the feed reports the screen's 3D modes
@@ -597,7 +597,7 @@ public static class StatusText
     /// (not the one drawn now) the plain fact that it does.
     /// </summary>
     public static string Mode3DItemText(Mode3D m, Mode3DChoice c) =>
-        c.NeedsRestart && c.Name != m.Active ? $"{c.Label} (applies the next time an app starts)" : c.Label;
+        c.NeedsRestart && c.Name != m.Active ? $"{c.Label} (applies at the next start)" : c.Label;
 
     /// <summary>
     /// The picker's selected entry: the stored choice when it is listed (it is what was picked, also while
@@ -611,6 +611,13 @@ public static class StatusText
                 if (items[i].Name == name) return i;
         return -1;
     }
+
+    /// <summary>
+    /// When a stored start-up-only choice takes effect. An app that runs through the DisplayXR service
+    /// gets it when the service starts, not when the app does (the service declares its modes at its own start).
+    /// </summary>
+    public const string Mode3DNextStart =
+        "It applies the next time an app starts; for an app that runs through the DisplayXR service, the next time the service starts.";
 
     /// <summary>The CLI verb a picker choice runs (per user, as every per-screen choice here).</summary>
     public static CliArgs Mode3DVerb(string key, Mode3DChoice choice) => new("dp", "mode", "set", choice.Name, "--screen", key);
@@ -649,20 +656,24 @@ public static class StatusText
         bool waiting = stored is not null && stored.Name != m.Active;
         if (waiting && stored!.NeedsRestart)
             notes.Add(active is null
-                ? $"{stored.Label} is stored. It applies the next time an app starts."
-                : $"{stored.Label} is stored. It applies the next time an app starts. Apps that are running keep {active.Label}.");
+                ? $"{stored.Label} is stored. {Mode3DNextStart}"
+                : $"{stored.Label} is stored. {Mode3DNextStart} Apps that are running keep {active.Label}.");
+        else if (m.Reason is { Length: > 0 } unused && m.Choices.Count > 0)
+            notes.Add(Sentence(unused)); // the runtime's own words for a stored choice it does not use
         else if (waiting && stored!.NotSupported)
             notes.Add(stored.Reason is { Length: > 0 } why
                 ? $"{stored.Label} is stored, but this display cannot show it: {why}."
                 : $"{stored.Label} is stored, but this display cannot show it.");
         else if (!waiting && active is { Reason: { Length: > 0 } note })
             notes.Add(Sentence(note));
-        if (m.Setting is { Length: > 0 } name && stored is null && m.Choices.Count > 0)
+        if (m.Setting is { Length: > 0 } name && stored is null && m.Choices.Count > 0 && m.Reason is null)
             notes.Add($"The stored choice \"{name}\" is not one of this display's 3D modes and is not used.");
         var missing = m.Choices.Where(c => c.NotSupported && c.Name != m.Active && c.Name != m.Setting)
             .Select(c => c.Reason is { Length: > 0 } r ? $"{c.Label} ({r})" : c.Label).ToList();
         if (missing.Count > 0) notes.Add($"Not available on this display: {string.Join("; ", missing)}.");
         if (m.Choices.Count == 0 && m.Reason is { Length: > 0 } none) notes.Add(Sentence(none));
+        if (m.Reason is not null && m.Source == "machine")
+            notes.Add("It was chosen for everyone on this PC, so it cannot be cleared here. An administrator can clear it with: displayxr-cli dp mode reset --screen <key> --machine");
         return notes;
     }
 

@@ -43,7 +43,7 @@ public class Mode3DTests
         Assert.Null(m.Reason);
         Assert.Empty(StatusText.Mode3DNotes(m)); // a mode that waits for an app start says nothing until it is stored
         // In the list it can be picked, and says in plain words when it applies.
-        Assert.Equal(new[] { "Same as 2D", "Anaglyph", "Quad (applies the next time an app starts)" },
+        Assert.Equal(new[] { "Same as 2D", "Anaglyph", "Quad (applies at the next start)" },
                      StatusText.Mode3DItems(m).Select(c => StatusText.Mode3DItemText(m, c)));
     }
 
@@ -94,8 +94,8 @@ public class Mode3DTests
         var items = StatusText.Mode3DItems(stored);
         Assert.Equal(2, items.Count); // listed, so it can be picked
         Assert.Equal(1, StatusText.Mode3DSelected(stored)); // the picker keeps what was picked
-        Assert.Equal("Quad (applies the next time an app starts)", StatusText.Mode3DItemText(stored, items[1]));
-        Assert.Equal(new[] { "Quad is stored. It applies the next time an app starts. Apps that are running keep Anaglyph." },
+        Assert.Equal("Quad (applies at the next start)", StatusText.Mode3DItemText(stored, items[1]));
+        Assert.Equal(new[] { $"Quad is stored. {StatusText.Mode3DNextStart} Apps that are running keep Anaglyph." },
                      StatusText.Mode3DNotes(stored));
         Assert.True(StatusText.Mode3DCanReset(stored));
         Assert.Equal("dp mode set quad --screen SIM-0006-F", StatusText.Mode3DVerb("SIM-0006-F", items[1]).ToString());
@@ -107,7 +107,7 @@ public class Mode3DTests
         Assert.Equal(new[] { "Declared only at start-up: restart the app to apply." }, StatusText.Mode3DNotes(inUse));
 
         // The mode drawn now is unknown: the sentence about running apps is left out.
-        Assert.Equal(new[] { "Quad is stored. It applies the next time an app starts." },
+        Assert.Equal(new[] { $"Quad is stored. {StatusText.Mode3DNextStart}" },
                      StatusText.Mode3DNotes(stored with { Active = null }));
     }
 
@@ -260,5 +260,39 @@ public class Mode3DTests
         Assert.True(DriverOptions.TryParse(TestData.Text("dp-options-leia-sr.json"), out var leia));
         Assert.Equal(OptionViews.Build("leia-sr", leia!).Friendly.Select(v => v.Key),
                      OptionViews.Build("leia-sr", leia!, modeOnDisplays: true).Friendly.Select(v => v.Key));
+    }
+
+    private static Mode3D Parse(string mode3dJson) =>
+        TestData.Parse("{\"schema\":1,\"screens\":[{\"key\":\"K\",\"mode_3d\":" + mode3dJson + "}]}").Screens.Single().Mode3D!;
+
+    private const string Choices =
+        "[{\"name\":\"same_as_2d\",\"label\":\"Same as 2D\",\"views\":1,\"applies\":\"now\",\"reason\":null}," +
+        "{\"name\":\"quad\",\"label\":\"Quad\",\"views\":4,\"applies\":\"now\",\"reason\":null}]";
+
+    [Fact]
+    public void StoredNameTheDriverDoesNotOffer_ShowsTheRuntimesReasonOnce_AndCanBeReset()
+    {
+        const string why = "the chosen 3D mode 'lenticular_9' is not offered by this display's driver; the default is used";
+        var m = Parse("{\"active\":\"same_as_2d\",\"setting\":\"lenticular_9\",\"source\":\"user\",\"reason\":\"" + why + "\",\"choices\":" + Choices + "}");
+        Assert.Equal(why, m.Reason);
+        Assert.Equal(0, StatusText.Mode3DSelected(m)); // the mode drawn now
+        Assert.True(StatusText.Mode3DCanReset(m));
+        Assert.Equal(new[] { "The chosen 3D mode 'lenticular_9' is not offered by this display's driver; the default is used." },
+                     StatusText.Mode3DNotes(m));
+
+        // Stored for everyone: no reset here, and the note says who can clear it.
+        var machine = m with { Source = "machine" };
+        Assert.False(StatusText.Mode3DCanReset(machine));
+        Assert.Equal(2, StatusText.Mode3DNotes(machine).Count);
+        Assert.Contains("--machine", StatusText.Mode3DNotes(machine)[1]);
+    }
+
+    [Fact]
+    public void InstanceStartedWithQuad_ShowsQuadSelected_WithNoNote()
+    {
+        var m = Parse("{\"active\":\"quad\",\"setting\":\"quad\",\"source\":\"user\",\"reason\":null,\"choices\":" + Choices + "}");
+        Assert.Equal(1, StatusText.Mode3DSelected(m));
+        Assert.Equal("Quad", StatusText.Mode3DItemText(m, m.Choices[1]));
+        Assert.Empty(StatusText.Mode3DNotes(m));
     }
 }
