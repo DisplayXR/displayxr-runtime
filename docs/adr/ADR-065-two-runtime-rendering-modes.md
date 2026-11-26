@@ -148,3 +148,27 @@ would buy switching the kind without restarting 3D apps; it would not buy a smal
   plug-in with three modes would keep exposing three. The runtime enforces the contract at the
   one apply point; drivers are updated to declare two anyway.
 - **Raise or lower `XRT_MAX_RENDERING_MODES`.** Rejected: an ABI break for no gain.
+
+## Amendment 1 (2026-11-26): the driver never decides an app's start mode
+
+**Decision.** Decision 3 ("`sim_display` starts in 2D") is withdrawn. Project lead, 2026-11-26:
+"sim display should NOT decide for the app, the app decides which mode it starts in."
+
+- Every display driver starts in its 3D slot (index 1), as the hardware drivers always have (the
+  Leia plug-in starts in `LEIA_MODE_3D`). `sim_display` now does the same.
+- The **app** picks its mode: `xrRequestDisplayRenderingModeDXR` (or the user, with V / 0 / 1). A
+  driver setting never chooses it for the app.
+- `START_3D` is deprecated: still declared (so stored values and old recipes do not error), no
+  effect, one WARN when set. The Dashboard drops its "Start in" control. `FORCE_MODE` stays: it
+  is a developer pin, not a start policy.
+
+**Why decision 3's reason is gone.** It existed so a PC with no 3D display would not open apps in
+red/cyan. Since ADR-066 the default 3D mode is **Same as 2D** (one full-resolution passthrough
+view), so slot 1 already looks like 2D on an ordinary screen. A user who picks a stereo kind
+(anaglyph, SBS, ...) in the Dashboard expects to see it in the app at once, not after a key press.
+
+**Unchanged.** Decisions 4-7 (sizing over the two modes, no swapchain rebuilds, the floors for
+kinds with more views than a session can fill, the key map). A legacy app keeps its sizing rule
+(`oxr_legacy_compromise_mode_index`); a session that cannot fill slot 1 is floored to 2D at begin
+exactly as before.
+

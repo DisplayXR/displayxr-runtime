@@ -272,7 +272,7 @@ TEST_CASE("the compromise scale follows the mode the session will run in (#1510)
 
 TEST_CASE("a flat start sizes a legacy app for the 3D mode V toggles into (ADR-065)", "[oxr][legacy_mode_rule]")
 {
-	SECTION("sim-display's default: starts in 2D, kind anaglyph -> Case A, as before")
+	SECTION("a flat start (an app that asked for 2D, kind anaglyph) -> Case A, as before")
 	{
 		const uint32_t idx = oxr_legacy_compromise_mode_index(kAnaglyphTable, 2, 0, false, false);
 		CHECK(idx == 1);

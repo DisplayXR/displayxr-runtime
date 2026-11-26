@@ -132,29 +132,27 @@ TEST_CASE("the tracking seam marks every 3D entry when a source is on", "[sim_di
 	}
 }
 
-TEST_CASE("the device starts in 2D unless START_3D", "[sim_display_modes]")
+TEST_CASE("the device starts in slot 1; the app picks its mode (ADR-065 Amendment 1)", "[sim_display_modes]")
 {
-	sim_display_start s = sim_display_resolve_start(false, -1);
-	CHECK(s.active == 0);
-	CHECK_FALSE(s.pinned);
-	CHECK_FALSE(s.force_ignored);
-	s = sim_display_resolve_start(true, -1);
+	// The driver never decides an app's start mode: slot 1, like every hardware driver.
+	sim_display_start s = sim_display_resolve_start(-1);
 	CHECK(s.active == 1);
 	CHECK_FALSE(s.pinned);
+	CHECK_FALSE(s.force_ignored);
 }
 
 TEST_CASE("FORCE_MODE pins 0 or 1 and ignores anything else", "[sim_display_modes]")
 {
-	sim_display_start s = sim_display_resolve_start(true, 0);
+	sim_display_start s = sim_display_resolve_start(0);
 	CHECK(s.active == 0);
 	CHECK(s.pinned);
-	s = sim_display_resolve_start(false, 1);
+	s = sim_display_resolve_start(1);
 	CHECK(s.active == 1);
 	CHECK(s.pinned);
 	for (long v : {2L, 3L, 4L, 5L, 99L, -2L}) {
 		INFO("FORCE_MODE=" << v);
-		s = sim_display_resolve_start(false, v);
-		CHECK(s.active == 0);
+		s = sim_display_resolve_start(v);
+		CHECK(s.active == 1); // an ignored FORCE_MODE leaves the slot-1 start
 		CHECK_FALSE(s.pinned);
 		CHECK(s.force_ignored);
 	}

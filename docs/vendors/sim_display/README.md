@@ -42,13 +42,16 @@ within about a second: same slot index, no swapchain recreation, no restart. The
    <value>`), also live;
 3. with neither: **Same as 2D**.
 
-**The device starts in 2D**: a PC with no 3D display shows a normal picture until you press
-**V** (or **1**), or an app requests slot 1. `START_3D=1` starts it in slot 1 instead.
+**The device starts in slot 1, and the app picks its mode** ([ADR-065](../../adr/ADR-065-two-runtime-rendering-modes.md)
+Amendment 1): sim_display no longer decides an app's start mode. Like every hardware driver it
+starts in its 3D slot, and an app that wants 2D asks for it (`xrRequestDisplayRenderingModeDXR`),
+or the user presses **V** / **0**. With the default Same-as-2D config slot 1 is one full-resolution
+view, so a PC with no 3D display still shows a normal picture.
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `OUTPUT` | `default` | The default 3D mode for a screen with no per-screen choice, applied live: `default` / `same_as_2d` (aliases `2d`, `passthrough`), `anaglyph`, `sbs`, `squeezed` (`squeezed_sbs`), `interlaced`, `blend`, `quad` (see below). |
-| `START_3D` | `0` | Start in slot 1 instead of slot 0. Read at start. |
+| `START_3D` | `0` | **Deprecated, no effect** (ADR-065 Amendment 1): the device always starts in slot 1. Logs one WARN when set. |
 | `FORCE_MODE` | `-1` | Developer pin: `0` (2D) or `1` (slot 1), held against every request from every app. Any other value is ignored with a WARN. |
 
 Set them with `displayxr-cli dp set sim-display <KEY> <value>` (per user), or
@@ -59,8 +62,10 @@ Set them with `displayxr-cli dp set sim-display <KEY> <value>` (per user), or
 **Behaviour change (ADR-066, 2026-11-23).** The default 3D mode was anaglyph and is now **Same as
 2D**: most apps ask for 3D at start, and an anaglyph on an ordinary screen reads as broken, so a 3D
 look is chosen on purpose. `OUTPUT=2d` / `passthrough` used to mean "anaglyph, start in 2D"; they
-are now aliases of Same as 2D (the device starts in 2D either way), and `START_3D` is no longer
-ignored with them.
+are now aliases of Same as 2D.
+
+**Behaviour change (ADR-065 Amendment 1, 2026-11-26).** The device used to start in 2D unless
+`START_3D=1`; it now starts in slot 1 and the app decides. `START_3D` is a deprecated no-op.
 
 The declared list (choice names are what `dp mode set` takes; labels are what apps enumerate):
 

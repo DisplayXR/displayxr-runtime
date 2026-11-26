@@ -386,7 +386,7 @@ sim_display_plugin_get_screen_status(struct xrt_plugin_instance *inst,
 	}
 	// The output mode is one process-singleton atomic, shared by every screen
 	// sim drives: it is the mode of THIS process (in a diagnostic process that
-	// is the start-up mode — 2D unless START_3D, ADR-065 — not a client's live one).
+	// is the start-up mode — slot 1, ADR-065 Amendment 1 — not a client's live one).
 	out->lens = sim_display_resolved_output() == SIM_DISPLAY_OUTPUT_PASSTHROUGH ? XRT_PLUGIN_LENS_STATE_2D
 	                                                                            : XRT_PLUGIN_LENS_STATE_3D;
 	snprintf(out->model, sizeof(out->model), "Sim");

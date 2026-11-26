@@ -30,8 +30,7 @@
  * (project lead, 2026-11-23): most apps ask for 3D at start, and an anaglyph
  * on an ordinary screen looks broken, so a 3D look is chosen on purpose.
  * Before ADR-066 the default was anaglyph, and `OUTPUT=2d|passthrough` meant
- * "anaglyph, start in 2D"; they now name the Same-as-2D config (the device
- * starts in 2D either way unless START_3D).
+ * "anaglyph, start in 2D"; they now name the Same-as-2D config.
  *
  * The OUTPUT setting is the config: it names which declared entry slot 1 maps
  * to, and it applies LIVE: the runtime polls `XRT_DEVICE_PROPERTY_CONFIGURED_3D_MODE`
@@ -52,9 +51,14 @@
  *
  * ## Start-up
  *
- * The device starts in **2D** (slot 0). `START_3D=1` starts it in slot 1
- * instead. `FORCE_MODE` (0 or 1) pins the slot for every app; any other value
- * is ignored with a WARN. START_3D and FORCE_MODE are read once per process.
+ * The driver does not choose an app's start mode (ADR-065 Amendment 1, project
+ * lead 2026-11-26): the device starts in **slot 1**, the 3D slot, like every
+ * hardware driver, and the APP picks with `xrRequestDisplayRenderingModeDXR`
+ * (or the user with V / 0 / 1). With the default Same-as-2D config slot 1 is one
+ * full-resolution passthrough view, so a PC with no 3D display still looks 2D.
+ * `START_3D` is deprecated and has no effect (one WARN when it is set).
+ * `FORCE_MODE` (0 or 1) stays the developer pin for every app; any other value
+ * is ignored with a WARN. FORCE_MODE is read once per process.
  */
 
 #pragma once
@@ -336,18 +340,19 @@ struct sim_display_start
 };
 
 /*!
- * The start-up rule.
+ * The start-up rule: slot 1 (the 3D slot) unless FORCE_MODE pins 0 or 1. The
+ * driver never decides an app's start mode; the app requests one (ADR-065
+ * Amendment 1).
  *
- * @param start_3d    START_3D is on.
  * @param force_mode  FORCE_MODE (-1 = unset).
  */
 static inline struct sim_display_start
-sim_display_resolve_start(bool start_3d, long force_mode)
+sim_display_resolve_start(long force_mode)
 {
 	struct sim_display_start s;
 	s.pinned = false;
 	s.force_ignored = false;
-	s.active = start_3d ? 1u : 0u;
+	s.active = 1u;
 	if (force_mode == 0 || force_mode == 1) {
 		s.active = (uint32_t)force_mode;
 		s.pinned = true;
