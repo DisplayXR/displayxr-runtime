@@ -84,8 +84,9 @@
  * arbitrates; an app never sets the user's default. 6 = the GAUSSIANS
  * camera block: XrLiftBlobCameraDXR chained on XrLiftBlobDXR returns, with
  * each blob, the camera block v2 the runtime builds from the provider's facts
- * (the same JSON object a SOG's meta.json carries as `camera`, so one parser
- * serves both) plus those facts; a failed conversion is reported once as
+ * -- or, for a SOG that already carries an authored block (the provider's own
+ * included), that block verbatim -- (the same JSON object a SOG's meta.json
+ * carries as `camera`, so one parser serves both) plus those facts; a failed conversion is reported once as
  * XR_ERROR_LIFT_CONVERSION_FAILED_DXR instead of reading NOT READY forever;
  * and a photo larger than the provider can take is downscaled by the runtime
  * (intrinsics reported in the caller's pixels). Spec 7 (planned, not in this
@@ -644,8 +645,11 @@ typedef struct XrLiftBlobDXR {
  * provider reported none (nothing is assumed). `focus` is the provider's
  * suggestion (`"source": "auto"`), else the runtime's own estimate from the
  * splats (`"source": "runtime"`: the screen-plane rule lifted video uses).
- * A SOG that already carries an authored camera block returns that block
- * verbatim. @c facts is the provider's facts (the `X-DXR-Result` /
+ * A SOG that already carries an authored camera block (no top-level
+ * `"source": "auto"`) returns that block verbatim -- including one the
+ * provider wrote into a SOG it encoded itself (ADR-057 Amendment 2026-11-25:
+ * same v2 schema, nearest-clump focus, the same numbers as its facts).
+ * @c facts is the provider's facts (the `X-DXR-Result` /
  * `conv run --facts` shape: intrinsics with their source -- given / estimated /
  * assumed --, metric, near / far, focus suggestion, build stamp).
  *

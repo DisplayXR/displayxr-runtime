@@ -720,7 +720,13 @@ same latched frame — also returns:
 
 Rules, all runtime-side and provider-agnostic (a consumer never branches on the provider):
 
-- **Built by the runtime**, from the facts schema, whichever provider made the splats.
+- **Built by the runtime**, from the facts schema, whichever provider made the splats — unless
+  the blob is a SOG that already carries an authored block (below). A provider that encodes the
+  SOG itself may write that block (ADR-057 Amendment 2026-11-25): same v2 schema as above, focus
+  by the nearest-substantial-clump rule, no top-level `"source": "auto"`, and the same numbers as
+  its facts. Provider-side spec:
+  [`displayxr-conversion-open` `docs/sog-camera-block.md`](https://github.com/DisplayXR/displayxr-conversion-open/blob/main/docs/sog-camera-block.md).
+  This path asks the provider for PLY, so today the runtime builds the block.
 - **Intrinsics in the caller's pixels.** When the runtime downscaled the photo (below), the
   provider's intrinsics are scaled back to the photo the caller submitted. A provider that
   reports none gets no `intrinsics` key: nothing is assumed (no nominal field of view). A
@@ -735,7 +741,10 @@ Rules, all runtime-side and provider-agnostic (a consumer never branches on the 
   the 2nd / 98th percentile of the opaque splats' depth. (PLY blobs; a SOG lends the focus of its
   own auto block.)
 - **An authored block is never rewritten**: a SOG blob whose `meta.json` already carries a
-  `camera` that is not `"source": "auto"` returns that block verbatim.
+  `camera` that is not `"source": "auto"` — written by the provider or by a person — returns that
+  block verbatim, and the runtime merges nothing into it. Only an `auto` block is rebuilt (its
+  focus is kept). Known gap: such a block's `intrinsics` stay in the pixels the provider was
+  handed even when the runtime downscaled the photo, while `facts` are scaled back (#2836).
 - Strings use the two-call idiom per string (counts include the NUL), but a too-small string
   capacity is **not** an error — the blob call's own result and latch rules are unchanged — so a
   caller sizes both strings on the blob's size query. A spec-5 runtime ignores the struct
