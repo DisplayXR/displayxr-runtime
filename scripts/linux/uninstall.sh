@@ -90,6 +90,23 @@ rm -f "$SHARE_ROOT/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
 rm -f "$SHARE_ROOT/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json"  # #886
 rmdir "$SHARE_ROOT/vulkan/explicit_layer.d" "$SHARE_ROOT/vulkan/implicit_layer.d" "$SHARE_ROOT/vulkan" 2>/dev/null || true
 
+# KDE window-geometry publisher (user-level): the KWin script, the bridge's
+# D-Bus activation file, and the script's enable key. Stop a running bridge.
+if [ "$SYSTEM" = 0 ]; then
+    if [ -d "$SHARE_ROOT/kwin/scripts/displayxr-window-geometry" ] ||
+        [ -f "$SHARE_ROOT/dbus-1/services/org.displayxr.WindowGeometry.service" ]; then
+        rm -rf "$SHARE_ROOT/kwin/scripts/displayxr-window-geometry"
+        rm -f "$SHARE_ROOT/dbus-1/services/org.displayxr.WindowGeometry.service"
+        if command -v kwriteconfig6 >/dev/null 2>&1; then
+            kwriteconfig6 --file kwinrc --group Plugins --key displayxr-window-geometryEnabled --delete || true
+            dbus-send --session --type=method_call --dest=org.kde.KWin /KWin org.kde.KWin.reconfigure \
+                >/dev/null 2>&1 || true
+        fi
+        pkill -f "$PREFIX/bin/displayxr-kwin-geometry-bridge" >/dev/null 2>&1 || true
+        echo "==> Removed the KDE window-geometry publisher"
+    fi
+fi
+
 # DisplayXR Dashboard menu entry + icon.
 rm -f "$SHARE_ROOT/applications/displayxr-dashboard.desktop" \
     "$SHARE_ROOT/icons/hicolor/256x256/apps/displayxr-dashboard.png"

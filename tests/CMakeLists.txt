@@ -171,6 +171,7 @@ set(tests
     tests_gamepad_map
     tests_gamepad_hid_report
     tests_gamepad_evdev_map
+    tests_kwgb_payload
     tests_ultraleap_map
     tests_touch_gesture
     tests_comp_layer_view_camera
@@ -1338,6 +1339,17 @@ target_include_directories(
 				 ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_gamepad_evdev_map PRIVATE xrt-interfaces)
+# SteamOS / stock KDE Plasma -- what displayxr-kwin-geometry-bridge accepts from
+# the KWin script before republishing it as org.displayxr.WindowGeometry1
+# (targets/kwin_geometry_bridge/kwgb_payload.c): schema 1 only, titles stripped,
+# KWin and KDE only. Pure, so it runs on every platform.
+target_sources(
+	tests_kwgb_payload PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/kwin_geometry_bridge/kwgb_payload.c
+	)
+target_include_directories(
+	tests_kwgb_payload PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/kwin_geometry_bridge
+	)
+target_link_libraries(tests_kwgb_payload PRIVATE xrt-external-cjson)
 # Dev probe (not a test, never built by default): reads the real Windows
 # gamepad backend -- XInput + HID dispatch -- and prints the live reader and
 # the pad state at 2 Hz for 15 s. `gamepad_backend_probe [--rumble]`.

@@ -48,6 +48,11 @@
 # Flags: --system  system-wide (needs root; not on SteamOS)
 #        --no-service  skip the systemd user units (displayxr-service)
 #        --no-gnome-extension  skip the GNOME Shell extension
+#        --kwin  set up the KDE Plasma window-geometry publisher (KWin script +
+#                bridge) even when this is not run from a KDE session; it is
+#                set up automatically when XDG_CURRENT_DESKTOP says KDE.
+#                User-level only.
+#        --no-kwin  never set it up
 
 set -euo pipefail
 
@@ -56,12 +61,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SYSTEM=0
 NO_SERVICE=0
 NO_GNOME_EXT=0
+KWIN=auto
 for arg in "$@"; do
     case "$arg" in
     --system) SYSTEM=1 ;;
     --no-service) NO_SERVICE=1 ;;
     --no-gnome-extension) NO_GNOME_EXT=1 ;;
-    *) echo "Unknown option: $arg (supported: --system --no-service --no-gnome-extension)" >&2; exit 2 ;;
+    --kwin) KWIN=yes ;;
+    --no-kwin) KWIN=no ;;
+    *) echo "Unknown option: $arg (supported: --system --no-service --no-gnome-extension --kwin --no-kwin)" >&2; exit 2 ;;
     esac
 done
 
@@ -342,6 +350,54 @@ EOF
         "$PREFIX/bin/displayxr-gnome-extension-enable" --install || true
     fi
     echo "    LOG OUT AND BACK IN for it to load: a Wayland session cannot reload GNOME Shell."
+fi
+
+# --- KDE Plasma: window-geometry publisher (KWin script + bridge) ------------
+# A stock KWin (SteamOS Desktop Mode) has no native publisher of
+# org.displayxr.WindowGeometry1 yet (#1928). The KWin script pushes geometry to
+# displayxr-kwin-geometry-bridge, which D-Bus activates on first use and which
+# serves the canonical name (wayland-window-geometry.md, "KWin script bridge").
+# User-level only. The D-Bus activation file goes in ONLY for KDE: anywhere
+# else the desktop's own publisher (the GNOME extension) owns that name.
+KWIN_ID="displayxr-window-geometry"
+KWIN_SRC="$HERE/share/kwin/scripts/$KWIN_ID"
+KWGB_SVC_IN="$HERE/share/dbus-1/services/org.displayxr.WindowGeometry.service.in"
+case ":${XDG_CURRENT_DESKTOP:-}:" in
+*:KDE:* | *:kde:*) IS_KDE=1 ;;
+*) IS_KDE=0 ;;
+esac
+if [ "$KWIN" = auto ]; then
+    [ "$IS_KDE" = 1 ] && KWIN=yes || KWIN=no
+fi
+if [ "$KWIN" = yes ] && [ "$SYSTEM" = 1 ]; then
+    echo "note: the KDE window-geometry publisher is user-level; run ./install.sh --kwin as the user"
+elif [ "$KWIN" = yes ] && [ -x "$PREFIX/bin/displayxr-kwin-geometry-bridge" ] && [ -d "$KWIN_SRC" ] &&
+    [ -f "$KWGB_SVC_IN" ]; then
+    mkdir -p "$DATA_ROOT/kwin/scripts" "$DATA_ROOT/dbus-1/services"
+    rm -rf "$DATA_ROOT/kwin/scripts/$KWIN_ID"
+    cp -r "$KWIN_SRC" "$DATA_ROOT/kwin/scripts/"
+    sed "s|@BRIDGE_BIN@|$PREFIX/bin/displayxr-kwin-geometry-bridge|" "$KWGB_SVC_IN" \
+        >"$DATA_ROOT/dbus-1/services/org.displayxr.WindowGeometry.service"
+    echo "==> KDE window-geometry publisher: $DATA_ROOT/kwin/scripts/$KWIN_ID"
+    echo "    + $DATA_ROOT/dbus-1/services/org.displayxr.WindowGeometry.service"
+    # Enable the script, never over a user who switched it off.
+    if command -v kwriteconfig6 >/dev/null 2>&1; then
+        WAS="$(kreadconfig6 --file kwinrc --group Plugins --key "${KWIN_ID}Enabled" 2>/dev/null || true)"
+        if [ "$WAS" = false ]; then
+            echo "    left disabled (you switched it off in System Settings > KWin Scripts)"
+        else
+            kwriteconfig6 --file kwinrc --group Plugins --key "${KWIN_ID}Enabled" true
+            if command -v dbus-send >/dev/null 2>&1 &&
+                dbus-send --session --type=method_call --dest=org.kde.KWin /KWin org.kde.KWin.reconfigure \
+                    >/dev/null 2>&1; then
+                echo "    enabled and loaded into the running KWin"
+            else
+                echo "    enabled; it loads at your next login"
+            fi
+        fi
+    else
+        echo "    enable it in System Settings > Window Management > KWin Scripts (\"DisplayXR window geometry\")"
+    fi
 fi
 
 # --- DisplayXR Dashboard: applications-menu entry ----------------------------
