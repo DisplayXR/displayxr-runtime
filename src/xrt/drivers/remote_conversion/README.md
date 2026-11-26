@@ -68,7 +68,9 @@ in the hosting process's environment overrides them, like every provider.
 - **Facts**: the blob is written untouched; `X-DXR-Result` fills `xrt_conv_splat_info` and
   `xrt_conv_splat_result` (build stamp of the host that answered, refusal, metric fit, layers, focus
   suggestion). The runtime never writes a camera block; `conv run --camera-block auto` is the
-  separate convenience writer.
+  separate convenience writer. An endpoint that returns a SOG with its own camera block (no
+  top-level `"source": "auto"`) is the block's author: it reaches the caller untouched and the
+  writer leaves it (`kept-authored`), per ADR-057 Amendment 2026-11-25.
 - **HTTP**: WinHTTP on Windows; libcurl loaded at run time on macOS and Linux (no build or package
   dependency). Linux without `libcurl.so.4`: `ABSENT(PLATFORM)` with that reason.
 

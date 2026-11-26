@@ -27,7 +27,10 @@ The result separates **facts** the model measured (intrinsics, baseline, metric 
 refusal, near/far, a build stamp) from **intent**: the rig, the rest view and the focus point
 an author chooses. Facts are the provider's to report and never invented. The **camera block
 in the content file is authored**: the app or the person who made the picture writes it, the
-runtime never does. A provider may *suggest* a focus, labelled as a suggestion. Research-only
+runtime never does. A provider may *suggest* a focus, labelled as a suggestion. *(Amended
+2026-11-25: a provider may also write the block into a splat container it produces itself, under
+the same schema and focus rule; see "Amendment: a provider may author the block in its own
+container".)* Research-only
 weights are never bundled, never mirrored and never pre-fetched; the user downloads them, or
 uses a remote endpoint, with the licence shown.
 
@@ -149,6 +152,10 @@ combining facts with its own intent. Convenience writers — `displayxr-cli conv
 helper — may write a block from facts plus suggestions, marked `source: "auto"`, which an
 author overrides. The runtime never rewrites a block it reads.
 
+*Amended 2026-11-25: a provider that produces the container itself (a SOG) may write the block
+into it; the runtime passes that block through like any authored block. See "Amendment: a
+provider may author the block in its own container" below.*
+
 **What stays runtime policy is display-time behaviour**, as ADR-054 §4.6 says: how a splat is
 converged and budgeted *on this display*, for this viewer. That policy *reads* the author's
 intent as input. It may adapt to the panel, for example clamping to the depth budget
@@ -260,6 +267,58 @@ catch a same-size in-place edit or bit rot after entry, which the on-demand chec
 same-user attacker able to rewrite a blob can rewrite its stamp and the manifest it is checked
 against too, so they were out of scope before and still are. Spec:
 `conversion-provider-discovery.md` §5.1, §5.3, §5.4.
+
+### Amendment (2026-11-25): a provider may author the block in its own container
+
+§3 said only the app, the SDK or a convenience writer writes the camera block. The open
+conversion provider (`displayxr-conversion-open` v0.2.2) now encodes the SOG itself when its
+output is `.sog`, and the moment it writes the container is the one moment it knows, exactly,
+the focal it unprojected through and the clump it measured. A block added after the fact by
+another tool can only repeat those numbers. The gallery's online generator has always done the
+same. So the rule is widened, not reversed: **facts stay the provider's, intent stays the
+author's, and a provider that builds the container is the author of that file's first block.**
+
+- **A provider MAY write the camera block into a splat container it produces itself** (today a
+  SOG's `meta.json` `camera` key). It is never required to: a provider that returns PLY, or a SOG
+  without a block, is as conformant as before.
+- **When it does, the block follows the one schema and the one focus rule.**
+  - The schema is the camera block v2 the runtime already documents
+    ([`XR_DXR_lift.md` §5.2](../specs/extensions/XR_DXR_lift.md), discovery spec §2.6):
+    `convention`, `rig`, `rest`, `intrinsics` (the focal the Gaussians were actually unprojected
+    through, in the pixels of the image the provider was handed), `stereo.baseline_m` only for a
+    metric result, `metric` only for a fit, `focus`, `dxr`.
+  - The focus is the nearest-substantial-clump rule the gallery uses (the provider's
+    `focus_suggestion` with source `NEAREST_CLUMP`); no clump means no `focus` key.
+  - The provider-side text is the provider's spec,
+    [`docs/sog-camera-block.md`](https://github.com/DisplayXR/displayxr-conversion-open/blob/main/docs/sog-camera-block.md)
+    in `displayxr-conversion-open`: the mono block (`rig: "camera"`, identity `rest`, no `stereo`
+    key, `dxr` factors 1 / 1) and the rule's constants.
+- **Facts and block agree.** A provider that writes a block still returns every fact in
+  `xrt_conv_splat_info` / `xrt_conv_splat_result` (or `X-DXR-Result`), and the two carry the same
+  numbers: intrinsics, focus suggestion, near / far, metric and baseline. The block never replaces
+  the facts.
+- **It is an authored block.** It carries no top-level `"source": "auto"`, so every runtime path
+  treats it as authored, exactly as it treats one a person wrote.
+- **What the runtime does, by case.**
+  - **PLY + facts** (today's GAUSSIANS lift path, which asks for PLY): the runtime builds the
+    block from the facts, as before.
+  - **An authored block** (any `camera` without a top-level `"source": "auto"`, a provider's or a
+    person's): passed through unchanged. The lift path returns it verbatim; `conv camera-block`
+    and `conv run --camera-block auto` leave the file byte for byte (`kept-authored`).
+  - **An `auto` block**: the only kind the runtime rewrites. The convenience writer replaces it;
+    the lift path builds its own block from the facts and keeps the auto block's focus.
+- **Authority when both exist.** A provider-authored block in the file wins over anything the
+  runtime would build: the runtime passes it through and never merges its own estimate into it.
+  For an `auto` block the runtime keeps authority over the suggestion and may replace it. An app
+  or a person may still replace a provider's block (they own the content file); the runtime never
+  does.
+
+What does not change: the runtime still never writes or rewrites an authored block, display-time
+behaviour stays runtime policy (§3), and no ABI, struct or enum moves. Known gap: when the lift
+path downscaled the photo, a provider-authored SOG block comes back with intrinsics in the
+downscaled pixels while `facts` are scaled to the caller's
+([#2836](https://github.com/DisplayXR/displayxr-runtime/issues/2836); the lift path asks for PLY,
+so today only the open provider's `SPLAT_FORMAT=sog` test switch reaches it).
 
 ## Consequences
 

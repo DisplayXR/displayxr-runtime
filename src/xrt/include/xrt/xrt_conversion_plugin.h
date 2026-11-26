@@ -807,9 +807,13 @@ struct xrt_conv_job_out
 /*!
  * ADR-057 §3 / §4: what a splat job MEASURED (facts) and what it SUGGESTS.
  * Never intent: the rig, the rest pose and the chosen focus belong to the
- * author, who writes the content file's camera block. The runtime never
- * writes or rewrites a camera block. Unknown = 0 / "" / its `valid` bit
- * clear, never invented. Reached through xrt_conv_job_out::splat_result.
+ * author, who writes the content file's camera block. A provider that
+ * encodes the container itself (a SOG) MAY write that block too (ADR-057
+ * Amendment 2026-11-25): camera block v2, nearest-clump focus, no top-level
+ * "source":"auto", and the SAME numbers as these facts, which it still
+ * returns. The runtime never writes or rewrites an authored block (a
+ * provider's included). Unknown = 0 / "" / its `valid` bit clear, never
+ * invented. Reached through xrt_conv_job_out::splat_result.
  *
  * Top-level (struct_size first, append-only), flat (fixed-size strings, no
  * pointers) and without hidden padding, so a satellite carries it as a
