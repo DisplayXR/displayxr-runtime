@@ -123,6 +123,7 @@ Sources are community wikis and project READMEs, not Valve documentation (vronli
 - Packages the tarball and installs it as a **non-root user** with a SteamOS os-release (`DXR_OS_RELEASE`): `--system` refused, user install, `displayxr-cli selftest`, the service smoke test, uninstall, and nothing written outside `$HOME`.
 
 ## Hardware checklist (later)
+The step-by-step protocol, with exact commands and the log line that means PASS for each test, is [steamos-hardware-validation.md](../getting-started/steamos-hardware-validation.md). Summary:
 Report each line Pass/Fail with its conditions (runtime + plug-in version, depth %, fps, depth budget).
 1. Steam Machine + 3D panel, Desktop Mode X11: `cube_handle_vk_linux`, `cube_hosted_legacy_vk_linux`, then a Unity Linux player.
 2. The same in Desktop Mode Wayland (after WS2) and in Game Mode (after WS3).
