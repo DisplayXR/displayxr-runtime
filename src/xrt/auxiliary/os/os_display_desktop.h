@@ -79,6 +79,52 @@ os_display_native_source_str(enum os_display_native_source src)
 }
 
 /*!
+ * How the desktop presents an output relative to its scanout mode, as the
+ * compositor reports it (Mutter's logical-monitor transform, the wl_output
+ * transform: counter-clockwise). Mirrored transforms map to their rotation.
+ *
+ * What every consumer actually needs is @ref os_display_rotation_is_quarter:
+ * a quarter turn swaps the mode's width and height on the desktop. The Steam
+ * Deck's internal panel is the common case: an 800x1280 portrait scanout mode
+ * presented as a 1280x800 landscape desktop.
+ */
+enum os_display_rotation
+{
+	//! Not reported, and nothing could be inferred.
+	OS_DISPLAY_ROTATION_UNKNOWN = 0,
+	OS_DISPLAY_ROTATION_0,
+	OS_DISPLAY_ROTATION_90,
+	OS_DISPLAY_ROTATION_180,
+	OS_DISPLAY_ROTATION_270,
+	//! Inferred, not reported: the desktop rect is the mode turned 90 or 270
+	//! degrees (portrait vs landscape disagree), sense unknown. DRM sysfs
+	//! has no transform, so this is all it can say.
+	OS_DISPLAY_ROTATION_QUARTER,
+};
+
+//! True when @p r swaps the mode's width and height on the desktop.
+static inline bool
+os_display_rotation_is_quarter(enum os_display_rotation r)
+{
+	return r == OS_DISPLAY_ROTATION_90 || r == OS_DISPLAY_ROTATION_270 || r == OS_DISPLAY_ROTATION_QUARTER;
+}
+
+//! Short name of a @ref os_display_rotation, for logs and the CLI.
+static inline const char *
+os_display_rotation_str(enum os_display_rotation r)
+{
+	switch (r) {
+	case OS_DISPLAY_ROTATION_0: return "0";
+	case OS_DISPLAY_ROTATION_90: return "90";
+	case OS_DISPLAY_ROTATION_180: return "180";
+	case OS_DISPLAY_ROTATION_270: return "270";
+	case OS_DISPLAY_ROTATION_QUARTER: return "quarter turn";
+	case OS_DISPLAY_ROTATION_UNKNOWN:
+	default: return "unknown";
+	}
+}
+
+/*!
  * Desktop geometry and identity of one monitor.
  */
 struct os_display_desktop_info
@@ -167,10 +213,20 @@ struct os_display_desktop_info
 	 * e.g. 2.0 on Retina, and the rect is in points, so the "is 1:1" test
 	 * below reads 0 on every HiDPI display by design). 0 = unknown, which
 	 * every consumer must treat as "keep current behaviour".
+	 *
+	 * Always in the PRESENTED orientation: on an output the desktop turns a
+	 * quarter (@ref rotation), the mode's width and height are swapped here,
+	 * so `native_width` lines up with @ref width like every consumer assumes.
+	 * The Steam Deck's 800x1280 scanout mode is 1280x800 here. The scanout
+	 * orientation is the transpose, when @ref rotation is a quarter turn.
 	 * @{
 	 */
 	uint32_t native_width;
 	uint32_t native_height;
+
+	//! How the desktop presents the mode (see @ref os_display_rotation).
+	//! Applies to @ref preferred_width too, which is likewise presented.
+	enum os_display_rotation rotation;
 
 	//! The compositor's scale for this output (e.g. 1.5). 0 = unknown.
 	double scale;

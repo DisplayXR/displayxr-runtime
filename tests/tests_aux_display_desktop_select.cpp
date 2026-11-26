@@ -467,3 +467,50 @@ TEST_CASE("claim select: without the bit (0, 0) keeps the old 'no origin' readin
 	CHECK(os_display_desktop_select_claim(claims, 1, &h, &overrides) == 0);
 	CHECK_FALSE(overrides);
 }
+
+TEST_CASE("panel select: Steam Deck — a quarter-turned panel matches in either orientation")
+{
+	// The Deck's internal eDP scans out 800x1280 (portrait) and the desktop
+	// presents it as 1280x800. native_* is stored presented, rotation says
+	// it is turned; a 3D panel on DP sits beside it.
+	os_display_desktop_info deck = mon("eDP-1", 0, 1280, 800, 1280, 800, true);
+	deck.rotation = OS_DISPLAY_ROTATION_90;
+	const os_display_desktop_info mons[] = {
+	    deck,
+	    mon("DP-1", 1280, PANEL_W, PANEL_H, PANEL_W, PANEL_H, false),
+	};
+	os_display_panel_match match = {};
+
+	SECTION("a plug-in reporting the desktop orientation")
+	{
+		const auto hint = panel_hint(1280, 800);
+		CHECK(os_display_desktop_select_by_size(mons, 2, &hint, &match) == 0);
+		CHECK(match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE);
+	}
+
+	SECTION("a plug-in reporting the scanout orientation (EDID / kernel)")
+	{
+		const auto hint = panel_hint(800, 1280);
+		CHECK(os_display_desktop_select_by_size(mons, 2, &hint, &match) == 0);
+		CHECK(match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE);
+	}
+
+	SECTION("the 3D panel next to it is unaffected")
+	{
+		const auto hint = panel_hint();
+		CHECK(os_display_desktop_select_by_size(mons, 2, &hint, &match) == 1);
+	}
+
+	SECTION("an unturned monitor never matches the transposed size")
+	{
+		os_display_desktop_info flat[] = {mons[0], mons[1]};
+		flat[0].rotation = OS_DISPLAY_ROTATION_0;
+		const auto hint = panel_hint(800, 1280);
+		CHECK(os_display_desktop_select_by_size(flat, 2, &hint, &match) == -1);
+	}
+
+	SECTION("the presented mode is 1:1 with the presented rect")
+	{
+		CHECK(os_display_desktop_info_is_1to1(&mons[0]) == 1);
+	}
+}

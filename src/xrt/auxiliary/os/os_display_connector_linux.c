@@ -76,6 +76,7 @@ struct connector_mode
 	double scale;         // 0 = unknown
 	uint32_t refresh_mhz; // current mode's refresh, 0 = unknown
 	uint32_t pw, ph;      // the preferred mode (`is-preferred`), 0 = unknown
+	uint32_t transform;   // logical monitor transform (MetaMonitorTransform), UINT32_MAX = unknown
 };
 
 // Local declarations of the libdbus ABI used here (stable since dbus 1.0).
@@ -95,6 +96,7 @@ typedef struct
 #define OS_DBUS_TYPE_VARIANT 'v'
 #define OS_DBUS_TYPE_STRING 's'
 #define OS_DBUS_TYPE_INT32 'i'
+#define OS_DBUS_TYPE_UINT32 'u'
 #define OS_DBUS_TYPE_DOUBLE 'd'
 #define OS_DBUS_TYPE_BOOLEAN 'b'
 
@@ -338,6 +340,7 @@ query_mutter(struct connector_mode *out, uint32_t max)
 					c->refresh_mhz = crefresh > 0.0 ? (uint32_t)(crefresh * 1000.0 + 0.5) : 0u;
 					c->pw = pw;
 					c->ph = ph;
+					c->transform = UINT32_MAX; // set from the logical monitors below
 				}
 			}
 			f.message_iter_next(&mons);
@@ -345,7 +348,9 @@ query_mutter(struct connector_mode *out, uint32_t max)
 	}
 	f.message_iter_next(&top);
 
-	// Logical monitors: the scale each connector is painted at.
+	// Logical monitors: the scale each connector is painted at, and its
+	// transform (the modes above are in scanout orientation; a quarter turn
+	// swaps them on the desktop).
 	if (f.message_iter_get_arg_type(&top) == OS_DBUS_TYPE_ARRAY) {
 		os_dbus_iter lms;
 		f.message_iter_recurse(&top, &lms);
@@ -356,7 +361,10 @@ query_mutter(struct connector_mode *out, uint32_t max)
 			double scale = 0.0;
 			if (iter_take(&f, &lm, OS_DBUS_TYPE_INT32, &x) && iter_take(&f, &lm, OS_DBUS_TYPE_INT32, &y) &&
 			    iter_take(&f, &lm, OS_DBUS_TYPE_DOUBLE, &scale)) {
-				f.message_iter_next(&lm); // transform
+				uint32_t transform = UINT32_MAX;
+				if (!iter_take(&f, &lm, OS_DBUS_TYPE_UINT32, &transform)) {
+					f.message_iter_next(&lm); // not a transform: skip it
+				}
 				f.message_iter_next(&lm); // primary
 				if (f.message_iter_get_arg_type(&lm) == OS_DBUS_TYPE_ARRAY) {
 					os_dbus_iter specs;
@@ -367,6 +375,9 @@ query_mutter(struct connector_mode *out, uint32_t max)
 							char norm[64];
 							os_display_connector_normalise(connector, norm, sizeof(norm));
 							struct connector_mode *c = find_connector(out, count, norm);
+							if (c != NULL) {
+								c->transform = transform;
+							}
 							if (c != NULL && scale > 0.0) {
 								c->scale = scale;
 							}
@@ -475,6 +486,82 @@ enumerate_drm(struct drm_connector *out, uint32_t max)
 
 /*
  *
+ * Orientation (SteamOS / Steam Deck: a portrait panel on a landscape desktop).
+ *
+ */
+
+enum os_display_rotation
+os_display_rotation_from_mutter(uint32_t transform)
+{
+	if (transform > 7) {
+		return OS_DISPLAY_ROTATION_UNKNOWN;
+	}
+	switch (transform & 3u) { // 4-7 are 0-3 flipped; the flip keeps the size
+	case 0: return OS_DISPLAY_ROTATION_0;
+	case 1: return OS_DISPLAY_ROTATION_90;
+	case 2: return OS_DISPLAY_ROTATION_180;
+	default: return OS_DISPLAY_ROTATION_270;
+	}
+}
+
+//! Portrait vs landscape disagree. Square on either side never does.
+static bool
+orientation_flipped(uint32_t aw, uint32_t ah, uint32_t bw, uint32_t bh)
+{
+	if (aw == 0 || ah == 0 || bw == 0 || bh == 0 || aw == ah || bw == bh) {
+		return false;
+	}
+	return (aw > ah) != (bw > bh);
+}
+
+bool
+os_display_drm_pick_mode(const uint32_t *mode_w,
+                         const uint32_t *mode_h,
+                         uint32_t mode_count,
+                         uint32_t rect_w,
+                         uint32_t rect_h,
+                         uint32_t *out_w,
+                         uint32_t *out_h,
+                         bool *out_quarter_turn)
+{
+	if (mode_w == NULL || mode_h == NULL || mode_count == 0 || out_w == NULL || out_h == NULL ||
+	    out_quarter_turn == NULL) {
+		return false;
+	}
+
+	// 1. The rect is a mode: the desktop is device pixels, not turned. Errs
+	//    only toward "the rect is device pixels" (the pre-existing assumption),
+	//    never toward a false "scaled".
+	for (uint32_t j = 0; j < mode_count; j++) {
+		if (rect_w > 0 && mode_w[j] == rect_w && mode_h[j] == rect_h) {
+			*out_w = rect_w;
+			*out_h = rect_h;
+			*out_quarter_turn = false;
+			return true;
+		}
+	}
+
+	// 2. The rect transposed is a mode: device pixels, turned a quarter.
+	for (uint32_t j = 0; j < mode_count; j++) {
+		if (rect_w > 0 && rect_w != rect_h && mode_w[j] == rect_h && mode_h[j] == rect_w) {
+			*out_w = rect_w;
+			*out_h = rect_h;
+			*out_quarter_turn = true;
+			return true;
+		}
+	}
+
+	// 3. The preferred mode, turned when the rect's aspect says so.
+	const bool quarter = orientation_flipped(mode_w[0], mode_h[0], rect_w, rect_h);
+	*out_w = quarter ? mode_h[0] : mode_w[0];
+	*out_h = quarter ? mode_w[0] : mode_h[0];
+	*out_quarter_turn = quarter;
+	return true;
+}
+
+
+/*
+ *
  * The join.
  *
  */
@@ -502,12 +589,21 @@ os_display_connector_annotate(struct os_display_desktop_info *mons, uint32_t cou
 
 		const struct connector_mode *mc = find_connector(mutter, mutter_count, norm);
 		if (mc != NULL) {
-			m->native_width = mc->w;
-			m->native_height = mc->h;
+			// Mutter's modes are in scanout orientation; native_* is the
+			// presented one (os_display_desktop_info::native_width).
+			enum os_display_rotation rot = os_display_rotation_from_mutter(mc->transform);
+			if (rot == OS_DISPLAY_ROTATION_UNKNOWN &&
+			    orientation_flipped(mc->w, mc->h, m->width, m->height)) {
+				rot = OS_DISPLAY_ROTATION_QUARTER;
+			}
+			const bool q = os_display_rotation_is_quarter(rot);
+			m->native_width = q ? mc->h : mc->w;
+			m->native_height = q ? mc->w : mc->h;
 			m->scale = mc->scale;
 			m->native_refresh_mhz = mc->refresh_mhz;
-			m->preferred_width = mc->pw;
-			m->preferred_height = mc->ph;
+			m->preferred_width = q ? mc->ph : mc->pw;
+			m->preferred_height = q ? mc->pw : mc->ph;
+			m->rotation = rot;
 			m->native_source = OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR;
 			continue;
 		}
@@ -516,19 +612,14 @@ os_display_connector_annotate(struct os_display_desktop_info *mons, uint32_t cou
 			if (strcmp(norm, drm[k].name) != 0) {
 				continue;
 			}
-			// Preferred mode unless the X11 size is itself a mode. Errs only
-			// toward "the X11 rect is device pixels" — the pre-existing
-			// assumption — never toward a false "scaled".
-			m->native_width = drm[k].mode_w[0];
-			m->native_height = drm[k].mode_h[0];
-			for (uint32_t j = 0; j < drm[k].mode_count; j++) {
-				if (drm[k].mode_w[j] == m->width && drm[k].mode_h[j] == m->height) {
-					m->native_width = m->width;
-					m->native_height = m->height;
-					break;
-				}
+			bool quarter = false;
+			if (os_display_drm_pick_mode(drm[k].mode_w, drm[k].mode_h, drm[k].mode_count, m->width,
+			                             m->height, &m->native_width, &m->native_height, &quarter)) {
+				// sysfs has no transform: a quarter turn is inferred, and
+				// "not turned" is not evidence of 0 vs 180.
+				m->rotation = quarter ? OS_DISPLAY_ROTATION_QUARTER : OS_DISPLAY_ROTATION_UNKNOWN;
+				m->native_source = OS_DISPLAY_NATIVE_SOURCE_DRM;
 			}
-			m->native_source = OS_DISPLAY_NATIVE_SOURCE_DRM;
 			break;
 		}
 	}
