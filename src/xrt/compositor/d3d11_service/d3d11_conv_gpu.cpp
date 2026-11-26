@@ -1464,15 +1464,11 @@ d3d11_lift_glue_import_input(struct d3d11_lift *l,
 	return ok ? XRT_SUCCESS : XRT_ERROR_WEAVE_REFUSED;
 }
 
-uint64_t
-d3d11_lift_glue_input_content_key(struct d3d11_lift *l, uint64_t wire, const struct conv_submit_slot *slot)
+//! The #2030 content key of GPU slot image @p gi (caller is inside glue_enter).
+static uint64_t
+glue_content_key(d3d11_lift *l, uint64_t wire, const glue_img &gi, uint64_t import_key)
 {
-	if (l == nullptr || slot == nullptr || slot->image_count < 1 || !glue_enter(l)) {
-		return 0;
-	}
-	glue_img gi;
-	if (!glue_find(l, slot->images[0].import_key, &gi) || gi.share == nullptr) {
-		glue_leave(l); // a CPU slot: the core hashes the pixels itself
+	if (gi.share == nullptr) {
 		return 0;
 	}
 	d3d11_conv_content_check *chk;
@@ -1491,7 +1487,21 @@ d3d11_lift_glue_input_content_key(struct d3d11_lift *l, uint64_t wire, const str
 		}
 		chk = l->content_check;
 	}
-	const uint64_t key = d3d11_conv_content_check_sample(chk, wire, gi.share, slot->images[0].import_key);
+	return d3d11_conv_content_check_sample(chk, wire, gi.share, import_key);
+}
+
+uint64_t
+d3d11_lift_glue_input_content_key(struct d3d11_lift *l, uint64_t wire, const struct conv_submit_slot *slot)
+{
+	if (l == nullptr || slot == nullptr || slot->image_count < 1 || !glue_enter(l)) {
+		return 0;
+	}
+	glue_img gi;
+	if (!glue_find(l, slot->images[0].import_key, &gi) || gi.share == nullptr) {
+		glue_leave(l); // a CPU slot: the core hashes the pixels itself
+		return 0;
+	}
+	const uint64_t key = glue_content_key(l, wire, gi, slot->images[0].import_key);
 	glue_leave(l);
 	return key;
 }
@@ -2340,7 +2350,8 @@ core_weave_submit_locked(d3d11_lift *l,
 	}
 	glue_img gi;
 	bool ok;
-	if (glue_find(l, slot.images[0].import_key, &gi)) {
+	const bool gpu_slot = glue_find(l, slot.images[0].import_key, &gi);
+	if (gpu_slot) {
 		ok = gi.rtv != nullptr;
 		if (ok) {
 			blit_dst dst = {gi.km, gi.rtv};
@@ -2433,6 +2444,14 @@ core_weave_submit_locked(d3d11_lift *l,
 	fr.focal_px = p.focal_px;
 	if (capped && fr.focal_px > 0.0f) {
 		fr.focal_px *= (float)dw / (float)cw; // focal is in INPUT pixels (a crop keeps the scale)
+	}
+	// #2030 still-image dedupe on the weave path too: a lifted <img> is
+	// snapshotted every frame the page draws, and its GPU slot carries no
+	// pixels the core can hash, so without a key every unchanged frame was
+	// converted again (~20 / s on the win box, competing with Explore's splat
+	// job for the GPU). The v3 submit path already sends this key.
+	if (gpu_slot && conv_core_stream_content_hint(core, core_id) == XRT_CONV_CONTENT_PHOTO) {
+		fr.content_key = glue_content_key(l, id, gi, slot.images[0].import_key);
 	}
 	const xrt_result_t r = conv_core_stream_commit_submit(core, core_id, slot.slot, &fr, out_frame_id);
 	glue_leave(l);

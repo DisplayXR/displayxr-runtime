@@ -1797,6 +1797,16 @@ conv_core_stream_input_kinds(struct conv_core *core,
 	return found;
 }
 
+uint32_t
+conv_core_stream_content_hint(struct conv_core *core, uint64_t stream_id)
+{
+	os_mutex_lock(&core->streams_mtx);
+	struct conv_stream *st = find_locked(core, stream_id);
+	const uint32_t hint = st != NULL ? st->content_hint : 0u;
+	os_mutex_unlock(&core->streams_mtx);
+	return hint;
+}
+
 xrt_result_t
 conv_core_stream_get_stats(struct conv_core *core, uint64_t stream_id, struct conv_stream_stats *out)
 {
