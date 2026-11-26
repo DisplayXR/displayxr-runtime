@@ -256,8 +256,21 @@ jobs:
         run: |
           chmod +x "$DXR_DASHBOARD_BIN"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          ./scripts/build_linux.sh --hybrid --no-test
+          # --bundled-cjson: the tarball must not need libcjson.so.1, which
+          # SteamOS and the Steam Runtime lack (docs/roadmap/steamos-support.md).
+          ./scripts/build_linux.sh --hybrid --no-test --bundled-cjson
           ./scripts/package_linux.sh --no-build
+
+      - name: Tarball needs no system cJSON (SteamOS)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          mkdir -p /tmp/cjson-check && tar -C /tmp/cjson-check -xzf dist/displayxr-runtime-linux-*.tar.gz
+          if find /tmp/cjson-check -type f \( -name '*.so' -o -perm -u+x \) -exec sh -c \
+              'objdump -p "$1" 2>/dev/null | grep -q "NEEDED.*libcjson"' _ {} \; -print | grep .; then
+            echo "error: the files above link libcjson.so.1; build the tarball with --bundled-cjson" >&2
+            exit 1
+          fi
 
       - name: Runtime carries the checkout's version (#1790)
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -306,6 +319,88 @@ jobs:
           name: displayxr-runtime-linux-tarball
           path: dist/displayxr-runtime-linux-*.tar.gz
           if-no-files-found: error
+
+  # SteamOS proxy (docs/roadmap/steamos-support.md, WS1/WS8). SteamOS is Arch
+  # based with a read-only OS image, so this builds the tarball on Arch, runs
+  # the host unit tests that cover SteamOS-relevant code, and installs it the
+  # only way SteamOS allows: user-level, as a non-root user who cannot write
+  # /usr. The --system refusal is checked with a SteamOS os-release.
+  # NOT a required check yet (no org mirror of the image; Arch moves daily).
+  # Promote only after adding it to the LinuxPackaging-style doc-only contract.
+  SteamOS:
+    name: SteamOS (Arch)
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
+      - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git cmake ninja pkgconf python binutils \
+            vulkan-headers vulkan-icd-loader vulkan-validation-layers glslang \
+            eigen systemd-libs \
+            libxcb libx11 libxrandr libxxf86vm wayland dbus \
+            mesa libglvnd
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build (hybrid, bundled cJSON) + headless selftest
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          CMAKE_BUILD_TYPE=Release ./scripts/build_linux.sh --hybrid --bundled-cjson
+
+      - name: Host unit tests (SteamOS-relevant)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          ctest --test-dir build --output-on-failure \
+            -R 'tests_u_file_socket_path|tests_aux_display_|tests_aux_x11_scale|tests_aux_wayland_geom|tests_aux_gamescope|tests_gamepad_|tests_kwgb_payload|tests_service_.*_linux'
+
+      - name: Package (no dashboard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./scripts/package_linux.sh --no-build
+
+      - name: User-level install as a non-root user, selftest, uninstall
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          useradd -m deck
+          tar -C /home/deck -xzf dist/displayxr-runtime-linux-*.tar.gz
+          chown -R deck:deck /home/deck
+          cp scripts/smoke_service_linux.sh /home/deck/ && chown deck:deck /home/deck/smoke_service_linux.sh
+          printf 'NAME="SteamOS"\nID=steamos\nID_LIKE=arch\n' > /tmp/os-release-steamos
+          runuser -u deck -- env -i HOME=/home/deck PATH=/usr/bin bash -euo pipefail -c '
+            cd ~/displayxr-runtime-linux-*/
+            # --system must be refused on SteamOS, before anything is written.
+            if DXR_OS_RELEASE=/tmp/os-release-steamos ./install.sh --system; then
+              echo "error: --system was not refused on SteamOS" >&2; exit 1
+            fi
+            DXR_OS_RELEASE=/tmp/os-release-steamos ./install.sh | tee /tmp/install.log
+            grep -q "XR_RUNTIME_JSON=$HOME/.local/share/displayxr/openxr_displayxr.json PRESSURE_VESSEL_FILESYSTEMS_RW=" /tmp/install.log
+            test -f ~/.local/share/displayxr/openxr_displayxr.json
+            test -f ~/.config/openxr/1/active_runtime.json
+            unset XRT_PLUGIN_SEARCH_PATH
+            ~/.local/share/displayxr/bin/displayxr-cli info
+            ~/.local/share/displayxr/bin/displayxr-cli selftest
+            ~/smoke_service_linux.sh --bin-dir ~/.local/share/displayxr/bin
+            ./uninstall.sh
+            test ! -e ~/.local/share/displayxr
+            test ! -f ~/.config/openxr/1/active_runtime.json
+          '
+          # Nothing outside $HOME was written.
+          test ! -e /usr/local/share/displayxr
 
   # Newest-toolchain gate (#1656): the Package job used to build in the NEXT-LTS
   # container and moved to 22.04 so the tarball it produces is portable, so the
