@@ -64,8 +64,8 @@
 //! screen looks broken, so a 3D look is chosen on purpose). It is
 //! position-preserving, as anaglyph, interlaced and blend are, so it composes
 //! with display zones. The rearranging kinds (SBS / Squeezed / Quad) are
-//! view-inspection tools. The DEVICE starts in 2D whatever the config
-//! (START_3D=1 starts it in slot 1).
+//! view-inspection tools. The DEVICE starts in slot 1 (the app picks its
+//! mode; ADR-065 Amendment 1).
 static xrt_atomic_s32_t g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 static xrt_atomic_s32_t g_sim_display_view_count = 1;
 //! The slot-1 entry's kind (ADR-066 C1), published for the DPs'
@@ -680,7 +680,7 @@ sim_display_hmd_create(void)
 {
 	// ADR-066 C1: the config (OUTPUT) names slot 1's entry; it is read here for
 	// the start-up selection and re-read live through CONFIGURED_3D_MODE. The
-	// start-up mode (START_3D, FORCE_MODE) is read once, here.
+	// start-up pin (FORCE_MODE) is read once, here.
 	enum sim_display_output_mode kind = SIM_DISPLAY_DEFAULT_KIND;
 	struct sim_display_start start;
 	{
@@ -694,7 +694,12 @@ sim_display_hmd_create(void)
 			    mode_str);
 		}
 		const long force = debug_get_num_option_sim_display_force_mode();
-		start = sim_display_resolve_start(sim_display_setting_on("START_3D"), force);
+		start = sim_display_resolve_start(force);
+		if (sim_display_setting_on("START_3D")) {
+			U_LOG_W(
+			    "sim_display: START_3D is deprecated and has no effect - the device starts in slot 1 "
+			    "and the app picks its mode (ADR-065 Amendment 1); FORCE_MODE is the developer pin");
+		}
 		if (start.force_ignored) {
 			U_LOG_W(
 			    "sim_display: SIM_DISPLAY_FORCE_MODE=%ld ignored — it takes 0 (2D) or 1 (the 3D slot "
@@ -906,7 +911,7 @@ sim_display_hmd_create(void)
 		hmd->base.hmd->view_count = max_views;
 	}
 
-	// Start-up mode (ADR-065): 2D unless START_3D; FORCE_MODE (0/1) pins it and
+	// Start-up mode (ADR-065 Amendment 1): slot 1; FORCE_MODE (0/1) pins it and
 	// the set_property guard above then holds it against every later request
 	// (plug-in-wide, any app).
 	if (start.pinned) {

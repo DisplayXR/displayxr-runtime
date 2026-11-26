@@ -57,7 +57,8 @@ static const struct knob g_knobs[] = {
       "switching TO quad applies at the next start; stereo apps fall back to 2D)"},
      "OUTPUT"},
     {{"START_3D", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
-      "start in the 3D mode (mode 1) instead of 2D (mode 0); read at start"},
+      "deprecated, no effect: the device starts in mode 1 and the app picks its mode (ADR-065 Amendment 1); "
+      "FORCE_MODE is the developer pin"},
      "START_3D"},
     {{"FORCE_MODE", XRT_COMPONENT_SETTING_TYPE_INT, "-1",
       "pin the rendering mode for every app: 0 = 2D, 1 = the 3D mode OUTPUT names; -1 = off (other values are "

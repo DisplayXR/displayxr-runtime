@@ -168,9 +168,9 @@ cover.
 
 sim-display shows two rendering modes, 2D (mode 0) and the screen's 3D mode
 (mode 1: a per-screen `dp mode set` choice, else the entry `SIM_DISPLAY_OUTPUT`
-names, else **Same as 2D**), and **starts in 2D** unless
-`SIM_DISPLAY_START_3D=1` ([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md),
-ADR-066 (design PR #2792) C1). The 3D
+names, else **Same as 2D**), and **starts in mode 1**: the app, not the driver, picks its start
+mode ([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md) Amendment 1; `SIM_DISPLAY_START_3D`
+is a deprecated no-op that older recipes still set, harmlessly; ADR-066 (design PR #2792) C1). The 3D
 mode applies live; the start mode is read at device create (`sim_display_hmd_create`,
 declared list in `src/xrt/drivers/sim_display/sim_display_modes.h`). Clear any
 per-screen choice first (`displayxr-cli dp mode reset --screen all`): it outranks
@@ -181,8 +181,8 @@ whatever the device starts in is what the whole run sees:
 | Setting | What the panel shows | Use for |
 |---|---|---|
 | `SIM_DISPLAY_OUTPUT=2d` (= `default`, Same as 2D) | first view flat, full window, in either mode | **everything except eye-visibility** |
-| `SIM_DISPLAY_OUTPUT=sbs` + `SIM_DISPLAY_START_3D=1` | mode 1: side-by-side, centre-cropped, 2 views | the `EyeVisibility`-shaped tests only |
-| `SIM_DISPLAY_OUTPUT=squeezed` + `SIM_DISPLAY_START_3D=1` | SBS, no crop, tiles as-is | rarely — cross-check a tiling doubt |
+| `SIM_DISPLAY_OUTPUT=sbs` | mode 1: side-by-side, centre-cropped, 2 views | the `EyeVisibility`-shaped tests only |
+| `SIM_DISPLAY_OUTPUT=squeezed` | SBS, no crop, tiles as-is | rarely — cross-check a tiling doubt |
 | `anaglyph` | red/cyan, 2 views | **never for these runs** |
 | `blend` | 50/50 alpha blend of the views | never |
 | `quad` | 2×2, 4 views | **never** — see below |

@@ -83,14 +83,15 @@ public class DriverOptionsTests
     public void FriendlyTable_IsData_OrderAndLabels()
     {
         var f = FriendlyOptions.Table;
-        Assert.Equal(new[] { "OUTPUT", "START_3D", "FORCE_MODE", "MULTI_VIEWER" }, f.OrderBy(x => x.Order).Select(x => x.Key));
-        Assert.Equal(new[] { "3D preview kind", "Start in", "Always 2D", "Several viewers" }, f.OrderBy(x => x.Order).Select(x => x.Label));
+        // No "Start in": the app, not the driver, picks its start mode (ADR-065 Amendment 1).
+        Assert.Equal(new[] { "OUTPUT", "FORCE_MODE", "MULTI_VIEWER" }, f.OrderBy(x => x.Order).Select(x => x.Key));
+        Assert.Equal(new[] { "3D preview kind", "Always 2D", "Several viewers" }, f.OrderBy(x => x.Order).Select(x => x.Label));
 
         var output = FriendlyOptions.Find("sim-display", "OUTPUT")!;
         Assert.Equal(new[] { "Red / cyan (anaglyph)", "Side by side", "Side by side, squeezed", "Four views (2x2)", "Interlaced", "Blend" },
                      output.Choices.Select(c => c.Label));
-        Assert.DoesNotContain(output.Choices, c => c.Value is "2d" or "passthrough"); // covered by Start in / Always 2D
-        Assert.Equal(new[] { "2D", "3D preview" }, FriendlyOptions.Find("sim-display", "START_3D")!.Choices.Select(c => c.Label));
+        Assert.DoesNotContain(output.Choices, c => c.Value is "2d" or "passthrough"); // covered by Always 2D
+        Assert.Null(FriendlyOptions.Find("sim-display", "START_3D")); // deprecated no-op: raw list only
         // The simulated display's keys are its own; MULTI_VIEWER is friendly on any driver that declares it.
         Assert.Null(FriendlyOptions.Find("another-driver", "OUTPUT"));
         var mv = FriendlyOptions.Find("another-driver", "MULTI_VIEWER")!;
@@ -102,9 +103,9 @@ public class DriverOptionsTests
     public void Block_FriendlyFirst_InTableOrder_RestByKey()
     {
         var b = SimBlock();
-        Assert.Equal(new[] { "3D preview kind", "Start in", "Always 2D" }, b.Friendly.Select(v => v.Label));
+        Assert.Equal(new[] { "3D preview kind", "Always 2D" }, b.Friendly.Select(v => v.Label));
         Assert.All(b.Friendly, v => Assert.True(v.Friendly));
-        Assert.Equal(new[] { "TRACKING", "TRACKING_PERIOD_MS", "WIDTH_M", "WEAVE_SCOPE", "STEREO_CAMERA_SIZE", "LICENCE_KEY" },
+        Assert.Equal(new[] { "TRACKING", "TRACKING_PERIOD_MS", "START_3D", "WIDTH_M", "WEAVE_SCOPE", "STEREO_CAMERA_SIZE", "LICENCE_KEY" },
                      b.More.Select(v => v.Label)); // the raw key is the label
         Assert.All(b.More, v => Assert.False(v.Friendly));
     }
@@ -140,24 +141,11 @@ public class DriverOptionsTests
     }
 
     [Fact]
-    public void StartIn_IsATwoWayChoice()
-    {
-        var v = SimBlock().Friendly[1];
-        Assert.Equal(OptionControl.TwoWay, v.Control);
-        Assert.Equal("0", v.Selected);
-        Assert.Equal("2D", v.ValueText);
-        Assert.Equal("Default", v.SourceText);
-        var on = OptionViews.View(Sim().Find("START_3D")! with { Value = "1", Source = SettingSource.User }, FriendlyOptions.Find("sim-display", "START_3D"));
-        Assert.Equal("3D preview", on.ValueText);
-        Assert.Equal("1", on.Selected);
-    }
-
-    [Fact]
     public void Always2D_IsAPin_AndAStored1IsItsOwnState()
     {
         var s = Sim().Find("FORCE_MODE")!;
         var entry = FriendlyOptions.Find("sim-display", "FORCE_MODE");
-        var three = SimBlock().Friendly[2];
+        var three = SimBlock().Friendly[1];
         Assert.Equal(OptionControl.Pin, three.Control);
         Assert.False(three.On);
         Assert.Equal("Always 3D preview", three.State);
@@ -609,8 +597,8 @@ public class DriverOptionsTests
         Assert.Equal("MULTI_VIEWER", asInt.More[0].Label);
         Assert.Equal("Several viewers", Assert.Single(OptionViews.Build("other",
             new DriverOptions("other", "", new[] { Setting("MULTI_VIEWER", SettingType.Enum, "ON") })).Friendly).Label);
-        // START_3D declared as an enum: not the two-way choice.
-        Assert.Null(FriendlyOptions.For("sim-display", Setting("START_3D", SettingType.Enum, "1")));
+        // START_3D is not a friendly option at all any more (ADR-065 Amendment 1).
+        Assert.Null(FriendlyOptions.For("sim-display", Setting("START_3D", SettingType.Bool, "1")));
 
         // Any case.
         var output = FriendlyOptions.Find("sim-display", "OUTPUT");
@@ -624,7 +612,7 @@ public class DriverOptionsTests
     }
 
     [Fact]
-    public void NoKindChosen_SaysSo_AndStartInHasNoEffect()
+    public void NoKindChosen_SaysSo()
     {
         var o = Sim();
         var two = o with { Settings = o.Settings.Select(x => x.Key == "OUTPUT" ? x with { Value = "Passthrough" } : x).ToArray() };
@@ -632,9 +620,7 @@ public class DriverOptionsTests
         var kind = b.Friendly.Single(v => v.Key == "OUTPUT");
         Assert.Equal("No 3D preview kind is chosen: apps stay in 2D", kind.ValueText);
         Assert.Null(kind.Selected);
-        Assert.Equal("Has no effect until a 3D preview kind is chosen.", b.Friendly.Single(v => v.Key == "START_3D").Note);
-        // With a kind chosen, no such note.
-        Assert.Null(SimBlock().Friendly.Single(v => v.Key == "START_3D").Note);
+        Assert.DoesNotContain(b.Friendly, v => v.Key == "START_3D");
     }
 
     [Fact]

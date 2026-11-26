@@ -233,10 +233,8 @@ public static class FriendlyOptions
             Aliases: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["squeezed_sbs"] = "squeezed", ["interlace"] = "interlaced" },
             Notes: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [FourViewKind] = FourViewNote },
             NoKindValues: new[] { "2d", "passthrough" }, Is3DMode: true),
-        new FriendlyOption(SimDisplay, "START_3D", "Start in", OptionControl.TwoWay,
-            "How apps start. They can still switch between 2D and the 3D preview.",
-            new[] { new OptionChoice("0", "2D"), new OptionChoice("1", "3D preview") }, 20, SettingType.Bool,
-            InertWithoutKindOf: "OUTPUT"),
+        // START_3D is gone from the friendly options (ADR-065 Amendment 1): the app, not the driver,
+        // picks its start mode; the setting is a deprecated no-op and shows only in the raw list.
         new FriendlyOption(SimDisplay, "FORCE_MODE", "Always 2D", OptionControl.Pin,
             "Keep every app in 2D, whatever it asks for.",
             new[] { new OptionChoice("1", "Always 3D preview") }, 30, SettingType.Int, PinValue: "0"),
