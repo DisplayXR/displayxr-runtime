@@ -4,19 +4,17 @@
  * @file
  * @brief  No-pad backend for platforms without a reader yet.
  *
- * Desktop Linux lands here today. TODO(linux): an evdev backend —
- * `/dev/input/event*` with `EV_ABS` / `EV_KEY` over the `BTN_GAMEPAD`
- * family (and `udev` for hot-plug) — maps straight onto @ref gamepad_state;
- * the hub, the devices and the mapping table need no change for it. Until
- * then @ref gamepad_backend_available returns false and the provider declines
- * at probe, so a staged Linux manifest costs nothing.
+ * Android, and any other platform with no reader, lands here. (Desktop Linux
+ * has the evdev reader, `gamepad_backend_evdev.c`.) Here
+ * @ref gamepad_backend_available returns false and the provider declines at
+ * probe, so a staged manifest costs nothing.
  *
  * @ingroup drv_gamepad
  */
 
 #include "xrt/xrt_config_os.h"
 
-#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_MACOS)
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_MACOS) && !defined(XRT_OS_LINUX_DESKTOP)
 
 #include "gamepad_backend.h"
 
@@ -61,4 +59,4 @@ gamepad_backend_name(void)
 #else
 // Keep the translation unit non-empty where this backend is compiled out (-Wempty-translation-unit).
 typedef int gamepad_backend_stub_not_built_here_t;
-#endif // !XRT_OS_WINDOWS && !XRT_OS_MACOS
+#endif // !XRT_OS_WINDOWS && !XRT_OS_MACOS && !XRT_OS_LINUX_DESKTOP

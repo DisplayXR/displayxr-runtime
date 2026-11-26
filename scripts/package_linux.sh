@@ -90,6 +90,11 @@ PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -
 # nothing for a user (qwerty keeps the hand roles; no conversion task moves).
 SIMINPUT_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimInput.so" -type f | head -1)"
 SIMCONV_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimConversion.so" -type f | head -1)"
+# The gamepad input provider: the evdev reader on desktop Linux (on SteamOS it
+# reads Steam Input's virtual pad). Presence-gated, inert with no pad attached.
+# Optional, so a build without it still packages; install.sh registers it only
+# when it shipped.
+GAMEPAD_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-Gamepad.so" -type f 2>/dev/null | head -1 || true)"
 VKLAYER_SO="$(find "$BUILD_DIR/src/xrt/targets/vk_layer" -maxdepth 1 -name libVkLayer_DXR_queue_lock.so -type f 2>/dev/null | head -1 || true)"
 
 for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
@@ -196,6 +201,11 @@ cp "$ROOT/scripts/linux/systemd/displayxr.socket" "$ROOT/scripts/linux/systemd/d
 cp "$RUNTIME_SO" "$STAGE/lib/"
 cp "$PLUGIN_SO" "$STAGE/lib/displayxr/plugins/"
 cp "$SIMINPUT_SO" "$SIMCONV_SO" "$SIMCONV_PACK" "$STAGE/lib/displayxr/plugins/"
+if [ -n "$GAMEPAD_SO" ]; then
+    cp "$GAMEPAD_SO" "$STAGE/lib/displayxr/plugins/"
+else
+    echo "note: DisplayXR-Gamepad.so not built — packaging without the gamepad provider" >&2
+fi
 cp -r "$(dirname "$SIMCONV_SO")/sim-conversion-blobs" "$STAGE/lib/displayxr/plugins/"
 cp "$VKLAYER_SO" "$STAGE/lib/"
 cp "$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock.json.in" "$STAGE/share/vulkan/"
@@ -219,7 +229,8 @@ echo "$VERSION" > "$STAGE/VERSION"
 GLIBC_SYMS="$(objdump -T "$STAGE/bin"/* "$STAGE/lib/openxr_displayxr.so" "$STAGE/lib/libVkLayer_DXR_queue_lock.so" \
     "$STAGE/lib/displayxr/plugins/DisplayXR-SimDisplay.so" \
     "$STAGE/lib/displayxr/plugins/DisplayXR-SimInput.so" \
-    "$STAGE/lib/displayxr/plugins/DisplayXR-SimConversion.so" 2>/dev/null || true)"
+    "$STAGE/lib/displayxr/plugins/DisplayXR-SimConversion.so" \
+    "$STAGE/lib/displayxr/plugins/DisplayXR-Gamepad.so" 2>/dev/null || true)"
 GLIBC_FLOOR="$(echo "$GLIBC_SYMS" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1 || true)"
 if [ -n "$GLIBC_FLOOR" ]; then
     echo "$GLIBC_FLOOR" > "$STAGE/GLIBC_FLOOR"
