@@ -10,6 +10,7 @@
 #include "catch_amalgamated.hpp"
 
 #include "os/os_display_edid_linux.h"
+#include "os/os_display_connector_linux.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -560,4 +561,102 @@ TEST_CASE("sysfs: reads connected connectors, their EDID, enabled state and mode
 	(void)rmdir((root + "/card1").c_str());
 	(void)unlink((root + "/version").c_str());
 	(void)rmdir(root.c_str());
+}
+
+/*
+ * SteamOS / Steam Deck: the internal eDP scans out 800x1280 (portrait), and
+ * the desktop presents it as 1280x800. sysfs lists the scanout mode only.
+ */
+
+TEST_CASE("drm pick: the rect is a mode -> that mode, not turned")
+{
+	const uint32_t mw[] = {3840, 1920}, mh[] = {2160, 1080};
+	uint32_t w = 0, h = 0;
+	bool q = true;
+	REQUIRE(os_display_drm_pick_mode(mw, mh, 2, 1920, 1080, &w, &h, &q));
+	CHECK(w == 1920);
+	CHECK(h == 1080);
+	CHECK_FALSE(q);
+}
+
+TEST_CASE("drm pick: Steam Deck — the rect transposed is a mode -> quarter turn, presented size")
+{
+	const uint32_t mw[] = {800}, mh[] = {1280};
+	uint32_t w = 0, h = 0;
+	bool q = false;
+	REQUIRE(os_display_drm_pick_mode(mw, mh, 1, 1280, 800, &w, &h, &q));
+	CHECK(w == 1280);
+	CHECK(h == 800);
+	CHECK(q);
+}
+
+TEST_CASE("drm pick: a scaled, turned desktop -> preferred mode, turned by aspect")
+{
+	// 800x1280 at 125 % on a landscape desktop: 1024x640 logical.
+	const uint32_t mw[] = {800}, mh[] = {1280};
+	uint32_t w = 0, h = 0;
+	bool q = false;
+	REQUIRE(os_display_drm_pick_mode(mw, mh, 1, 1024, 640, &w, &h, &q));
+	CHECK(w == 1280);
+	CHECK(h == 800);
+	CHECK(q);
+}
+
+TEST_CASE("drm pick: a scaled, unturned desktop keeps the preferred mode as it is")
+{
+	// The #1831 shape: 3840x2160 at 150 % reads 5120x2880 in X11.
+	const uint32_t mw[] = {3840}, mh[] = {2160};
+	uint32_t w = 0, h = 0;
+	bool q = true;
+	REQUIRE(os_display_drm_pick_mode(mw, mh, 1, 5120, 2880, &w, &h, &q));
+	CHECK(w == 3840);
+	CHECK(h == 2160);
+	CHECK_FALSE(q);
+}
+
+TEST_CASE("drm pick: unknown rect or square modes never infer a turn; empty list fails")
+{
+	const uint32_t mw[] = {800}, mh[] = {1280};
+	uint32_t w = 0, h = 0;
+	bool q = true;
+	REQUIRE(os_display_drm_pick_mode(mw, mh, 1, 0, 0, &w, &h, &q));
+	CHECK(w == 800);
+	CHECK(h == 1280);
+	CHECK_FALSE(q);
+
+	const uint32_t sw[] = {1080}, sh[] = {1080};
+	REQUIRE(os_display_drm_pick_mode(sw, sh, 1, 1920, 1080, &w, &h, &q));
+	CHECK_FALSE(q);
+
+	CHECK_FALSE(os_display_drm_pick_mode(mw, mh, 0, 1280, 800, &w, &h, &q));
+}
+
+TEST_CASE("mutter transform -> rotation")
+{
+	CHECK(os_display_rotation_from_mutter(0) == OS_DISPLAY_ROTATION_0);
+	CHECK(os_display_rotation_from_mutter(1) == OS_DISPLAY_ROTATION_90);
+	CHECK(os_display_rotation_from_mutter(2) == OS_DISPLAY_ROTATION_180);
+	CHECK(os_display_rotation_from_mutter(3) == OS_DISPLAY_ROTATION_270);
+	CHECK(os_display_rotation_from_mutter(5) == OS_DISPLAY_ROTATION_90); // flipped-90
+	CHECK(os_display_rotation_from_mutter(8) == OS_DISPLAY_ROTATION_UNKNOWN);
+	CHECK(os_display_rotation_from_mutter(UINT32_MAX) == OS_DISPLAY_ROTATION_UNKNOWN);
+	CHECK(os_display_rotation_is_quarter(OS_DISPLAY_ROTATION_270));
+	CHECK(os_display_rotation_is_quarter(OS_DISPLAY_ROTATION_QUARTER));
+	CHECK_FALSE(os_display_rotation_is_quarter(OS_DISPLAY_ROTATION_180));
+	CHECK_FALSE(os_display_rotation_is_quarter(OS_DISPLAY_ROTATION_UNKNOWN));
+}
+
+TEST_CASE("join: Steam Deck — a turned eDP joins its connector by name, presented mode")
+{
+	// KWin / Xwayland: no Mutter, so no compositor mode; DRM sysfs only.
+	const std::vector<uint8_t> edp = edp_no_serial_edid();
+	os_display_desktop_info randr[1] = {randr_mon("eDP-1", 0, 1280, 800, 0, 0, true)};
+	os_display_drm_connector drm[1] = {drm_conn("card0-eDP-1", edp.data(), edp.size(), 800, 1280)};
+
+	os_display_edid_monitor out[1] = {};
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 1, drm, 1, out, 1) == 1);
+	CHECK(out[0].join == OS_EDID_JOIN_NAME);
+	CHECK(std::string(out[0].connector) == "card0-eDP-1");
+	CHECK(out[0].native_width == 1280);
+	CHECK(out[0].native_height == 800);
 }

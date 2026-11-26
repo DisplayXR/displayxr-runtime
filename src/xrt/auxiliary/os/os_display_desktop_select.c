@@ -165,8 +165,18 @@ os_display_desktop_select_by_size(const struct os_display_desktop_info *mons,
 	// at every desktop scale — the plug-in reports hardware pixels, and so
 	// does the connector — where the X11 rect of a fractionally-scaled output
 	// is device x ceil(scale) / scale and matches nothing.
+	//
+	// native_* is in the orientation the desktop presents the output. On a
+	// quarter-turned one (the Steam Deck: an 800x1280 portrait panel shown as
+	// a 1280x800 desktop) a plug-in may report either orientation — the
+	// desktop's, or the scanout mode's (what EDID and the kernel say) — and
+	// both are this monitor's hardware mode.
 	for (uint32_t i = 0; i < count; i++) {
-		if (mons[i].native_width == hint->pixel_width && mons[i].native_height == hint->pixel_height) {
+		const struct os_display_desktop_info *m = &mons[i];
+		const bool presented = m->native_width == hint->pixel_width && m->native_height == hint->pixel_height;
+		const bool scanout = os_display_rotation_is_quarter(m->rotation) &&
+		                     m->native_width == hint->pixel_height && m->native_height == hint->pixel_width;
+		if (presented || scanout) {
 			cand[cand_count++] = i;
 		}
 	}

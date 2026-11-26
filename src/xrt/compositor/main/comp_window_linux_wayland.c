@@ -86,7 +86,12 @@ struct cwlw_output
 	uint32_t name;
 	struct wl_output *output;
 	struct zxdg_output_v1 *xdg_output;
+	//! The current mode as wl_output reports it: SCANOUT orientation. Use
+	//! @ref cwlw_output_presented_mode for the size the output has on the
+	//! desktop (and so the size a fullscreen buffer must be).
 	int32_t mode_w, mode_h;
+	//! wl_output transform (WL_OUTPUT_TRANSFORM_*); odd values turn a quarter.
+	int32_t transform;
 	int32_t refresh_mhz;
 	int32_t logical_x, logical_y;
 	int32_t logical_w, logical_h;
@@ -341,10 +346,29 @@ out_geometry(void *data,
              int32_t transform)
 {
 	struct cwlw_output *out = find_output(data, o);
+	if (out != NULL) {
+		out->transform = transform;
+	}
 	if (out != NULL && out->label[0] == '\0') {
 		snprintf(out->label, sizeof(out->label), "%s %s", make != NULL ? make : "?",
 		         model != NULL ? model : "?");
 	}
+}
+
+/*!
+ * The output's current mode as the desktop presents it: the scanout mode with
+ * width and height swapped under a 90/270 transform (odd WL_OUTPUT_TRANSFORM_*
+ * values). The Steam Deck's internal panel is 800x1280 scanout and 1280x800
+ * on the desktop; a fullscreen surface with no buffer transform must be the
+ * latter, and the panel's native size (reported by the plug-in in either
+ * orientation) is compared against it.
+ */
+static void
+cwlw_output_presented_mode(const struct cwlw_output *o, int32_t *out_w, int32_t *out_h)
+{
+	const bool quarter = (o->transform & 1) != 0;
+	*out_w = quarter ? o->mode_h : o->mode_w;
+	*out_h = quarter ? o->mode_w : o->mode_h;
 }
 
 static void
@@ -1066,11 +1090,15 @@ resolve_panel(struct comp_window_linux_wl *w)
 		mon.logical_y = o->logical_y;
 		mon.logical_w = o->have_logical_size ? o->logical_w : 0;
 		mon.logical_h = o->have_logical_size ? o->logical_h : 0;
-		mon.mode_w = o->mode_w;
-		mon.mode_h = o->mode_h;
+		cwlw_output_presented_mode(o, &mon.mode_w, &mon.mode_h);
 		bool origin = false;
+		// The panel size may come in scanout orientation on a turned output
+		// (a plug-in reading EDID); it is the same hardware mode.
+		const bool quarter = (o->transform & 1) != 0;
 		if (!u_wl_monitor_is_panel(&mon, w->place.screen_left, w->place.screen_top, w->place.width,
-		                           w->place.height, &origin)) {
+		                           w->place.height, &origin) &&
+		    !(quarter && u_wl_monitor_is_panel(&mon, w->place.screen_left, w->place.screen_top, w->place.height,
+		                                       w->place.width, &origin))) {
 			continue;
 		}
 		size_matches++;
@@ -1087,14 +1115,15 @@ resolve_panel(struct comp_window_linux_wl *w)
 	}
 	if (picked != NULL) {
 		w->panel_output = picked->output;
-		w->buf_w = picked->mode_w;
-		w->buf_h = picked->mode_h;
-		w->panel_lw = picked->have_logical_size ? picked->logical_w : picked->mode_w;
-		w->panel_lh = picked->have_logical_size ? picked->logical_h : picked->mode_h;
+		// Presented orientation: a fullscreen surface on a turned output
+		// (Steam Deck) is the turned size; the compositor rotates on scanout.
+		cwlw_output_presented_mode(picked, &w->buf_w, &w->buf_h);
+		w->panel_lw = picked->have_logical_size ? picked->logical_w : w->buf_w;
+		w->panel_lh = picked->have_logical_size ? picked->logical_h : w->buf_h;
 		U_LOG_W(
-		    "comp_window_linux(wayland): 3D panel output %s: mode %dx%d device px, logical %dx%d at "
-		    "(%d, %d)%s",
-		    picked->label, picked->mode_w, picked->mode_h, w->panel_lw, w->panel_lh, picked->logical_x,
+		    "comp_window_linux(wayland): 3D panel output %s: mode %dx%d device px (transform %d), logical "
+		    "%dx%d at (%d, %d)%s",
+		    picked->label, w->buf_w, w->buf_h, picked->transform, w->panel_lw, w->panel_lh, picked->logical_x,
 		    picked->logical_y, exact != NULL ? "" : " (matched by size only)");
 	} else {
 		U_LOG_W(
