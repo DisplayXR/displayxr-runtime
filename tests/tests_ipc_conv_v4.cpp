@@ -689,3 +689,71 @@ TEST_CASE("viewCount 0 follows the weave: resized behind the same handle", "[ipc
 	}
 	conv_fake_fini(&f);
 }
+
+/*
+ * A live lift stream (Convert to 3D) warms the photo -> splats capability in
+ * the background, so the Explore that follows finds the model loaded (on the
+ * win box: Explore 20 s cold -> ~2.8 s). DXR_CONV_PREWARM_SPLATS=0 turns it off.
+ */
+//! Portable: set (or, with NULL / "", clear) an environment variable.
+static void
+prewarm_set_env(const char *name, const char *value)
+{
+#ifdef _WIN32
+	(void)_putenv_s(name, value != nullptr ? value : "");
+#else
+	if (value != nullptr && value[0] != ' ') {
+		(void)setenv(name, value, 1);
+	} else {
+		(void)unsetenv(name);
+	}
+#endif
+}
+
+static uint32_t
+fake_cap_state(conv_fake_provider &f, uint32_t cap_id)
+{
+	os_mutex_lock(&f.mtx);
+	uint32_t s = 0;
+	for (uint32_t i = 0; i < f.cap_count; i++) {
+		if (f.caps[i].cap.cap_id == cap_id) {
+			s = f.caps[i].state;
+		}
+	}
+	os_mutex_unlock(&f.mtx);
+	return s;
+}
+
+TEST_CASE("a live lift stream warms the splats capability", "[ipc_conv_v4]")
+{
+	for (const bool off : {false, true}) {
+		CAPTURE(off);
+		prewarm_set_env("DXR_CONV_PREWARM_SPLATS", off ? "0" : nullptr);
+		conv_fake_provider f;
+		conv_fake_init(&f, "fake");
+		conv_fake_cap *v = conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM,
+		                                     XRT_CONV_OUT_VIEWS | XRT_CONV_OUT_DEPTH, 0);
+		v->cap.max_views = 2;
+		conv_fake_cap *s =
+		    conv_fake_add_cap(&f, 6, XRT_CONV_TASK_SPLATS_MONO, XRT_CONV_LANE_JOB, XRT_CONV_OUT_SPLAT_BLOB, 0);
+		(void)s;
+		conv_fake_set_state(&f, 4, XRT_CONV_STATE_READY, 0, false);
+		conv_fake_set_state(&f, 6, XRT_CONV_STATE_INSTALLED, 0, false);
+		{
+			Fixture fx;
+			REQUIRE(fx.add(f) >= 0);
+			fx.install_glue();
+			REQUIRE(fake_cap_state(f, 6) == XRT_CONV_STATE_INSTALLED);
+			uint64_t id = 0;
+			REQUIRE(fx.create_task(1, XRT_CONV_TASK_VIEWS_MONO, &id) == XRT_SUCCESS);
+			if (!off) {
+				CHECK(wait_until([&] { return fake_cap_state(f, 6) == XRT_CONV_STATE_READY; }, 5000));
+			} else {
+				os_nanosleep(300ll * 1000 * 1000);
+				CHECK(fake_cap_state(f, 6) == XRT_CONV_STATE_INSTALLED);
+			}
+		}
+		conv_fake_fini(&f);
+	}
+	prewarm_set_env("DXR_CONV_PREWARM_SPLATS", nullptr);
+}
