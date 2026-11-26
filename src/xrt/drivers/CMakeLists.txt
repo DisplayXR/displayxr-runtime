@@ -1120,8 +1120,10 @@ endif()
 # = look, ADR-034 Amendment 4), and an optional emulated khr/simple_controller
 # pair so HANDLE apps — denied the qwerty pair because their own window owns
 # the keyboard — get xrSyncActions controllers at all. Platform readers:
-# XInput + HID for Sony pads (Windows), GameController.framework (macOS); desktop Linux is a stub
-# that declines at probe (evdev follow-up). Presence-gated: registered by
+# XInput + HID for Sony pads (Windows), GameController.framework (macOS), evdev
+# (desktop Linux: plain /dev/input reads, no new library; prefers Steam Input's
+# virtual pad on SteamOS); anything else is a stub
+# that declines at probe. Presence-gated: registered by
 # the installer, inert without a pad. Same build model as sim-input above.
 #
 # drv_gamepad_sources / drv_gamepad_static: the sources also compile as a
@@ -1152,6 +1154,14 @@ if(WIN32)
 		gamepad/gamepad_backend_hid_win.c
 		gamepad/gamepad_hid_report.c
 		gamepad/gamepad_hid_report.h
+		)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	# Desktop Linux = evdev; the event-code mapping is pure and unit-tested.
+	list(APPEND DRV_GAMEPAD_SOURCES
+		gamepad/gamepad_backend_evdev.c
+		gamepad/gamepad_evdev_map.c
+		gamepad/gamepad_evdev_map.h
 		)
 endif()
 if(APPLE)

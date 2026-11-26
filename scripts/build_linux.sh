@@ -311,9 +311,9 @@ if [ -n "$SIMTRACK_PLUGIN" ]; then
 EOF
 fi
 
-# Gamepad input provider (ADR-034 / ADR-054). Desktop Linux has no pad reader
-# yet (evdev follow-up): the provider DECLINES at probe, so staging the
-# manifest costs nothing and the dev tree matches macOS / Windows.
+# Gamepad input provider (ADR-034 / ADR-054). Desktop Linux reads pads over
+# evdev (prefers Steam Input's virtual pad on SteamOS); with no pad attached it
+# is inert, and the dev tree matches macOS / Windows.
 GAMEPAD_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-Gamepad.so" -type f | head -1)"
 if [ -n "$GAMEPAD_PLUGIN" ]; then
   cp "$GAMEPAD_PLUGIN" "$PLUGIN_DIR/"

@@ -55,6 +55,7 @@ fi
 
 rm -f "$DP_ROOT/200-sim-display.json"
 rm -f "$DP_ROOT/200-sim-input-input-provider.json" "$DP_ROOT/250-sim-conversion-conversion-provider.json"
+rm -f "$DP_ROOT/150-gamepad-input-provider.json"
 # Leave other vendors' manifests + the shared root in place; prune if empty.
 rmdir "$DP_ROOT" 2>/dev/null || true
 
@@ -99,7 +100,8 @@ if [ "$SYSTEM" = 1 ]; then
         "$PREFIX/bin/displayxr-gnome-extension-enable" \
         "$PREFIX/lib/openxr_displayxr.so" "$PREFIX/lib/libVkLayer_DXR_queue_lock.so" \
         "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so" \
-        /usr/local/share/displayxr/openxr_displayxr.json
+        /usr/local/share/displayxr/openxr_displayxr.json \
+        "$PREFIX/lib/displayxr/plugins/DisplayXR-Gamepad.so"
     rmdir -p "$PREFIX/lib/displayxr/plugins" 2>/dev/null || true
 else
     rm -rf "$PREFIX"
