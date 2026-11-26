@@ -179,6 +179,26 @@ cat > "$DP_ROOT/250-sim-conversion-conversion-provider.json" <<EOF
 EOF
 echo "==> Reference provider manifests: $DP_ROOT/200-sim-input-input-provider.json, $DP_ROOT/250-sim-conversion-conversion-provider.json"
 
+# --- Gamepad input provider (evdev; SteamOS: Steam Input's virtual pad) -----
+# Presence-gated: inert until a pad is attached. Registered only when the
+# tarball shipped it. `displayxr-cli input disable gamepad` turns it off.
+if [ -f "$PREFIX/lib/displayxr/plugins/DisplayXR-Gamepad.so" ]; then
+    cat > "$DP_ROOT/150-gamepad-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "gamepad",
+        "display_name": "DisplayXR Gamepad",
+        "vendor":       "DisplayXR",
+        "version":      "$(cat "$HERE/VERSION" 2>/dev/null || echo unknown)",
+        "binary_path":  "$PREFIX/lib/displayxr/plugins/DisplayXR-Gamepad.so",
+        "probe_order":  150
+    }
+}
+EOF
+    echo "==> Gamepad provider manifest: $DP_ROOT/150-gamepad-input-provider.json"
+fi
+
 # --- VK_LAYER_DXR_queue_lock (#902 / #2036) ---------------------------------
 # The Vulkan layer the runtime enables by name at xrCreateVulkanInstanceKHR so
 # the #868 repaint can share the app's only graphics queue (Intel and other

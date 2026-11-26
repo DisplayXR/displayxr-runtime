@@ -169,6 +169,7 @@ set(tests
     tests_sim_stylus_mouse
     tests_gamepad_map
     tests_gamepad_hid_report
+    tests_gamepad_evdev_map
     tests_ultraleap_map
     tests_touch_gesture
     tests_comp_layer_view_camera
@@ -1323,6 +1324,19 @@ target_include_directories(
 				 ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_gamepad_hid_report PRIVATE xrt-interfaces)
+# SteamOS / desktop Linux -- the evdev event-code mapping the Linux pad reader
+# trusts (drivers/gamepad/gamepad_evdev_map.c): face-button layouts, axis
+# normalisation, Steam Input virtual-pad preference. Pure, so it runs on every
+# platform; no pad and no /dev/input needed.
+target_sources(
+	tests_gamepad_evdev_map
+	PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad/gamepad_evdev_map.c
+	)
+target_include_directories(
+	tests_gamepad_evdev_map PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad
+				 ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_gamepad_evdev_map PRIVATE xrt-interfaces)
 # Dev probe (not a test, never built by default): reads the real Windows
 # gamepad backend -- XInput + HID dispatch -- and prints the live reader and
 # the pad state at 2 Hz for 15 s. `gamepad_backend_probe [--rumble]`.
