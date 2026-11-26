@@ -3,7 +3,7 @@
   "runtime":     "v2.70.8",
   "shell":       "v2.4.2",
   "leia_plugin": "v2.24.0",
-  "conversion_open": "v0.2.1",
+  "conversion_open": "v0.2.2",
   "leia_conversion": "v0.1.1",
   "mcp_tools":   "v0.5.7",
   "browser":     "v1.10.8",
