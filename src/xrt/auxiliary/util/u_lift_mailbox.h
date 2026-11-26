@@ -458,6 +458,22 @@ u_lift_letterbox_profile_from_lines(const uint8_t *col_px,
                                     float *cols,
                                     uint32_t *out_nc);
 
+/*!
+ * The letterbox crop of ONE still picture (the one-shot GAUSSIANS input, an
+ * Explore of a paused video): the same profile and the same policy as a live
+ * stream (u_lift_letterbox_profile_from_lines + u_lift_letterbox_update, fed
+ * until a stable crop settles), so a picture and the video it came from are
+ * cropped alike, subtitles in a bar and the symmetry rule included. A black
+ * frame, or one with no bars, crops nothing.
+ *
+ * @p px is @p w x @p h texels of 4 bytes, @p stride bytes per row, B G R A
+ * when @p bgra, else R G B A. Returns true when *@p out crops anything (else
+ * *@p out is all zero).
+ */
+bool
+u_lift_letterbox_measure_still(
+    const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, bool bgra, struct u_lift_crop *out);
+
 
 #ifdef __cplusplus
 }

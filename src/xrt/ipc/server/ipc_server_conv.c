@@ -85,6 +85,9 @@ struct sc_stream
 	char *camera_json;               //!< runtime-built camera block v2 of the latched blob
 	char *facts_json;                //!< the provider's facts, intrinsics in the caller's pixels
 	double job_scale_x, job_scale_y; //!< caller px / provider px of the newest job (downscale)
+	//! The newest job's letterbox crop: its top-left in the caller's photo and
+	//! that photo's full size (0 x 0 = not cropped).
+	uint32_t job_crop_x, job_crop_y, job_full_w, job_full_h;
 	bool fail_latched;               //!< the newest job FAILED: report it once
 	uint64_t fail_frame_id;
 	int64_t fail_source_time;
@@ -1060,16 +1063,43 @@ gaussians_job_submit(struct ipc_server_conv *sc,
                      uint8_t *px,
                      uint64_t *out_frame_id)
 {
-	uint32_t pw = args->width, ph = args->height;
-	px = photo_downscale(px, args->width, args->height, IPC_SERVER_CONV_PHOTO_MAX_EDGE, &pw, &ph);
+	// The picture only: a video frame's letterbox bars are cut off first, by the
+	// live stream's own policy (u_lift_letterbox_measure_still), so the provider
+	// never spends its splats, or its depth, on black. The camera block is put
+	// back into the caller's full frame afterwards (gaussians_describe).
+	uint32_t crop_x = 0, crop_y = 0, cw = args->width, ch = args->height;
+	struct u_lift_crop lc;
+	if (u_lift_letterbox_parse(getenv("DXR_LIFT_LETTERBOX")) &&
+	    u_lift_letterbox_measure_still(px, args->width, args->height, args->width * 4u, false, &lc)) {
+		cw = args->width - lc.left - lc.right;
+		ch = args->height - lc.top - lc.bottom;
+		uint8_t *cropped = (uint8_t *)malloc((size_t)cw * ch * 4u);
+		if (cropped == NULL) {
+			free(px);
+			return XRT_ERROR_ALLOCATION;
+		}
+		for (uint32_t y = 0; y < ch; y++) {
+			memcpy(cropped + (size_t)y * cw * 4u, px + ((size_t)(y + lc.top) * args->width + lc.left) * 4u,
+			       (size_t)cw * 4u);
+		}
+		free(px);
+		px = cropped;
+		crop_x = lc.left;
+		crop_y = lc.top;
+		U_LOG_W("[conv] GAUSSIANS: photo %ux%u cropped to its picture %ux%u at (%u, %u) (letterbox bars top %u "
+		        "bottom %u left %u right %u)",
+		        args->width, args->height, cw, ch, crop_x, crop_y, lc.top, lc.bottom, lc.left, lc.right);
+	}
+	uint32_t pw = cw, ph = ch;
+	px = photo_downscale(px, cw, ch, IPC_SERVER_CONV_PHOTO_MAX_EDGE, &pw, &ph);
 	if (px == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
-	const double scale_x = (double)args->width / (double)pw;
-	const double scale_y = (double)args->height / (double)ph;
-	if (pw != args->width || ph != args->height) {
-		U_LOG_W("[conv] GAUSSIANS: photo %ux%u downscaled to %ux%u for the provider (max edge %u)", args->width,
-		        args->height, pw, ph, IPC_SERVER_CONV_PHOTO_MAX_EDGE);
+	const double scale_x = (double)cw / (double)pw;
+	const double scale_y = (double)ch / (double)ph;
+	if (pw != cw || ph != ch) {
+		U_LOG_W("[conv] GAUSSIANS: photo %ux%u downscaled to %ux%u for the provider (max edge %u)", cw, ch, pw,
+		        ph, IPC_SERVER_CONV_PHOTO_MAX_EDGE);
 	}
 	struct conv_job_create_info ji;
 	memset(&ji, 0, sizeof(ji));
@@ -1111,6 +1141,11 @@ gaussians_job_submit(struct ipc_server_conv *sc,
 	st->job_source_time = args->source_time;
 	st->job_scale_x = scale_x;
 	st->job_scale_y = scale_y;
+	const bool cropped = cw != args->width || ch != args->height;
+	st->job_crop_x = cropped ? crop_x : 0u;
+	st->job_crop_y = cropped ? crop_y : 0u;
+	st->job_full_w = cropped ? args->width : 0u;
+	st->job_full_h = cropped ? args->height : 0u;
 	st->fail_latched = false; // a newer photo supersedes an unreported failure
 	*out_frame_id = st->job_frame_id;
 	return XRT_SUCCESS;
@@ -1484,7 +1519,8 @@ ipc_server_conv_lift_stats(struct ipc_server_conv *sc,
 /*!
  * Spec 6: the facts and the runtime-built camera block of a succeeded job's
  * blob, as compact JSON (either may stay NULL). The provider's intrinsics are
- * re-expressed in the caller's pixels when the facade downscaled the photo.
+ * re-expressed in the caller's pixels when the facade downscaled the photo,
+ * and in the caller's full frame when it cut off letterbox bars.
  */
 static void
 gaussians_describe(struct ipc_server_conv *sc,
@@ -1514,6 +1550,15 @@ gaussians_describe(struct ipc_server_conv *sc,
 	char err[160] = {0};
 	// The same scale reaches an authored SOG block's intrinsics (#2836).
 	cJSON *block = conv_lift_camera_block(facts, sx, sy, blob, (size_t)size, jr->blob_format, err, sizeof(err));
+	if (st->job_full_w != 0) {
+		// The letterbox crop: the same full-frame rule for the facts and the block.
+		(void)conv_intrinsics_uncrop(facts, (double)st->job_crop_x, (double)st->job_crop_y, st->job_full_w,
+		                             st->job_full_h);
+		if (block != NULL) {
+			(void)conv_intrinsics_uncrop(block, (double)st->job_crop_x, (double)st->job_crop_y,
+			                             st->job_full_w, st->job_full_h);
+		}
+	}
 	if (block != NULL) {
 		*out_camera = cJSON_PrintUnformatted(block);
 		const cJSON *focus = cJSON_GetObjectItemCaseSensitive(block, "focus");

@@ -120,6 +120,21 @@ bool
 conv_camera_block_scale_intrinsics(cJSON *block, double sx, double sy);
 
 /*!
+ * The runtime cropped the caller's photo before the provider saw it (the
+ * letterbox bars of a video frame): re-express @p obj's `intrinsics` (facts or
+ * a camera block, already in the caller's pixel SCALE, see
+ * conv_splat_facts_scale_intrinsics) in the caller's FULL frame, in place:
+ * cx += @p ox, cy += @p oy, width = @p full_w, height = @p full_h. fx / fy are
+ * unchanged (a crop keeps the focal). The splats then sit exactly where the
+ * picture sat in the frame the caller submitted, and the bars stay empty.
+ *
+ * No change (false) when @p obj has no `intrinsics` object, a present key is
+ * not a finite number, or there is nothing to do (no offset, same size).
+ */
+bool
+conv_intrinsics_uncrop(cJSON *obj, double ox, double oy, uint32_t full_w, uint32_t full_h);
+
+/*!
  * The camera block a lift caller receives with a GAUSSIANS blob (XR_DXR_lift
  * spec 6): the SAME v2 object `conv run --camera-block auto` writes into a SOG,
  * built by the RUNTIME from the common facts schema whatever provider made the

@@ -796,3 +796,78 @@ TEST_CASE("lift letterbox: the line-sample profile equals the D3D11 reduction", 
 	CHECK(u_lift_letterbox_sample_pos(0, 1920) == 10);
 	CHECK(u_lift_letterbox_sample_pos(95, 1920) == 1910);
 }
+
+
+/*
+ * The one-shot crop (u_lift_letterbox_measure_still): an Explore of a paused
+ * video sends ONE frame; its bars come off by the same policy a live stream
+ * settles on, so the splats are made from the picture only.
+ */
+namespace {
+//! A w x h RGBA frame: black, with a lit picture in [x0, x1) x [y0, y1).
+std::vector<uint8_t>
+still_frame(uint32_t w, uint32_t h, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+{
+	std::vector<uint8_t> px((size_t)w * h * 4u, 0);
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			uint8_t *p = &px[((size_t)y * w + x) * 4u];
+			p[3] = 255;
+			if (x >= x0 && x < x1 && y >= y0 && y < y1) {
+				p[0] = (uint8_t)(80 + (x * 7) % 120); // a textured picture, never black
+				p[1] = (uint8_t)(90 + (y * 5) % 110);
+				p[2] = 120;
+			}
+		}
+	}
+	return px;
+}
+} // namespace
+
+TEST_CASE("lift letterbox: one still frame is cropped to its picture", "[lift][letterbox]")
+{
+	u_lift_crop c = {};
+	SECTION("pillarbox: 4:3 in 16:9 (the YouTube frame on the win box)")
+	{
+		// 1920x1080 with a 1440x1080 picture centred: bars of 240 columns each side.
+		const std::vector<uint8_t> px = still_frame(1920, 1080, 240, 0, 1680, 1080);
+		REQUIRE(u_lift_letterbox_measure_still(px.data(), 1920, 1080, 1920 * 4, false, &c));
+		CHECK(c.left == 240);
+		CHECK(c.right == 240);
+		CHECK(c.top == 0);
+		CHECK(c.bottom == 0);
+	}
+	SECTION("letterbox: 2.39:1 in 16:9")
+	{
+		const std::vector<uint8_t> px = still_frame(1920, 1080, 0, 138, 1920, 941);
+		REQUIRE(u_lift_letterbox_measure_still(px.data(), 1920, 1080, 1920 * 4, false, &c));
+		CHECK(c.top == 138);
+		CHECK(c.bottom == 1080 - 941);
+		CHECK(c.left == 0);
+		CHECK(c.right == 0);
+	}
+	SECTION("a full-frame picture crops nothing")
+	{
+		const std::vector<uint8_t> px = still_frame(1280, 720, 0, 0, 1280, 720);
+		CHECK_FALSE(u_lift_letterbox_measure_still(px.data(), 1280, 720, 1280 * 4, false, &c));
+		CHECK_FALSE(u_lift_crop_active(&c));
+	}
+	SECTION("a black frame crops nothing (a fade is not a letterbox)")
+	{
+		const std::vector<uint8_t> px = still_frame(1280, 720, 0, 0, 0, 0);
+		CHECK_FALSE(u_lift_letterbox_measure_still(px.data(), 1280, 720, 1280 * 4, false, &c));
+		CHECK_FALSE(u_lift_crop_active(&c));
+	}
+	SECTION("a padded row stride is honoured")
+	{
+		const uint32_t w = 640, h = 360, stride = (w + 32) * 4;
+		const std::vector<uint8_t> tight = still_frame(w, h, 80, 0, 560, h);
+		std::vector<uint8_t> padded((size_t)stride * h, 0xEE); // lit padding must be ignored
+		for (uint32_t y = 0; y < h; y++) {
+			memcpy(&padded[(size_t)y * stride], &tight[(size_t)y * w * 4], (size_t)w * 4);
+		}
+		REQUIRE(u_lift_letterbox_measure_still(padded.data(), w, h, stride, false, &c));
+		CHECK(c.left == 80);
+		CHECK(c.right == 80);
+	}
+}
