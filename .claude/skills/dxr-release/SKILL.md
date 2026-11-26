@@ -34,7 +34,7 @@ Spec: [`docs/specs/runtime/versions-json-autobump.md`](../../docs/specs/runtime/
 ```
 /dxr-release <component> <version-spec>
 
-  <component>     shell | leia-plugin (leia) | leia-conversion | ultraleap | mcp | browser | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview) | unity
+  <component>     shell | leia-plugin (leia) | leia-conversion | open-conversion | ultraleap | mcp | browser | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview) | unity
   <version-spec>  vX.Y.Z  |  patch  |  minor  |  major        (browser too, from v1.0.0 — see "Browser is special")
 ```
 
@@ -60,6 +60,7 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 | `browser` | `DisplayXR/displayxr-browser-pvt` | `browser` | `publish-browser-releases.yml` | `displayxr-browser` (public, keeps its name) |
 | `leia-plugin` / `leia` | `DisplayXR/displayxr-leia-plugin` | `leia_plugin` | `build-windows.yml` | same repo |
 | `leia-conversion` | `DisplayXR/displayxr-leia-conversion` | `leia_conversion` | `release.yml` | same repo |
+| `open-conversion` | `DisplayXR/displayxr-conversion-open` | `conversion_open` | `release.yml` | same repo |
 | `ultraleap` | `DisplayXR/displayxr-ultraleap` | `ultraleap` | `release.yml` | same repo |
 | `mcp` | `DisplayXR/displayxr-mcp` | `mcp_tools` | `build.yml` | same repo |
 | `gauss` / `demo-gaussiansplat` | `DisplayXR/displayxr-demo-gaussiansplat` | `gauss_demo` | `build-windows.yml` | same repo |
@@ -99,6 +100,21 @@ is signed), so teach the signing provider the component before expecting it ther
 `leia-conversion` is signed through Phase 3.5 like any installer component once the signing
 provider's `leia-conversion` recipe is merged; a provider without it returns no
 `DisplayXRLeiaConversionSetup-<version>.exe` and the release ships unsigned.
+
+**`open-conversion`** (the open-model conversion provider every install gets by default) is
+an ordinary installer component: its `release.yml` attaches an unsigned
+`DisplayXROpenConversionSetup-<version>.exe` plus a Linux tarball, and Phase 3.5 replaces the
+`.exe` with the signing provider's `open-conversion` build (provider DLL, uninstaller and
+installer signed; the bundled ONNX Runtime, DirectML and OpenVINO DLLs keep their vendors'
+signatures). The Linux tarball stays as CI built it. Two things differ from `leia-conversion`:
+- **Its `release.yml` may not dispatch the `versions-bump` itself.** v0.2.0 to v0.2.2 had no
+  dispatch job (that is why `conversion_open` lagged at v0.2.0); one is added by a
+  `displayxr-conversion-open` PR. Phase 4 checks the tag's run for a
+  `dispatch-versions-bump` job and, when there is none, dispatches the bump by hand
+  (`gh workflow run versions-bump.yml -R DisplayXR/displayxr-runtime -f field=conversion_open
+  -f tag=<tag> -f source_repo=DisplayXR/displayxr-conversion-open`).
+- **The bump is not ABI-gated** (`versions-bump.yml` gates only `leia_plugin`,
+  `leia_conversion` and `ultraleap`), so a green run means the pin moved.
 
 **Browser is special** — it is the second private→public split after the shell
 (source, patch series, build lanes and the Android keystore live in the PRIVATE
@@ -257,6 +273,7 @@ case "$COMPONENT" in
   browser)                       REPO=DisplayXR/displayxr-browser-pvt;        FIELD=browser;     WORKFLOW=publish-browser-releases.yml; REL_REPO=DisplayXR/displayxr-browser ;;
   leia|leia-plugin)              REPO=DisplayXR/displayxr-leia-plugin;        FIELD=leia_plugin; WORKFLOW=build-windows.yml;           REL_REPO=DisplayXR/displayxr-leia-plugin ;;
   leia-conversion)               REPO=DisplayXR/displayxr-leia-conversion;    FIELD=leia_conversion; WORKFLOW=release.yml;             REL_REPO=DisplayXR/displayxr-leia-conversion ;;
+  open-conversion)               REPO=DisplayXR/displayxr-conversion-open;    FIELD=conversion_open; WORKFLOW=release.yml;             REL_REPO=DisplayXR/displayxr-conversion-open ;;
   ultraleap)                     REPO=DisplayXR/displayxr-ultraleap;          FIELD=ultraleap;   WORKFLOW=release.yml;                 REL_REPO=DisplayXR/displayxr-ultraleap ;;
   mcp)                           REPO=DisplayXR/displayxr-mcp;                FIELD=mcp_tools;   WORKFLOW=build.yml;                   REL_REPO=DisplayXR/displayxr-mcp ;;
   gauss|demo-gaussiansplat)      REPO=DisplayXR/displayxr-demo-gaussiansplat; FIELD=gauss_demo; WORKFLOW=build-windows.yml;           REL_REPO=DisplayXR/displayxr-demo-gaussiansplat ;;
@@ -267,7 +284,7 @@ case "$COMPONENT" in
   unity)                         REPO=DisplayXR/displayxr-unity;              FIELD="";               WORKFLOW=build-native.yml;      REL_REPO=DisplayXR/displayxr-unity ;;
   runtime)                       echo "Use /release (in-repo) for the runtime."; exit 1 ;;
   installer)                     echo "Use /installer-release for the bundle.";  exit 1 ;;
-  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, leia-conversion, ultraleap, mcp, browser, gauss, modelviewer, mediaplayer, avatar, earthview, unity."; exit 1 ;;
+  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, leia-conversion, open-conversion, ultraleap, mcp, browser, gauss, modelviewer, mediaplayer, avatar, earthview, unity."; exit 1 ;;
 esac
 # FIELD="" (unity) → no versions.json entry; skip the Phase 4 versions-bump watch.
 # Tag shape is `vX.Y.Z` for EVERY component, browser included (browser-pvt#120 retired
@@ -813,12 +830,13 @@ fi
 ```
 
 ### Step 3.5.2: Normalize the component name for the workflow
-The workflow expects canonical names (`runtime|leia-plugin|leia-conversion|mcp|gauss|modelviewer|mediaplayer|avatar|earthview`).
+The workflow expects canonical names (`runtime|leia-plugin|leia-conversion|open-conversion|mcp|gauss|modelviewer|mediaplayer|avatar|earthview`).
 Map the skill's aliases:
 ```bash
 case "$COMPONENT" in
   leia|leia-plugin)              COMP=leia-plugin ;;
   leia-conversion)               COMP=leia-conversion ;;
+  open-conversion)               COMP=open-conversion ;;
   gauss|demo-gaussiansplat)      COMP=gauss ;;
   modelviewer|demo-modelviewer)  COMP=modelviewer ;;
   avatar|demo-avatar)            COMP=avatar ;;
@@ -837,6 +855,7 @@ esac
 case "$COMP" in
   leia-plugin) INST=DisplayXRLeiaSRSetup ;;
   leia-conversion) INST=DisplayXRLeiaConversionSetup ;;
+  open-conversion) INST=DisplayXROpenConversionSetup ;;
   mcp)         INST=DisplayXRMCPSetup ;;
   gauss)       INST=DisplayXRGaussianSplatSetup ;;
   modelviewer) INST=DisplayXRModelViewerSetup ;;
@@ -1077,6 +1096,26 @@ fi
 Spec: `docs/specs/runtime/versions-json-autobump.md` §"The browser pin LAGS the newest
 release on purpose".
 
+**open-conversion — dispatch the bump by hand when its release run did not.** A
+`displayxr-conversion-open` tag whose `release.yml` has no `dispatch-versions-bump` job (every
+tag up to v0.2.2) sends nothing, so the pin would wait forever below. Look at the tag's run
+(`RUN_ID` from Phase 3) and, only when the job is absent, dispatch `versions-bump.yml` with the
+same three values the job would send. The hand dispatch is a `workflow_dispatch` event, so the
+run-id lookup below searches that event instead:
+```bash
+BUMP_EVENT=repository_dispatch
+if [ "$COMPONENT" = open-conversion ] && [ -z "$SKIP_BUMP" ]; then
+  HAS_DISPATCH=$(gh run view "$RUN_ID" -R "$REPO" --json jobs \
+                   --jq '[.jobs[].name | select(. == "dispatch-versions-bump")] | length')
+  if [ "$HAS_DISPATCH" = 0 ]; then
+    echo "open-conversion $NEW_TAG: release.yml has no dispatch-versions-bump job; dispatching the bump by hand"
+    gh workflow run versions-bump.yml -R DisplayXR/displayxr-runtime \
+      -f field=conversion_open -f tag="$NEW_TAG" -f source_repo="$REPO"
+    BUMP_EVENT=workflow_dispatch
+  fi
+fi
+```
+
 ```bash
 # Resolve the bump by its RESULT, not by "newest run": several components release
 # concurrently (2026-09-18: shell, modelviewer, avatar, earthview, mediaplayer bumped within
@@ -1096,7 +1135,7 @@ done
 # for the other dispatch shapes, so match BOTH exact quoted values, never a bare substring.
 BUMP_RUN=""
 for _id in $(gh run list -R DisplayXR/displayxr-runtime --workflow=versions-bump.yml \
-               --event=repository_dispatch --limit=12 --json databaseId --jq '.[].databaseId'); do
+               --event="${BUMP_EVENT:-repository_dispatch}" --limit=12 --json databaseId --jq '.[].databaseId'); do
   _log=$(gh run view "$_id" -R DisplayXR/displayxr-runtime --log 2>/dev/null)
   if grep -q -F "FIELD=\"${FIELD}\"" <<<"$_log" && grep -q -F "TAG=\"${NEW_TAG}\"" <<<"$_log"; then
     BUMP_RUN="$_id"; break
@@ -1105,7 +1144,7 @@ done
 # A run still in progress has no log yet: if nothing matched, wait and retry once, then
 # fall back to the bump COMMIT on runtime/main (`chore(versions): bump <field> → <tag>`)
 # as the evidence and say "run id unresolved" in the report — never `.[0]`.
-[ -n "$BUMP_RUN" ] || { sleep 30; for _id in $(gh run list -R DisplayXR/displayxr-runtime --workflow=versions-bump.yml --event=repository_dispatch --limit=12 --json databaseId --jq '.[].databaseId'); do _log=$(gh run view "$_id" -R DisplayXR/displayxr-runtime --log 2>/dev/null); if grep -q -F "FIELD=\"${FIELD}\"" <<<"$_log" && grep -q -F "TAG=\"${NEW_TAG}\"" <<<"$_log"; then BUMP_RUN="$_id"; break; fi; done; }
+[ -n "$BUMP_RUN" ] || { sleep 30; for _id in $(gh run list -R DisplayXR/displayxr-runtime --workflow=versions-bump.yml --event="${BUMP_EVENT:-repository_dispatch}" --limit=12 --json databaseId --jq '.[].databaseId'); do _log=$(gh run view "$_id" -R DisplayXR/displayxr-runtime --log 2>/dev/null); if grep -q -F "FIELD=\"${FIELD}\"" <<<"$_log" && grep -q -F "TAG=\"${NEW_TAG}\"" <<<"$_log"; then BUMP_RUN="$_id"; break; fi; done; }
 [ -n "$BUMP_RUN" ] || echo "bump run id unresolved for ${FIELD}=${NEW_TAG} — cite the bump commit on runtime/main instead"
 BUMP_CONC="unresolved"
 [ -n "$BUMP_RUN" ] && while :; do
