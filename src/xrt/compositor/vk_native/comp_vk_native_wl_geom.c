@@ -43,6 +43,8 @@
 #define WLG_PLACEMENT_PATH "/org/displayxr/WindowPlacement"
 #define WLG_PLACEMENT_IFACE "org.displayxr.WindowPlacement1"
 #define WLG_EXT_UUID "window-geometry@displayxr.org"
+//! The DisplayXR KWin script (contrib/kwin/), the stock-KWin stand-in publisher.
+#define WLG_KWIN_SCRIPT_ID "displayxr-window-geometry"
 #define WLG_MATCH_RULE "type='signal',interface='" WLG_IFACE "',member='WindowsChanged'"
 
 //! The publisher comes and goes (see wlg_pump), so we also watch who owns its
@@ -562,19 +564,20 @@ wlg_request_snapshot(struct comp_vk_native_wl_geom *g, int timeout_ms)
 
 
 /*!
- * Find the extension on disk the way GNOME Shell does: the user data dir, then
- * each XDG data dir. Returns false when no copy is installed.
+ * Find @p rel (e.g. "gnome-shell/extensions/<uuid>", "kwin/scripts/<id>") on
+ * disk the way GNOME Shell and KWin look for their add-ons: the user data dir,
+ * then each XDG data dir. Returns false when no copy is installed.
  */
 static bool
-wlg_find_installed_extension(char *out, size_t out_size)
+wlg_find_data_path(const char *rel, char *out, size_t out_size)
 {
 	struct stat st;
 	const char *data_home = getenv("XDG_DATA_HOME");
 	const char *home = getenv("HOME");
 	if (data_home != NULL && data_home[0] != '\0') {
-		snprintf(out, out_size, "%s/gnome-shell/extensions/" WLG_EXT_UUID, data_home);
+		snprintf(out, out_size, "%s/%s", data_home, rel);
 	} else if (home != NULL && home[0] != '\0') {
-		snprintf(out, out_size, "%s/.local/share/gnome-shell/extensions/" WLG_EXT_UUID, home);
+		snprintf(out, out_size, "%s/.local/share/%s", home, rel);
 	} else {
 		out[0] = '\0';
 	}
@@ -590,7 +593,7 @@ wlg_find_installed_extension(char *out, size_t out_size)
 		const char *end = strchr(dirs, ':');
 		size_t len = end != NULL ? (size_t)(end - dirs) : strlen(dirs);
 		if (len > 0) {
-			snprintf(out, out_size, "%.*s/gnome-shell/extensions/" WLG_EXT_UUID, (int)len, dirs);
+			snprintf(out, out_size, "%.*s/%s", (int)len, dirs, rel);
 			if (stat(out, &st) == 0 && S_ISDIR(st.st_mode)) {
 				return true;
 			}
@@ -613,16 +616,40 @@ static void
 wlg_log_publisher_missing(void)
 {
 	const char *desktop = getenv("XDG_CURRENT_DESKTOP");
+	char path[1024];
+
+	// KDE Plasma (SteamOS Desktop Mode): a stock KWin has no native publisher
+	// yet (#1928); the DisplayXR KWin script + displayxr-kwin-geometry-bridge
+	// stand in for one (wayland-window-geometry.md, "KWin script bridge").
+	if (desktop != NULL && strstr(desktop, "KDE") != NULL) {
+		if (!wlg_find_data_path("kwin/scripts/" WLG_KWIN_SCRIPT_ID, path, sizeof(path))) {
+			U_LOG_W(
+			    "wl_geom: KDE Plasma, and no window-geometry publisher: the DisplayXR KWin script "
+			    "(" WLG_KWIN_SCRIPT_ID
+			    ") is NOT INSTALLED — run the DisplayXR tarball's install.sh "
+			    "from this KDE session. Weaving stays display-scoped.");
+			return;
+		}
+		U_LOG_W(
+		    "wl_geom: KDE Plasma: the DisplayXR KWin script is installed (%s) but no publisher answered. "
+		    "Enable it in System Settings > Window Management > KWin Scripts (\"DisplayXR window "
+		    "geometry\"); it starts displayxr-kwin-geometry-bridge on its first change, and a window "
+		    "move then brings geometry in. Weaving stays display-scoped until it appears.",
+		    path);
+		return;
+	}
+
 	if (desktop == NULL || strstr(desktop, "GNOME") == NULL) {
 		U_LOG_W(
-		    "wl_geom: no window-geometry publisher on this desktop (XDG_CURRENT_DESKTOP=%s) — only GNOME "
-		    "Shell has one (the " WLG_EXT_UUID " extension). Weaving stays display-scoped.",
+		    "wl_geom: no window-geometry publisher on this desktop (XDG_CURRENT_DESKTOP=%s) — GNOME Shell "
+		    "(the " WLG_EXT_UUID
+		    " extension) and KDE Plasma (the DisplayXR KWin script) have one. "
+		    "Weaving stays display-scoped.",
 		    desktop != NULL ? desktop : "unset");
 		return;
 	}
 
-	char path[1024];
-	if (!wlg_find_installed_extension(path, sizeof(path))) {
+	if (!wlg_find_data_path("gnome-shell/extensions/" WLG_EXT_UUID, path, sizeof(path))) {
 		U_LOG_W("wl_geom: GNOME Shell extension " WLG_EXT_UUID
 		        " is NOT INSTALLED — install the displayxr-runtime package "
 		        "(or contrib/gnome-shell/ by hand), then log out and back in. Until then weaving stays "

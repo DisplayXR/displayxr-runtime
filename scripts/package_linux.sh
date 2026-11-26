@@ -203,6 +203,20 @@ cp "$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock_implicit.json.in" "$ST
 for f in $EXT_FILES; do cp "$EXT_SRC/$f" "$STAGE/share/gnome-shell/extensions/$EXT_UUID/"; done
 install -m 0755 "$ROOT/scripts/linux/displayxr-gnome-extension-enable" "$STAGE/bin/"
 install -m 0755 "$ROOT/scripts/linux/displayxr-restart-service" "$STAGE/bin/"
+# KDE Plasma / SteamOS Desktop Mode: the stock-KWin stand-in publisher of
+# org.displayxr.WindowGeometry1 (wayland-window-geometry.md, "KWin script
+# bridge") -- the KWin script, its bridge, and the bridge's D-Bus activation
+# file. Optional (the bridge needs libdbus at build time); install.sh sets them
+# up only in a KDE session.
+KWGB_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-kwin-geometry-bridge -type f 2>/dev/null | head -1 || true)"
+if [ -n "$KWGB_BIN" ]; then
+    install -m 0755 "$KWGB_BIN" "$STAGE/bin/"
+    mkdir -p "$STAGE/share/kwin/scripts" "$STAGE/share/dbus-1/services"
+    cp -r "$ROOT/contrib/kwin/displayxr-window-geometry" "$STAGE/share/kwin/scripts/"
+    cp "$ROOT/scripts/linux/dbus/org.displayxr.WindowGeometry.service.in" "$STAGE/share/dbus-1/services/"
+else
+    echo "note: displayxr-kwin-geometry-bridge not built (no libdbus?) — packaging without the KWin publisher" >&2
+fi
 cp "$ROOT/scripts/linux/install.sh" "$ROOT/scripts/linux/uninstall.sh" "$STAGE/"
 chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"
 echo "$VERSION" > "$STAGE/VERSION"

@@ -539,6 +539,82 @@ Additive: no field changed meaning, so the schema stays `version: 1`. A
 consumer that finds no `hidden` (version 19 or older) treats the window as
 seen, which is what it had before.
 
+### 4.4 KWin script bridge (a stock KWin; SteamOS Desktop Mode)
+
+The KWin publisher of #1928 is a native KWin plug-in, built in a KWin fork and
+headed upstream. A stock KWin cannot load it. That includes SteamOS, whose
+KWin 6.4 lives on a read-only OS image, and which is KDE Plasma on Wayland by
+default from SteamOS 3.8 on. Until KDE ships a publisher, a stock Plasma gets a
+**geometry-only stand-in a user can install**. It has two parts, because a KWin
+script can *call* D-Bus but cannot own a name or serve an object:
+
+```
+KWin (stock)                         session bus                 runtime
+┌───────────────────────────┐  Publish(s)  ┌──────────────────────────────┐  GetWindows /   ┌───────────────┐
+│ KWin script                │────────────▶│ displayxr-kwin-geometry-bridge │  WindowsChanged │ comp_vk_native │
+│ contrib/kwin/              │  (D-Bus     │ owns org.displayxr.          │───────────────▶│ _wl_geom       │
+│  displayxr-window-geometry │  activates) │  WindowGeometry              │                 └───────────────┘
+└───────────────────────────┘              └──────────────────────────────┘
+```
+
+- **The script** (`contrib/kwin/displayxr-window-geometry`, installed to
+  `~/.local/share/kwin/scripts/`) builds the schema-1 snapshot from KWin's
+  scripting API. On every window add, remove, activate, geometry or output
+  change, and screen change, it calls
+  `org.displayxr.WindowGeometryFeed1.Publish(s)` on
+  `org.displayxr.WindowGeometry`. An identical snapshot is not re-sent.
+  - **Fields:** `pid`, `app_id` (desktop file name, else resource class),
+    `focus`, `xwayland`, `frame`, `buffer`, `monitor {x, y, w, h, scale,
+    device_scale}`, `moving`, `minimized`, `above` and `fullscreen`, plus a
+    top-level `layout_mode: "logical"`.
+  - **Rounding:** KWin's layout is always logical with a fractional scale per
+    output, so `device_scale` is the output's `devicePixelRatio`, as #1928
+    proposed. Positions are rounded, never truncated, because KWin keeps them
+    fractional.
+  - **Not sent:**
+    - `title`: GNOME gives titles only to callers it authorises (§12.5), and
+      a bridge cannot tell callers apart.
+    - `buffer_device`: a script cannot read the rect KWin paints, and §2 says
+      to leave the field out rather than guess. Consumers fall back to the
+      conversion, which can be one device pixel off after a pointer drag at a
+      fractional scale (#1928's measurement).
+    - Placement, the drag lattice, move sync, capture exclusion and the
+      workspace hotkey: they need KWin internals, and the native plug-in
+      carries them.
+- **The bridge** (`displayxr-kwin-geometry-bridge`, `src/xrt/targets/kwin_geometry_bridge/`)
+  owns `org.displayxr.WindowGeometry` and serves `WindowGeometry1.GetWindows()`
+  (the latest snapshot; no windows before KWin's first) and `WindowsChanged(s)`
+  under the canonical identity of §4. It accepts `Publish` only from KWin's own
+  process (the caller's `/proc/<pid>/comm` is `kwin_wayland` or `kwin_x11`),
+  because a forged snapshot would move every app's weave phase. Before
+  republishing, it holds the input to the contract (`kwgb_payload.c`, unit test
+  `tests_kwgb_payload`): schema version 1 (absent = 1, anything else is
+  refused), a `windows` array of objects, at most 1 MiB, and `title` stripped
+  from every entry.
+- **It steps aside for a real publisher:**
+  - It requests the name with `DO_NOT_QUEUE | ALLOW_REPLACEMENT`, so a native
+    publisher that asks with `REPLACE_EXISTING` takes the name, and the bridge
+    exits on `NameLost`.
+  - It refuses to start outside a KDE session (`XDG_CURRENT_DESKTOP`), so it
+    can never hold the name the GNOME extension needs.
+  - The tarball's `install.sh` writes its D-Bus activation file
+    (`~/.local/share/dbus-1/services/org.displayxr.WindowGeometry.service`)
+    only in a KDE session, or with `--kwin`.
+  - It enables the script through `kwinrc` (`[Plugins]
+    displayxr-window-geometryEnabled`), never over a user who switched it off,
+    and asks the running KWin to `reconfigure`.
+- **Packaging.** Tarball only, user-level, which is what SteamOS can install.
+  The `.deb` does not ship it. On a desktop distribution the native plug-in of
+  #1928 is the publisher to package, under the `-kwin` virtual name of §4.
+- **Re-sync.** The bridge starts on the script's first `Publish` (D-Bus
+  activation) or on a consumer's first `GetWindows`. If it restarts, it holds
+  no snapshot until the next window change. Consumers handle that as §3's "no
+  window matches" row, staying display-scoped until the next change.
+- **Not verified on hardware.** The script's API use (KWin 6
+  `workspace.windowList()`, `Window.output.devicePixelRatio`,
+  `interactiveMoveResizeStarted`/`Finished`, `callDBus`) is from KWin 6's
+  scripting API. It has not run on SteamOS's KWin 6.4.
+
 ## 5. Known limitations / follow-ups (#817)
 
 (Capture-exclusion limitations are listed with it, in §6.6.)
