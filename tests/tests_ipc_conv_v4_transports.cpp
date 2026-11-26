@@ -890,3 +890,62 @@ TEST_CASE("the GAUSSIANS input readback returns the caller's pixels", "[ipc_conv
 		rel(t);
 	}
 }
+
+/*
+ * #2843: the S6 depth readback hands back samples of an EARLIER conversion
+ * (one staging copy in flight, mapped later). When the stream's depth texture
+ * changes size between two reads (the letterbox crop moved), the same call
+ * that maps the old copy re-issues one at the new size, and it used to return
+ * the NEW extent with the OLD samples: conv_policy_depth_stats then read past
+ * the buffer and the service crashed. The returned extent must be the one the
+ * samples were copied at.
+ */
+TEST_CASE("the depth readback returns the extent its samples were copied at", "[ipc_conv_v4_transports]")
+{
+	Service svc;
+	if (!svc.init()) {
+		SKIP("no WARP D3D11 device");
+	}
+	conv_image_alloc_ops alloc{};
+	d3d11_lift_glue_alloc_ops(svc.l, &alloc);
+	conv_viewsyn_ops vs{};
+	conv_depth_readback_ops rb{};
+	d3d11_lift_glue_gpu_ops(svc.l, &vs, &rb);
+	REQUIRE(alloc.alloc != nullptr);
+	REQUIRE(rb.read != nullptr);
+
+	conv_image_request req{};
+	req.format = XRT_CONV_FMT_R32_FLOAT;
+	req.array_layers = 1;
+	req.role = XRT_CONV_OUT_DEPTH;
+	req.usage = CONV_IMAGE_USAGE_PROVIDER_OUT;
+	req.stream_id = 0x2843u;
+	req.width = 64;
+	req.height = 32;
+	xrt_conv_image d_small{};
+	REQUIRE(alloc.alloc(alloc.ud, &req, &d_small));
+	req.width = 128; // the crop grew: same stream, a larger depth texture
+	req.height = 96;
+	xrt_conv_image d_big{};
+	REQUIRE(alloc.alloc(alloc.ud, &req, &d_big));
+
+	const float *s = nullptr;
+	uint32_t w = 0, h = 0, stride = 0;
+	CHECK_FALSE(rb.read(rb.ud, &d_small, &s, &w, &h, &stride)); // issues the first copy: nothing yet
+
+	// The next read that lands maps the SMALL copy and, in the same call,
+	// re-issues one at the BIG size (the period has elapsed).
+	bool fresh = false;
+	for (int i = 0; i < 40 && !fresh; i++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(140));
+		fresh = rb.read(rb.ud, &d_big, &s, &w, &h, &stride);
+	}
+	REQUIRE(fresh);
+	REQUIRE(s != nullptr);
+	CHECK(w == 64);
+	CHECK(h == 32);
+	CHECK(stride == 64);
+
+	alloc.free(alloc.ud, &d_big);
+	alloc.free(alloc.ud, &d_small);
+}
