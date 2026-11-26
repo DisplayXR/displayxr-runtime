@@ -58,6 +58,7 @@ set(tests
     tests_space_overseer_rig
     tests_rig_composer
     tests_aux_x11_scale
+    tests_aux_gamescope
     tests_aux_display_desktop_select
     tests_cli_dims_check
     tests_cli_metres_check
