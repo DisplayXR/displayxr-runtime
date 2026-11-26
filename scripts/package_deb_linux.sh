@@ -4,7 +4,7 @@
 #   ./scripts/package_deb_linux.sh            # build (if needed) + stage + dpkg-deb
 #   ./scripts/package_deb_linux.sh --no-build # fail instead of building
 #
-# Output: dist/displayxr-runtime_<ver>_amd64.deb
+# Output: dist/displayxr-runtime_<ver>_<arch>.deb (amd64; arm64 on an arm64 host)
 #
 # Payload (installed layout — mirrors the CI-proven tarball's bin/ + sibling
 # lib/ so displayxr-cli's `$ORIGIN/../lib` RUNPATH resolves exactly as it does
@@ -465,6 +465,7 @@ chmod 0644 "$STAGE/usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json
 # -lwayland-client and libwayland-dev is a build-time-only dependency.)
 STABLE_SONAMES=(
     libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 ld-linux-x86-64.so.2
+    ld-linux-aarch64.so.1           # libc6 on arm64 (SteamOS on Steam Frame, Linux ARM boxes)
     libstdc++.so.6 libgcc_s.so.1
     libvulkan.so.1                  # libvulkan1
     libcjson.so.1                   # libcjson1
