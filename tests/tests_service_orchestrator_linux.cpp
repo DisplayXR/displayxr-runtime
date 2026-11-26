@@ -306,7 +306,7 @@ TEST_CASE("hotkey press spawns the controller; a press while running is forwarde
 		std::lock_guard<std::mutex> l(g_hk_lock);
 		REQUIRE(g_forwarded.size() == 1);
 		CHECK(g_forwarded[0].first == 0x20u);  // VK_SPACE
-		CHECK(g_forwarded[0].second == 0x2u); // bit1 = Ctrl
+		CHECK(g_forwarded[0].second == 0x3u); // bit0 Shift + bit1 Ctrl: the default Ctrl+Shift+Space (#2418)
 		g_forwarded.clear();
 	}
 
