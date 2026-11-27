@@ -120,6 +120,9 @@ conv_registry_set_usable(struct conv_registry *reg, uint32_t provider, bool usab
 {
 	if (provider < reg->provider_count) {
 		reg->providers[provider].usable = usable;
+		// The loader's verdict owns the flag now: a later READY status must
+		// not override a reject (#2828).
+		reg->providers[provider].platform_unusable = false;
 	}
 }
 
@@ -394,6 +397,14 @@ conv_registry_describe(struct conv_registry *reg, uint32_t pi, uint64_t now_ns)
 			if (st.state == CONV_PLATFORM_STATE_PLATFORM_ABSENT ||
 			    st.state == CONV_PLATFORM_STATE_INCOMPATIBLE) {
 				p->usable = false;
+				p->platform_unusable = true;
+			} else if (p->platform_unusable) {
+				// #2828: the platform came back (a satellite host re-probed
+				// after a settings fix, the platform was installed). Only the
+				// platform made it unusable, so the platform lifts it; a
+				// loader reject (conv_registry_set_usable) is not undone here.
+				p->usable = true;
+				p->platform_unusable = false;
 			}
 		}
 	}
