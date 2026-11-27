@@ -136,9 +136,11 @@ platform reports it.
 
 - **Desktop Linux**: the service window's input (native Wayland or X11) is translated to Win32
   VK codes before routing, so `vkCode` is a Win32 VK code as documented.
-- **macOS**: the service's AppKit pump historically forwards a printable key as its lowercase
-  character (`'a'`, not `'A'`), with arrows and F11 mapped to VK codes. An app that handles both
-  platforms should accept either form for letters until the macOS pump is normalized.
+- **macOS**: the service's AppKit pump translates each key to its Win32 VK code before routing
+  (`ipc_server_macos_key_to_vk()`, #2782): letters are `'A'`..`'Z'` whatever the case, US
+  punctuation is `VK_OEM_*`, and the function keys are their `VK_*` codes. Runtimes before that
+  fix sent a letter as its lowercase character (`'a'`), so an app that must run on older
+  runtimes can accept either form for letters.
 
 ## 5. Implementation
 

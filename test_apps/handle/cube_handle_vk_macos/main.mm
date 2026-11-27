@@ -4088,10 +4088,15 @@ static void PollForwardedInput(AppXrSession& xr) {
     for (uint32_t i = 0; i < count; i++) {
         const XrWorkspaceInputEventDXR& e = events[i];
         switch (e.eventType) {
-        case XR_WORKSPACE_INPUT_EVENT_KEY_DXR:
-            // Producer encodes the lowercased Unicode character in vkCode.
-            ApplyCharKey((unichar)e.key.vkCode, e.key.isDown != 0, false);
+        case XR_WORKSPACE_INPUT_EVENT_KEY_DXR: {
+            // vkCode is a Win32 VK code (#2782): letters arrive as 'A'..'Z';
+            // digits, space and Esc equal their characters. ApplyCharKey takes
+            // the lower-case character the in-process NSEvent path reads.
+            uint32_t vk = e.key.vkCode;
+            unichar ch = (vk >= 'A' && vk <= 'Z') ? (unichar)(vk - 'A' + 'a') : (unichar)vk;
+            ApplyCharKey(ch, e.key.isDown != 0, false);
             break;
+        }
         case XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_DXR: {
             bool leftHeld = (e.pointerMotion.buttonMask & 1u) != 0;
             int32_t cx = e.pointerMotion.cursorX, cy = e.pointerMotion.cursorY;

@@ -12,6 +12,7 @@
 
 #include "ipc_server_macos_appkit.h"
 #include "ipc_server_input_queue.h"
+#include "ipc_server_macos_keys.h"
 #include "displayxr_logo_white_png.h" // embedded menu-bar status-item icon (#61)
 #include "server/ipc_server.h"           // struct ipc_server::workspace_controller_pid (#61 lifecycle)
 #include "multi/comp_multi_workspace.h" // cursor pointer-position publish (#48 Phase 2)
@@ -19,7 +20,6 @@
 #include "util/u_logging.h"
 
 #include <stdbool.h>
-#include <ctype.h>
 #include <signal.h> // SIGTERM the controller on the toggle hotkey (#61)
 #include <spawn.h>  // posix_spawn the workspace controller (#61)
 #include <stdlib.h> // getenv
@@ -79,11 +79,11 @@ route_input_event(const struct ipc_workspace_input_event *ev)
 
 // Translate an NSEvent (service-window input) into a wire input event and queue
 // it for the IPC handler to forward to the client app (#48). Mirrors the Windows
-// D3D11 service WndProc producer. Keyboard is reported as the lowercased Unicode
-// character in key.vk_code — the macOS client maps characters, not VK codes — so
-// the forwarded path drives the same handling the app's in-process NSEvent loop
-// does (mode keys v/0-8, WASD camera). Returns true if the event was a captured
-// input event (so the caller can skip sendEvent: for keys — no responder, no beep).
+// D3D11 service WndProc producer. A key is reported as its Win32 VK code in
+// key.vk_code (ipc_server_macos_key_to_vk, #2782), the same code Windows and
+// desktop Linux send, so reserved chords match identically on every platform.
+// Returns true if the event was a captured input event (so the caller can skip
+// sendEvent: for keys — no responder, no beep).
 static bool
 queue_ns_input_event(NSEvent *event)
 {
@@ -112,31 +112,14 @@ queue_ns_input_event(NSEvent *event)
 		if ([chars length] == 0) {
 			return false; // modifier-only / dead key — nothing to forward
 		}
-		unichar raw = [chars characterAtIndex:0];
-		uint32_t vk;
-		// #61: translate macOS arrow / function keys into the Windows VK_* codes the
-		// controller's handlers expect (launcher arrows, F11 maximize, etc.). macOS
-		// delivers these as NS*FunctionKey unicode values (0xF7xx), not VK codes.
-		switch (raw) {
-		case 0xF700: vk = 0x26; break; // NSUpArrowFunctionKey    → VK_UP
-		case 0xF701: vk = 0x28; break; // NSDownArrowFunctionKey  → VK_DOWN
-		case 0xF702: vk = 0x25; break; // NSLeftArrowFunctionKey  → VK_LEFT
-		case 0xF703: vk = 0x27; break; // NSRightArrowFunctionKey → VK_RIGHT
-		case 0xF70E: vk = 0x7A; break; // NSF11FunctionKey        → VK_F11
-		default: {
-			unichar ch = raw;
-			// ONLY when Control is held does charactersIgnoringModifiers sometimes
-			// return the ASCII control char (Ctrl+L→0x0C); map THOSE back to letters
-			// so the controller's letter chords match. Gating on Control is essential
-			// — otherwise Return (0x0D), Tab (0x09) etc. would be corrupted into
-			// letters ('m', 'i', …), which broke Enter-to-launch + TAB.
-			bool ctrl_held = (mods & (1u << 1)) != 0;
-			if (ctrl_held && ch >= 1 && ch <= 26) {
-				ch = (unichar)(ch + 'a' - 1);
-			}
-			vk = (uint32_t)tolower(ch);
-			break;
-		}
+		// #2782: the wire carries a Win32 VK code, as on Windows and desktop
+		// Linux ('L' = 0x4C, not 'l'), so the controller's reserved chords
+		// ({'L', CTRL}, '[' = VK_OEM_4, ...) match and content apps draining
+		// XR_DXR_workspace_client_input get what the spec says.
+		bool ctrl_held = (mods & (1u << 1)) != 0;
+		uint32_t vk = ipc_server_macos_key_to_vk([chars characterAtIndex:0], ctrl_held);
+		if (vk == 0) {
+			return true; // no VK code (a non-US character): nothing to match, no beep
 		}
 		ev.event_type = IPC_WORKSPACE_INPUT_EVENT_KEY;
 		ev.u.key.vk_code = vk;

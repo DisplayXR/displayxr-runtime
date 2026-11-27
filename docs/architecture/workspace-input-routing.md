@@ -143,9 +143,6 @@ window is hidden and gets nothing natively, so the drain is the only source.
 
 - #2781: desktop Linux and macOS forward a lone Ctrl at once; Windows holds it until the
   chord is known (#667).
-- #2782: the macOS AppKit pump sends a printable key as its lowercase character (`'a'`), not
-  its VK code (`'A'`), so reserved letter chords never match there. An app that handles both
-  platforms should accept either form for letters until this is fixed.
 
 ## 5. App checklist (desktop Linux and macOS)
 
@@ -156,7 +153,7 @@ window is hidden and gets nothing natively, so the drain is the only source.
    `attach_session()` after `xrCreateSession`. Input then arrives as normal window events.
 3. Otherwise resolve `xrEnumerateWorkspaceClientInputEventsDXR` with `xrGetInstanceProcAddr`
    and drain it once per frame, before handling input. Treat `vkCode` as a Win32 VK code
-   (see #2782 for letters on macOS) and scale `position` by the app's own content size.
+   and scale `position` by the app's own content size.
 4. Create the window hidden when `DISPLAYXR_WORKSPACE_SESSION=1` on Wayland.
 
 Apps that do this today: `test_apps/cube_handle_vk_linux` and `test_apps/cube_zones_vk_linux`

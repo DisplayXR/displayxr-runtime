@@ -270,6 +270,9 @@ elseif(APPLE)
 			# compositor's render-thread NSWindow creation (shell Tier 1, #48).
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_macos_appkit.m
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_macos_appkit.h
+			# Key character -> Win32 VK code for the AppKit pump (#2782).
+			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_macos_keys.c
+			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_macos_keys.h
 			# Generic input-event queue: AppKit pump captures NSEvents → IPC
 			# handler drains → client app polls (keyboard/mouse forwarding, #48).
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.c
