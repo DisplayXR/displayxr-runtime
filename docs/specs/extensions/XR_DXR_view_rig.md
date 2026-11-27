@@ -165,7 +165,8 @@ centre turned by `atan(f·y/N)`; the physical angle is `atan(y/N)`.
 The display rig needs no such rule. It scales the eye and the canvas by the
 same `virtualDisplayHeight / canvas height`, so it is angle-true by
 construction. Converting a camera rig into a display rig carries `f` into the
-display rig's `ipdFactor` and `parallaxFactor`.
+display rig's `ipdFactor` and `parallaxFactor`. The full mapping between the
+two rigs, in both directions, is §4.
 
 ### Choosing `metersToVirtual`
 
@@ -234,7 +235,133 @@ To put the eye on the camera axis instead, use the display rig above:
 axis about 12 m behind the camera. That is a telephoto view that keeps the
 40° framing at the glass.
 
-## 4. Version history
+## 4. One view state, two rigs: the correspondence
+
+The display rig and the camera rig are two ways of writing the **same** set of
+off-axis views. Any display rig has an exact camera-rig equivalent, and any
+camera rig whose convergence is not at infinity has an exact display-rig
+equivalent: for every viewer position the two produce the same eye poses and
+the same frusta. An app (or a tool that decides the rig for a page) can
+therefore switch rig with no visual change, and can move from one rig's
+settings to another's as a continuous change of a few numbers instead of a cut.
+
+The reference implementation is `displayxr-common`, `include/dxr_view_math.{h,c}`:
+`dxr_view_rig_display_to_camera`, `dxr_view_rig_camera_to_display`,
+`dxr_rig_toggle` and `dxr_rig_transition`. The runtime's `qwerty` driver uses
+them for its rig toggle. This section is the contract they implement.
+
+### Inputs
+
+| Symbol | Meaning |
+|---|---|
+| `H` | physical height of the **canvas**, in metres (the window client area, texture sub-rect or zone the views are for; not the panel) |
+| `N` | the display's nominal viewer distance, in metres (`XR_DXR_display_info`) |
+| `t_phys = H / (2N)` | the half-tangent of the angle the canvas subtends from the nominal viewer |
+
+### The mapping
+
+| Display rig | | Camera rig |
+|---|---|---|
+| `pose` (the virtual display plane) | ⇄ | `pose` (the camera): the same orientation, `D` in front of the plane along its `+Z` |
+| `virtualDisplayHeight` (`vH`) | ⇄ | `convergenceDiopters = 1 / D` |
+| `perspectiveFactor` (`p`) | ⇄ | `verticalFov`, by `tan(verticalFov / 2) = t_phys / p` |
+| `ipdFactor`, `parallaxFactor` | ⇄ | `ipdFactor`, `parallaxFactor`, scaled by the gain `f` of §3 |
+
+with one shared scale, the display rig's **eye scale**
+
+```
+es = p × vH / H          (world units per metre of viewer motion)
+D  = es × N              (the convergence distance, in world units)
+```
+
+**Display → camera** (always exact):
+
+```
+tan(verticalFov / 2) = t_phys / p
+convergenceDiopters  = 1 / (es × N)
+metersToVirtual      = 1
+ipdFactor            = ipdFactor_display × es
+parallaxFactor       = parallaxFactor_display × es
+pose                 = display pose, moved es × N along its +Z
+```
+
+`metersToVirtual` is redundant with the two factors (all three only scale the
+eye in the modelview), so the conversion emits the canonical
+`metersToVirtual = 1` and carries the eye scale in the factors. That is what
+makes a display → camera → display round trip return the original numbers
+exactly, however often it is repeated.
+
+**Camera → display** (exact for any convergence short of infinity):
+
+```
+p              = t_phys / tan(verticalFov / 2)
+vH             = 2 × tan(verticalFov / 2) / convergenceDiopters
+f              = metersToVirtual × convergenceDiopters × N        (the gain of §3)
+ipdFactor      = ipdFactor_camera × f
+parallaxFactor = parallaxFactor_camera × f
+pose           = camera pose, moved es × N back along its −Z      (es = p × vH / H)
+```
+
+`vH` is the height of the camera's frustum at the convergence plane: what the
+camera frames there is what the display rig's portal shows. `f` appears
+because the display rig ties eye separation to the convergence distance through
+`es`, while the camera rig sets them independently; the factors absorb the
+difference.
+
+### Limits
+
+- **Convergence at infinity (0 diopters) has no display-rig equivalent.** The
+  portal would be infinitely far and infinitely tall. Converters clamp
+  `convergenceDiopters` to a small positive value; a caller should treat such a
+  rig as camera-only.
+- **A gain `f > 1` asks for factors above 1.** That is a camera rig converged
+  nearer than its display-compatible distance. The display rig's documented
+  factor range is `[0, 1]`, so a caller that clamps there falls short of exact.
+  `f ≤ 1` (convergence at or beyond the compatible distance, the common case)
+  is always exact.
+- **`H` and `N` are needed.** A consumer that cannot read them (an environment
+  that does not expose the nominal viewer or the canvas's physical size) cannot
+  convert. It can still declare either rig.
+- **The camera axis is the canvas normal** (§3, *The axis is the canvas, not
+  the viewer*). A consumer that re-centres the eyes on its own camera after
+  the locate must apply the same correction on both sides of a conversion, or
+  blend it across a transition.
+
+### Reading a camera rig as a display rig
+
+Because of the mapping, "use the author's camera" and "use the viewer's true
+perspective" differ in two numbers only. Written as a display rig, a camera rig
+is the same portal on the convergence plane with
+
+- `perspectiveFactor = t_phys / tan(verticalFov / 2)`: `1` is the viewer's own
+  perspective (the angle-true portal); a wide authored field of view on a small
+  canvas is a factor well below `1`;
+- `ipdFactor = parallaxFactor = f` (times the camera rig's own factors).
+
+What lies on the convergence plane keeps its size and position on the canvas
+for every value of both.
+
+### Moving between rigs
+
+To change from rig A to rig B without a cut, convert A into B's form (exact,
+so nothing moves at the start), then interpolate each parameter in the space
+where equal steps look equal:
+
+| Parameter | Interpolate |
+|---|---|
+| `convergenceDiopters` | linearly, in diopters (it passes through infinity safely) |
+| `virtualDisplayHeight`, `perspectiveFactor` | geometrically (in log space) |
+| `verticalFov` | linearly, in angle |
+| `ipdFactor`, `parallaxFactor`, `metersToVirtual` | linearly |
+| `pose` | position linearly, orientation by slerp |
+
+`dxr_rig_transition(from, to, info, t, comfort_far_z, out)` does exactly this
+and leaves timing and easing to the caller. When its output is a camera rig it
+also bounds the convergence for comfort (`dxr_rig_clamp_for_comfort`: the
+display-equivalent factor `ipdFactor × f` stays at or below 1, so far content
+never asks the eyes to diverge).
+
+## 5. Version history
 
 | Spec | Change |
 |---|---|
