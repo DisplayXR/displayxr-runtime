@@ -18,8 +18,10 @@ here is that
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import hashlib
+import io
 import json
 import sys
 import tempfile
@@ -783,6 +785,77 @@ class Schema2DetectValidation(unittest.TestCase):
         self.assertIn("'display_plugins' is reserved", self.problems())
         self.leia["aliases"] = ["leia_plugin", "detected_items"]
         self.assertIn("'detected_items' is reserved", self.problems())
+
+
+
+class PendingAfterALateSignedAsset(unittest.TestCase):
+    """#2758: a run that looks before the signed asset replaced the unsigned CI one
+    carries the old block forward and must say so (`pending`), so the workflow runs
+    again; the run after the swap lists the pin and reports nothing pending.
+
+    Replays 2026-11-22: leia_plugin bumped to v2.23.1 at 10:54 (its installer was
+    signed at 11:01), runtime bumped to v2.69.4 at 11:29 (signed at 11:30)."""
+
+    def build(self, versions, signed, previous):
+        def windows_block(comp, version, verifier, download_dir, registry_version=None):
+            if (comp["name"], version) not in signed:
+                return None  # what the generator returns for an unsigned asset
+            return win(f"{comp['name']}-{version}.exe", version, SHA_A, ["/S"], "HKLM\\x")
+
+        saved = {k: getattr(gen_catalog, k) for k in (
+            "windows_block", "fetch_detect_manifest", "browser_floor", "leia_floor", "leia_detect",
+            "warn", "info")}
+        try:
+            gen_catalog.windows_block = windows_block
+            gen_catalog.fetch_detect_manifest = lambda comp, tag: None
+            gen_catalog.browser_floor = gen_catalog.leia_floor = lambda tag: None
+            gen_catalog.leia_detect = lambda tag: []
+            gen_catalog.warn = gen_catalog.info = lambda msg: None
+            return gen_catalog.build_catalog(versions, gen_catalog.VERIFIERS["none"], "unused", previous)
+        finally:
+            for k, v in saved.items():
+                setattr(gen_catalog, k, v)
+
+    def test_replay_of_the_v2_69_4_release(self):
+        signed = {("runtime", "2.69.3"), ("leia_plugin", "2.23.0"), ("browser", "1.10.5")}
+        pins = {"runtime": "v2.69.3", "leia_plugin": "v2.23.0", "browser": "v1.10.5"}
+        live = self.build(pins, signed, None)
+        self.assertEqual(gen_catalog.pending_components(live), [])
+
+        # 10:54, the plug-in pin bump: its asset is still the unsigned CI build.
+        pins["leia_plugin"] = "v2.23.1"
+        live = self.build(pins, signed, live)
+        self.assertEqual(live["components"]["leia_plugin"]["windows"]["version"], "2.23.0")
+        self.assertEqual(gen_catalog.pending_components(live), ["leia_plugin"])
+
+        # 11:29, the runtime's own bump: the runtime is unsigned too, the plug-in now signed.
+        signed.add(("leia_plugin", "2.23.1"))
+        pins["runtime"] = "v2.69.4"
+        live = self.build(pins, signed, live)
+        self.assertEqual(live["components"]["leia_plugin"]["windows"]["version"], "2.23.1")
+        self.assertEqual(live["components"]["runtime"]["windows"]["version"], "2.69.3")
+        self.assertEqual(gen_catalog.pending_components(live), ["runtime"])
+
+        # The re-run after the runtime installer was signed lists everything.
+        signed.add(("runtime", "2.69.4"))
+        live = self.build(pins, signed, live)
+        self.assertEqual(gen_catalog.pending_components(live), [])
+        self.assertEqual({k: c["windows"]["version"] for k, c in live["components"].items()},
+                         {"runtime": "2.69.4", "leia_plugin": "2.23.1", "browser": "1.10.5"})
+
+    def test_carried_forward_and_missing_blocks_are_pending(self):
+        # The fixture's leia_plugin lags its pin; its browser has no windows block.
+        self.assertEqual(gen_catalog.pending_components(v1_fixture()), ["leia_plugin", "browser"])
+
+    def test_cli_prints_one_name_per_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stable.json"
+            path.write_bytes(gen_catalog.canonical_bytes(v1_fixture()))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = gen_catalog.cmd_pending(argparse.Namespace(catalog=str(path)))
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue(), "leia_plugin\nbrowser\n")
 
 
 if __name__ == "__main__":
