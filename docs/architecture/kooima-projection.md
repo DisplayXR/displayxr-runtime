@@ -288,6 +288,9 @@ multiplies every angle (#2422).  The same `f` is the comfort quantity
 display rig's `ipd_factor` / `parallax_factor` when it converts a camera rig.
 Worked example and the display-rig recipe for putting the nominal eye on the
 camera axis: [`XR_DXR_view_rig` §3](../specs/extensions/XR_DXR_view_rig.md#3-camera-rig-gain-meterstovirtual-convergencediopters-and-verticalfov-2422).
+The two rigs are two ways of writing one view state; the exact mapping between
+them, its limits and how to move from one to the other without a cut:
+[`XR_DXR_view_rig` §4](../specs/extensions/XR_DXR_view_rig.md#4-one-view-state-two-rigs-the-correspondence).
 
 **Step 6** — Compute the base symmetric half-tangents:
 
