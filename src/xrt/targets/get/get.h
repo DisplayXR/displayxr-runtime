@@ -90,7 +90,12 @@ struct dxr_edid_id
 	uint16_t prod; //!< EDID bytes 10-11, little-endian
 };
 
-//! Fills up to @p max EDID ids of present monitors. Returns the count.
+//! How many distinct ids of each kind dxr-get gathers as detect evidence (#2742).
+#define DXR_MAX_EDIDS 32
+#define DXR_MAX_USB 128
+
+//! Fills up to @p max distinct EDID ids of present monitors. Returns the count.
+//! Logs once when more distinct ids are present than fit.
 int
 dxr_detect_edids(struct dxr_edid_id *out, int max);
 
@@ -101,6 +106,7 @@ struct dxr_usb_id
 };
 
 //! Fills up to @p max distinct VID:PID pairs of present USB devices (SetupAPI, USB enumerator). Returns the count.
+//! Logs once when more distinct ids are present than fit.
 int
 dxr_detect_usb(struct dxr_usb_id *out, int max);
 

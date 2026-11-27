@@ -585,16 +585,20 @@ displayxr-leia-plugin).
 
 Registry rules read the 64-bit view. An `edid` rule with only `man`, or a `usb` rule with only
 `vid`, is always treated as **low** confidence, whatever the catalog says. A malformed rule (half
-or inverted range, exact and range together, a value outside 16 bits) matches nothing. A rule of
-an unknown kind is not matched, and evaluation goes on to the next rule. The EDID and USB
-evidence is gathered once per run, however many items' rules are evaluated.
+or inverted range, exact and range together, a value outside 16 bits or not an integer, such as
+`16711.9`) matches nothing. A rule of an unknown kind is not matched, and evaluation goes on to
+the next rule. The EDID and USB evidence is gathered once per run, however many items' rules are
+evaluated. At most 32 distinct monitor EDIDs and 128 distinct USB VID:PIDs are gathered. When
+more are present, `dxr-get` logs one line to stderr saying so and uses the first ones found.
 
 `detect` evaluates the rules of **every** item that has some. `--json`:
-`{"edids":[{man,prod}], "usb":[{vid,pid}], "display_plugins":[{id, component, label, match,
-high_confidence, evidence}], "<schema-1 name>":{match, high_confidence, evidence, id}, ...}`.
-`display_plugins` has one entry per item with detect rules (`component` is its schema-1 name);
-the per-name objects (so the Leia plug-in's key is still `leia_plugin`) are kept for one
-release. Low-confidence rules (the generic Acer product ids 0–3) are reported and never trigger
+`{"edids":[{man,prod}], "usb":[{vid,pid}], "detected_items":[{id, component, label, class,
+match, high_confidence, evidence}], "display_plugins":[...], "<schema-1 name>":{match,
+high_confidence, evidence, id}, ...}`. `detected_items` has one entry per item with detect rules,
+of any class: a display processor, or any other item, such as the owner of an external
+prerequisite (#2742). `component` is the item's schema-1 name. `display_plugins` holds the same
+entries, filtered to `class` `display_processor`. The per-name objects (so the Leia plug-in's key
+is still `leia_plugin`) are kept for one release. Low-confidence rules (the generic Acer product ids 0–3) are reported and never trigger
 an install.
 
 ## What changed for the three first-party components
@@ -608,7 +612,7 @@ Their behaviour and exit codes are the schema-1 tool's, with these deliberate di
 | `plan --json` | the schema-1 fields | the same fields in the same order, plus new ones after them |
 | `plan`: `reason` of a hardware item | `Leia display: <evidence>` | `detected: <evidence>`, for any item. Intentional: the text was Leia-specific. `reason` is free text for people; the DisplayXR Browser installer, the Leia plug-in installer and the runtime installer's listing shim were checked and none reads it (they read `component`, `state`, `target`, `size` and exit codes) |
 | `ensure-for`, `install` | no record | write a receipt per installed item |
-| `detect --json` | one `leia_plugin` object | the same object (plus its `id`), and one per other item with detect rules; plus `usb` evidence and a `display_plugins` list (#2737) |
+| `detect --json` | one `leia_plugin` object | the same object (plus its `id`), and one per other item with detect rules; plus `usb` evidence, a `display_plugins` list (#2737) and a `detected_items` list (#2742) |
 | any | waited for a child installer without limit | waits at most one hour |
 | `install`, `uninstall` | exactly one item; a second was a usage error (exit 2) | several items (§ Several items). One item behaves as before |
 

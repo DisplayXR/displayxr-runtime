@@ -569,7 +569,9 @@ static bool
 u16_of(const cJSON *o, const char *k, uint16_t *out)
 {
 	const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
-	if (!cJSON_IsNumber(v) || v->valuedouble < 0 || v->valuedouble > 65535) {
+	// An integer in 0..65535: 16711.9 is malformed, not 16711 (#2742).
+	if (!cJSON_IsNumber(v) || v->valuedouble < 0 || v->valuedouble > 65535 ||
+	    (double)(uint16_t)v->valuedouble != v->valuedouble) {
 		return false;
 	}
 	*out = (uint16_t)v->valueint;
@@ -614,8 +616,8 @@ dxr_detect_rules(const cJSON *rules, const struct dxr_env *env, bool high_only, 
 	if (!cJSON_IsArray(rules)) {
 		return false;
 	}
-	struct dxr_edid_id ids[32];
-	struct dxr_usb_id usb[128];
+	struct dxr_edid_id ids[DXR_MAX_EDIDS];
+	struct dxr_usb_id usb[DXR_MAX_USB];
 	int n = -1, n_usb = -1; // gathered on first use: most rule sets have no EDID / USB rule
 	const cJSON *r;
 	cJSON_ArrayForEach(r, rules)
@@ -645,10 +647,10 @@ dxr_detect_rules(const cJSON *rules, const struct dxr_env *env, bool high_only, 
 				continue;
 			}
 			if (edid && n < 0) {
-				n = env->edids != NULL ? env->edids(env->user, ids, 32) : 0;
+				n = env->edids != NULL ? env->edids(env->user, ids, DXR_MAX_EDIDS) : 0;
 			}
 			if (!edid && n_usb < 0) {
-				n_usb = env->usb != NULL ? env->usb(env->user, usb, 128) : 0;
+				n_usb = env->usb != NULL ? env->usb(env->user, usb, DXR_MAX_USB) : 0;
 			}
 			const int count = edid ? n : n_usb;
 			for (int i = 0; i < count; i++) {

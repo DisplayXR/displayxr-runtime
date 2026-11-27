@@ -966,7 +966,7 @@ V2_REGISTERED_CLASSES = ("display_processor", "input_provider", "conversion_prov
                          "tracking_provider", "workspace_controller", "companion")
 # Top-level keys of `dxr-get detect --json`, which also keys an object per item by
 # its schema-1 name / id: an item must not take one of these names.
-V2_RESERVED_IDS = ("edids", "usb", "display_plugins")
+V2_RESERVED_IDS = ("edids", "usb", "display_plugins", "detected_items")
 V2_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)?$")
 V2_VERSION_REQ_RE = re.compile(r"^>=\d+\.\d+\.\d+$")
 V2_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
