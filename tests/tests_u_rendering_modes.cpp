@@ -691,6 +691,65 @@ TEST_CASE("F1: a PINNED pre-ADR-065 driver holds its mode through the wrapper", 
 	CHECK(d.xdev.rendering_mode_count == 2);
 }
 
+TEST_CASE("start slot: a driver that starts in 2D is moved to slot 1 and told so (ADR-065 Amendment 1)",
+          "[u_rendering_modes][device][start_slot]")
+{
+	// The runtime, not the driver, picks the start mode of an app that does not ask.
+	fake_head h({mk(1, 1.0f, 1.0f, false, 1, 1, "2D"), mk(2, 0.5f, 1.0f, true, 2, 1, "3D")}, 0);
+	h.xdev.rendering_modes[1].mode_index = 1;
+	REQUIRE(u_device_enforce_two_rendering_modes(&h.xdev, "vendor") == U_RENDERING_MODES_TRIM_UNCHANGED);
+	CHECK(u_device_rendering_modes_apply_start_slot(&h.xdev, "vendor"));
+	CHECK(h.hmd.active_rendering_mode_index == U_RENDERING_MODE_3D);
+	REQUIRE(h.set_calls.size() == 1);
+	CHECK(h.set_calls[0] == 1); // the driver (and its DP) was told
+	CHECK(h.driver_output_mode == 1);
+}
+
+TEST_CASE("start slot: a driver already in slot 1 is left alone, no call", "[u_rendering_modes][device][start_slot]")
+{
+	fake_head h({mk(1, 1.0f, 1.0f, false, 1, 1, "2D"), mk(2, 0.5f, 1.0f, true, 2, 1, "3D")}, 1);
+	h.xdev.rendering_modes[1].mode_index = 1;
+	CHECK_FALSE(u_device_rendering_modes_apply_start_slot(&h.xdev, "leia-sr"));
+	CHECK(h.hmd.active_rendering_mode_index == 1);
+	CHECK(h.set_calls.empty());
+}
+
+TEST_CASE("start slot: a trimmed long table starting in 2D lands on slot 1 through the wrapper",
+          "[u_rendering_modes][device][start_slot]")
+{
+	strict_driver d(old_sim_table(), 0);
+	REQUIRE(u_device_enforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+	CHECK(d.hmd.active_rendering_mode_index == 0);
+	CHECK(u_device_rendering_modes_apply_start_slot(&d.xdev, "sim-display"));
+	CHECK(d.hmd.active_rendering_mode_index == U_RENDERING_MODE_3D);
+	CHECK(d.output >= 1);           // the driver got ITS index for slot 1, not a raw 1
+	CHECK(d.runtime_output() == 1); // and reads back as slot 1 in run-time numbering
+	CHECK(d.refused.empty());
+}
+
+TEST_CASE("start slot: a pinned driver (FORCE_MODE) keeps its start", "[u_rendering_modes][device][start_slot]")
+{
+	strict_driver d(old_sim_table(), 0, /* pinned */ true);
+	REQUIRE(u_device_enforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+	CHECK_FALSE(u_device_rendering_modes_apply_start_slot(&d.xdev, "sim-display"));
+	CHECK(d.hmd.active_rendering_mode_index == 0);
+	CHECK(d.output == 0);
+}
+
+TEST_CASE("start slot: no 3D slot, refused tables and null are harmless", "[u_rendering_modes][device][start_slot]")
+{
+	CHECK_FALSE(u_device_rendering_modes_apply_start_slot(nullptr, "x"));
+	fake_head one({mk(1, 1.0f, 1.0f, false, 1, 1, "2D")}, 0);
+	CHECK_FALSE(u_device_rendering_modes_apply_start_slot(&one.xdev, "flat-only"));
+	CHECK(one.hmd.active_rendering_mode_index == 0);
+	CHECK(one.set_calls.empty());
+	// Mode 0 not flat: a refused table keeps whatever the driver said.
+	fake_head odd({mk(2, 0.5f, 1.0f, true, 2, 1, "3D"), mk(1, 1.0f, 1.0f, false, 1, 1, "2D")}, 0);
+	CHECK_FALSE(u_device_rendering_modes_apply_start_slot(&odd.xdev, "odd"));
+	CHECK(odd.hmd.active_rendering_mode_index == 0);
+	CHECK(odd.set_calls.empty());
+}
+
 TEST_CASE("F3: trim, the plug-in rewrites its full table, re-trim keeps the same kind", "[u_rendering_modes][device]")
 {
 	strict_driver d(old_sim_table(), 4);

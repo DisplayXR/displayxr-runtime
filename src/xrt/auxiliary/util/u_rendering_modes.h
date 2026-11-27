@@ -671,6 +671,28 @@ enum u_rendering_modes_trim_result
 u_device_reenforce_two_rendering_modes(struct xrt_device *xdev, const char *driver_name);
 
 /*!
+ * ADR-065 Amendment 1: the RUNTIME, not the display driver, decides the mode an
+ * app starts in when the app does not ask for one: slot 1 (the 3D slot), for
+ * every driver. Whatever start index the driver wrote is overridden (one WARN
+ * when it differs) and the driver is told through
+ * `set_property(OUTPUT_MODE, 1)`, so it and its display processor draw the slot.
+ * The app overrides it with xrRequestDisplayRenderingModeDXR, as always.
+ *
+ * Left alone: a device pinned by its developer override
+ * (`XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED`, e.g. sim-display FORCE_MODE), a
+ * table with no 3D slot (fewer than two modes), and a table the contract
+ * refused (mode 0 not the flat mode).
+ *
+ * Call ONCE, at system creation, right after
+ * @ref u_device_enforce_two_rendering_modes; never on the display-info refresh
+ * path, which runs while apps are live.
+ *
+ * @return true when the active index was moved to slot 1.
+ */
+bool
+u_device_rendering_modes_apply_start_slot(struct xrt_device *xdev, const char *driver_name);
+
+/*!
  * How many entries of `xdev->rendering_modes` are the device's envelope (its
  * full declared list, ADR-066 C1.4): what every worst-case size (the system
  * atlas, `maxImageRect*`, the renderers' atlases, the located view count) is

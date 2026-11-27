@@ -65,6 +65,7 @@ t_instance_create_system(struct xrt_instance *xinst,
 	// ADR-065: the same two-mode contract the compositor instance enforces
 	// (target_instance.c), so a headless diagnostic reports the table apps see.
 	(void)u_device_enforce_two_rendering_modes(xsysd->static_roles.head, NULL);
+	(void)u_device_rendering_modes_apply_start_slot(xsysd->static_roles.head, NULL); // ADR-065 Amendment 1
 
 	u_system_fill_properties(usys, xsysd->static_roles.head->str);
 	*out_xsys = &usys->base;
