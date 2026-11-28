@@ -439,6 +439,50 @@ TEST_CASE("conv_registry: provider status (FALLBACK, platform absent)")
 	g_status_fake = nullptr;
 }
 
+TEST_CASE("conv_registry: a provider whose platform comes back is selectable again (#2828)")
+{
+	// open-conversion's host re-probed READY after a bad ONNXRUNTIME setting was
+	// unset, but its rows stayed drop-unusable until the service restarted.
+	auto reg = new_registry();
+	fake f;
+	f.caps = {cap(1, XRT_CONV_TASK_DEPTH_MONO)};
+	g_status_fake = &f;
+	auto d = desc("open-conversion", 200, &f);
+	conv_registry_add(reg.get(), &d);
+
+	f.status_state = 2; // PLATFORM_ABSENT
+	conv_registry_describe(reg.get(), 0, S);
+	REQUIRE_FALSE(reg->providers[0].usable);
+	CHECK(select_task(*reg, XRT_CONV_TASK_DEPTH_MONO).row == -1);
+
+	SECTION("a re-describe that reads READY lifts it")
+	{
+		f.status_state = 1; // READY
+		conv_registry_describe(reg.get(), 0, 2 * S);
+		CHECK(reg->providers[0].platform_state == 1u);
+		CHECK(reg->providers[0].usable);
+		CHECK(select_task(*reg, XRT_CONV_TASK_DEPTH_MONO).row >= 0);
+
+		f.status_state = 5; // INCOMPATIBLE: and back out again
+		conv_registry_describe(reg.get(), 0, 3 * S);
+		CHECK_FALSE(reg->providers[0].usable);
+	}
+	SECTION("a status that does not answer keeps it out")
+	{
+		g_status_fake = nullptr;
+		conv_registry_describe(reg.get(), 0, 2 * S);
+		CHECK_FALSE(reg->providers[0].usable);
+	}
+	SECTION("a loader reject is not undone by a READY status")
+	{
+		conv_registry_set_usable(reg.get(), 0, false); // e.g. probe failed
+		f.status_state = 1;
+		conv_registry_describe(reg.get(), 0, 2 * S);
+		CHECK_FALSE(reg->providers[0].usable);
+	}
+	g_status_fake = nullptr;
+}
+
 TEST_CASE("conv_registry: describe cache does not pin a platform-unavailable provider (#2596)")
 {
 	// leia-conversion described while NeurD was not installed (PLATFORM_ABSENT);

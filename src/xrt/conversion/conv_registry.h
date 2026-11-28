@@ -112,6 +112,10 @@ struct conv_provider
 	//! Default true; the loader clears it (conv_registry_set_usable) on a
 	//! reject, the registry on a PLATFORM_ABSENT / INCOMPATIBLE status.
 	bool usable;
+	//! #2828: @ref usable was cleared by a PLATFORM_ABSENT / INCOMPATIBLE
+	//! status alone, so a later describe that reads any other state sets it
+	//! again. Cleared by conv_registry_set_usable (a loader verdict).
+	bool platform_unusable;
 	uint32_t platform_state; //!< xrt_conv_provider_status::state
 	//! ADR-054 N5: the provider's licence state at the last live describe
 	//! (`not_applicable` = nothing to report). For showing: the consequence
