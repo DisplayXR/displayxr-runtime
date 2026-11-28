@@ -1098,7 +1098,7 @@ One row per buildable model in the **2D-to-3D models** section (`ModelPacks`, `C
 
 - **Badge:** `Research preview (non-commercial)`. Title: the model name; a line "Built on this PC
   from the official file. DisplayXR does not host this model." and "Model and licence by <source
-  licence `name`'s owner>, [licence](<link>)".
+  licence `name`'s owner>, licence: `license.link`" (shown as a link).
 - **Facts:** Download (sum of `sources[].size`), Space needed while building (`needs.disk_mb`),
   Memory needed to build (`needs.ram_mb`), Size when installed (sum of the model's files), Licence
   (`name`).
