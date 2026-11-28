@@ -63,6 +63,12 @@ LIST = {"schema": 2, "items": [
         listing="https://acme.example/viewer"),
 ]}
 
+# §5.6.6: the model builder, with the two keys a catalog must not give it
+# (dxr-get reports neither; the shim must not rely on that).
+BUILDER = row("open-conversion-model-builder", "Model builder", "model_builder", available="1.0.0",
+              research=True, badge="Research preview (non-commercial)", recommended=True, detected="high",
+              summary="Builds research-only models on this PC.", size=3145728, download=3145728)
+
 
 @unittest.skipUnless(PWSH, "no pwsh on PATH (or Windows)")
 class ShimTests(unittest.TestCase):
@@ -384,6 +390,31 @@ class ShimTests(unittest.TestCase):
         lst = copy.deepcopy(LIST)
         lst["items"] = [i for i in lst["items"] if i["id"] in ("runtime", "leia-sr", "browser")]
         self.assertEqual(self.selected(listing=lst), {"leia-sr"})
+
+    def test_research_item_is_never_preticked_and_carries_the_badge(self):
+        listing = copy.deepcopy(LIST)
+        listing["items"].append(copy.deepcopy(BUILDER))
+        for select in (None, "default", "recommended", "detected", "installed", "recommended,detected"):
+            ini = self.run_shim(listing, 0, Select=select) if select else self.run_shim(listing, 0)
+            b = self.items(ini)["open-conversion-model-builder"]
+            self.assertEqual(b["selected"], "0", select)
+            self.assertEqual(b["ro"], "0", select)  # it can still be ticked by hand
+        self.assertIn("(research preview)", b["label"])
+        self.assertTrue(b["desc"].startswith("Research preview (non-commercial). Installs the builder only."),
+                        b["desc"])
+        self.assertNotIn("Recommended.", b["desc"])
+        self.assertNotIn("Matching hardware", b["desc"])
+        # Only its own id ticks it.
+        ini = self.run_shim(listing, 0, Select="open-conversion-model-builder")
+        self.assertEqual(self.items(ini)["open-conversion-model-builder"]["selected"], "1")
+
+    def test_installed_research_item_with_an_update_is_not_ticked(self):
+        listing = copy.deepcopy(LIST)
+        b = copy.deepcopy(BUILDER)
+        b.update(installed="0.9.0", state="outdated")
+        listing["items"].append(b)
+        ini = self.run_shim(listing, 0)
+        self.assertEqual(self.items(ini)["open-conversion-model-builder"]["selected"], "0")
 
     def test_offline(self):
         ini = self.run_shim('{"offline":true,"reason":"catalog unreachable or expired"}', 10, Select="recommended,leia_plugin")

@@ -36,6 +36,15 @@
 ; processor of the connected display). Detection is dxr-get's; nothing here
 ; reads an EDID.
 ;
+; RESEARCH ITEMS ARE NEVER PRE-TICKED. An item the catalog marks
+; `research: true` (the model builder, conversion-provider-discovery.md
+; section 5.6.6) is offered unticked with the badge "Research preview
+; (non-commercial)", by none of the rules above or below (not recommended, not
+; detected, not "installed with an update", not a /COMPONENTS= keyword); only
+; its own id in /COMPONENTS= ticks it. Installing it lays down the builder and
+; its registration row and nothing else: no model is downloaded or built at
+; install time, and no licence acceptance or AllowResearchOnly is written.
+;
 ; ALREADY INSTALLED => TICKED, for every item. An installed item that has an
 ; update is pre-ticked (the update comes with the runtime; clearing the box
 ; keeps the installed version). An item already at the catalog version is

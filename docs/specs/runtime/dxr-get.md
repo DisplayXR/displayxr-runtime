@@ -119,7 +119,9 @@ in the plan as skipped, with the reason, and **does not fail the rest**: the exi
 when everything that could be installed was. Skip-if-current applies to each item, so a
 second run downloads nothing. With no connection the result is the offline one (exit 10, what
 was skipped, the command to run later). A schema-1 catalog has no `recommended` flag, so on
-the fallback only hardware matches are selected.
+the fallback only hardware matches are selected. A `research: true` item (the model builder,
+component-catalog.md § Item) is never in the set, nor in an `ensure-for` hardware pass, even
+if its entry carries `recommended` or a matching `detect` rule: it installs only when named.
 
 `plan --default [--json]` prints the same plan without installing. `install … --json` prints
 the plan as JSON instead of text, for both forms of `install`.
@@ -276,7 +278,8 @@ a setup page: no second fetch is needed for detection, sizes or compatibility.
 | `listing` | for a link-out: where to get it |
 | `summary` | the catalog's one-line description, when it has one |
 | `aliases` | other names the item answers to (the schema-1 name). Always an array |
-| `recommended` | the catalog's flag |
+| `recommended` | the catalog's flag; always `false` for a `research` item |
+| `research`, `badge` | `research` is the catalog's flag (`false` when absent); a research item also carries `badge`: `"Research preview (non-commercial)"`, and its `detected` is always `none` |
 | `detected` | `high`, `low` or `none`: the best confidence among the item's detect rules that match this machine. `evidence` says what matched |
 | `size` | bytes of the item's own asset |
 | `download` | bytes `install <id>` would still fetch **for this item**: its asset plus the installer assets of its unmet external prerequisites, minus what the download cache holds. `0` when nothing would be installed. The runtime and other required items are not included; they have rows of their own |

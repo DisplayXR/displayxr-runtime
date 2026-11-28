@@ -166,6 +166,8 @@ public static class ComponentRows
         "tracking_providers" => "tracking_provider",
         "conversion_providers" => "conversion_provider",
         "workspace_controller" => "workspace_controller",
+        // §5.6.6: the model builder sits with the models it builds.
+        "conversion_models" => "model_builder",
         _ => null,
     };
 
@@ -238,7 +240,11 @@ public static class ComponentRows
         var runtime = Ordered(items.Where(c => c.IsRuntime)).Select(c => CatalogOnly(c, stale)).ToArray();
         if (runtime.Length > 0)
             groups.Insert(0, CatalogGroup(RuntimeGroupId, "DisplayXR", "DisplayXR itself: what every add-on and app here runs on.", runtime));
-        var apps = Ordered(items.Where(c => !c.IsRuntime && !ComponentClassNames.Contains(c.Class))).Select(c => CatalogOnly(c, stale)).ToArray();
+        // A class whose section is shown is joined there (a model builder under 2D-to-3D models);
+        // with that section absent it is listed with the apps rather than dropped.
+        var joined = sections.Select(x => CatalogClassOf(x.Id)).Where(c => c is not null).ToHashSet();
+        var apps = Ordered(items.Where(c => !c.IsRuntime && !ComponentClassNames.Contains(c.Class) && !joined.Contains(c.Class)))
+            .Select(c => CatalogOnly(c, stale)).ToArray();
         if (apps.Length > 0)
             groups.Add(CatalogGroup(AppsGroupId, "Apps", "Apps and tools for your display. They run on DisplayXR.", apps));
         return groups;

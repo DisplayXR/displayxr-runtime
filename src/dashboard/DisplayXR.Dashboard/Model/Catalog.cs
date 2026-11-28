@@ -37,9 +37,15 @@ public sealed record CatalogItem(
     string? Installed, string? Available, string State, bool Installable, bool Receipt, string? Listing,
     string Summary, IReadOnlyList<string> Aliases, bool Recommended, string Detected, string? Evidence,
     long Size, long Download, bool Compatible, string? IncompatibleReason, IReadOnlyList<CatalogPrereq> Prerequisites,
-    bool HasUninstallCommand = false)
+    bool HasUninstallCommand = false, bool Research = false)
 {
     public bool IsRuntime => Class == "runtime";
+
+    /// <summary>
+    /// The badge of a research item (§5.6.6: the model builder). It is offered, never suggested:
+    /// the engine reports it neither recommended nor detected, and this does not rely on that.
+    /// </summary>
+    public string? ResearchBadge => Research ? ModelBuildRow.BadgeText : null;
 
     /// <summary>Present on this machine, whoever installed it.</summary>
     public bool IsInstalled => State is "current" or "outdated" or "rebuilt" or "newer" or "installed";
@@ -137,6 +143,7 @@ public static class CatalogClasses
         ("workspace_controller", "Spatial desktop", "A spatial desktop for your apps.", "spatial desktops"),
         ("app", "Apps", "Ready to open on your display.", "apps"),
         ("companion", "Companions", "Works alongside your display.", "companions"),
+        ("model_builder", "Model builders", "Builds research-only 2D-to-3D models on this PC from their official files.", "model builders"),
         ("sdk", "Developer tools", "Build your own.", "tools"),
         ("runtime", "DisplayXR", "The runtime everything here plugs into.", "components"),
     };
@@ -203,14 +210,16 @@ public sealed record CatalogList(int Schema, IReadOnlyList<CatalogItem> Items)
                     e.Str("state", "not_installed"), e.Bool("installable"), e.Bool("receipt"), e.StrOrNull("listing"),
                     e.Str("summary"),
                     e.Arr("aliases").Where(a => a.ValueKind == JsonValueKind.String).Select(a => a.GetString() ?? "").ToArray(),
-                    e.Bool("recommended"), e.Str("detected", "none"), e.StrOrNull("evidence"),
+                    // §5.6.6: a research item is never recommended or "works with your display", whatever was sent.
+                    e.Bool("recommended") && !e.Bool("research"), e.Bool("research") ? "none" : e.Str("detected", "none"),
+                    e.Bool("research") ? null : e.StrOrNull("evidence"),
                     e.Long("size"), e.Long("download"),
                     // An engine that predates the field judges nothing: the install itself will say.
                     e.Has("compatible") ? e.Bool("compatible") : true, e.StrOrNull("incompatible_reason"),
                     e.Arr("prerequisites").Where(p => p.ValueKind == JsonValueKind.Object && p.Str("name").Length > 0)
                         .Select(p => new CatalogPrereq(p.Str("name"), p.Bool("met"), p.Bool("installable"), p.StrOrNull("info_url")))
                         .ToArray(),
-                    e.Bool("can_uninstall")))
+                    e.Bool("can_uninstall"), e.Bool("research")))
                 .ToArray();
             list = new CatalogList(root.Int("schema"), items);
             return true;

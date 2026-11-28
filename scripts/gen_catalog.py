@@ -49,6 +49,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 ORG = "DisplayXR"
 API = "https://api.github.com"
@@ -839,6 +840,25 @@ V2_PLATFORM_WINDOWS = "windows-x64"
 # key names have been read from a release.
 # Keyed by the schema-1 component name (the versions.json field).
 V2_ITEMS = {
+    # §5.6.6: the signed tool that builds a research-only model on the user's
+    # machine from its official checkpoint. Its versions.json field (and its
+    # V2_ONLY_COMPONENTS row: release repo, asset name, registry_version) is
+    # added by its first release; until then it is not listed. `research`
+    # keeps it out of every default set: never recommended, never detected.
+    "model_builder": {
+        "id": "open-conversion-model-builder",
+        "class": "model_builder",
+        "registered_id": "open-model-builder",
+        "name": "Model builder",
+        "summary": "Builds research-only 2D-to-3D models on this PC from their official files. "
+                   "Builds nothing by itself.",
+        "research": True,
+        "license": {"class": "open", "spdx": "BSL-1.0"},
+        "uninstall": {
+            "path": "HKLM\\Software\\DisplayXR\\ModelBuilders\\open-model-builder\\UninstallString",
+            "args": ["/S"],
+        },
+    },
     "runtime": {
         "id": "runtime",
         "class": "runtime",
@@ -960,10 +980,13 @@ V2_ITEMS = {
 }
 
 V2_CLASSES = ("runtime", "display_processor", "input_provider", "conversion_provider",
-              "tracking_provider", "workspace_controller", "companion", "app", "sdk")
-# Classes the runtime loads or spawns under a registered id.
+              "tracking_provider", "workspace_controller", "companion", "model_builder", "app", "sdk")
+# Classes that register under an id (the runtime loads or spawns them, or, for a
+# model_builder, `conv models fetch` runs it: ModelBuilders\<id>, §5.6.3).
 V2_REGISTERED_CLASSES = ("display_processor", "input_provider", "conversion_provider",
-                         "tracking_provider", "workspace_controller", "companion")
+                         "tracking_provider", "workspace_controller", "companion", "model_builder")
+# The badge a front end shows on a `research: true` item (conversion-provider-discovery.md §5.6.6).
+RESEARCH_BADGE = "Research preview (non-commercial)"
 # Top-level keys of `dxr-get detect --json`, which also keys an object per item by
 # its schema-1 name / id: an item must not take one of these names.
 V2_RESERVED_IDS = ("edids", "usb", "display_plugins", "detected_items")
@@ -1044,7 +1067,11 @@ def build_catalog_v2(v1, *, manifests=None, extra=None):
             item["assets"] = {V2_PLATFORM_WINDOWS: v2_asset(comp["windows"], meta.get("uninstall"))}
         if "detect" in comp:
             item["detect"] = [dict(r) for r in comp["detect"]]
-        if meta.get("recommended"):
+        if "license" in meta:
+            item["license"] = dict(meta["license"])
+        if meta.get("research"):
+            item["research"] = True  # §5.6.6: never recommended, never detected
+        elif meta.get("recommended"):
             item["recommended"] = True
         items.append(item)
 
@@ -1085,9 +1112,53 @@ def _detect_problems(where, rules):
     return out
 
 
-def validate_v2(cat):
-    """Structural problems of a schema-2 catalog, as strings. Empty list = valid."""
+def pack_hashes(paths):
+    """sha256 -> where, for every file a model pack names (variants[].files[]) and every
+    `local_build.sources[]` (§5.6.1). No catalog asset may be one of them (§5.6.6).
+    `paths` are pack manifests (`<pack>.models.json`) or directories holding them."""
+    out = {}
+    for p in paths or []:
+        files = sorted(Path(p).glob("*.models.json")) if Path(p).is_dir() else [Path(p)]
+        for f in files:
+            with open(f, encoding="utf-8") as fh:
+                pack = json.load(fh)
+            pid = pack.get("pack", f.name)
+            for m in pack.get("models", []):
+                for v in m.get("variants", []):
+                    for x in v.get("files", []):
+                        if isinstance(x.get("sha256"), str):
+                            out[x["sha256"].lower()] = f"{pid}/{m.get('name')} file"
+                for src in (m.get("local_build") or {}).get("sources", []):
+                    if isinstance(src.get("sha256"), str):
+                        out[src["sha256"].lower()] = f"{pid}/{m.get('name')} source {src.get('role')!r}"
+    return out
+
+
+def _research_problems(where, item):
+    """§5.6.6: `research: true` is a boolean that forbids `recommended` and `detect`;
+    a model_builder is always a research item (it exists only for models we may not ship)."""
+    out = []
+    research = item.get("research")
+    if research is not None and not isinstance(research, bool):
+        out.append(f"{where}: research must be true or false")
+    if research is True:
+        if item.get("recommended"):
+            out.append(f"{where}: a research item must not be recommended")
+        if item.get("detect"):
+            out.append(f"{where}: a research item must not carry detect rules")
+    if item.get("class") == "model_builder" and research is not True:
+        out.append(f"{where}: a model_builder item must be research: true")
+    return out
+
+
+def validate_v2(cat, forbidden_sha256=None):
+    """Structural problems of a schema-2 catalog, as strings. Empty list = valid.
+
+    `forbidden_sha256` (pack_hashes()): sha256 -> what it is. An asset whose hash is a
+    model file or a build source is refused (§5.6.6: no weights, sources or derived
+    files are ever a catalog asset)."""
     problems = []
+    forbidden = forbidden_sha256 or {}
     publishers = cat.get("publishers")
     if not isinstance(publishers, dict):
         return ["publishers is not an object"]
@@ -1107,6 +1178,7 @@ def validate_v2(cat):
                 problems.append(f"{where}: id or alias {name!r} is reserved")
             seen.add(name)
         problems += _detect_problems(f"{where} detect", item.get("detect"))
+        problems += _research_problems(where, item)
         cls = item.get("class")
         if cls not in V2_CLASSES:
             problems.append(f"{where}: unknown class {cls!r}")
@@ -1135,6 +1207,12 @@ def validate_v2(cat):
                 problems.append(f"{where}: requires version {req.get('version')!r} is not >=X.Y.Z")
             elif kind == "external":
                 problems += _detect_problems(f"{where} requires {req.get('name')!r} detect", req.get("detect"))
+                for platform, ext in (req.get("asset") or {}).items():
+                    sha = str((ext or {}).get("sha256", "")).lower()
+                    if sha in forbidden:
+                        problems.append(f"{where} requires {req.get('name')!r} {platform}: asset is a model "
+                                        f"pack's {forbidden[sha]} (no weights, sources or derived files are "
+                                        "ever a catalog asset)")
         for platform, asset in item.get("assets", {}).items():
             awhere = f"{where} {platform}"
             if "listing" in asset:  # link-out: nothing is downloaded or run
@@ -1143,6 +1221,9 @@ def validate_v2(cat):
                 continue
             if not re.fullmatch(r"[0-9a-f]{64}", asset.get("sha256", "")):
                 problems.append(f"{awhere}: sha256 is not 64 lowercase hex")
+            elif asset["sha256"] in forbidden:
+                problems.append(f"{awhere}: asset is a model pack's {forbidden[asset['sha256']]} (no weights, "
+                                "sources or derived files are ever a catalog asset)")
             if not isinstance(asset.get("size"), int) or asset["size"] <= 0:
                 problems.append(f"{awhere}: size is not a positive integer")
             urls = asset.get("urls")
@@ -1227,7 +1308,7 @@ def cmd_generate(args):
             sys.exit("error: --out-v2 must be a different directory from --out")
         extra = build_extra_components(versions, VERIFIERS[args.verifier], download_dir)
         catalog2 = build_catalog_v2(catalog, manifests=MANIFESTS, extra=extra)
-        problems = validate_v2(catalog2)
+        problems = validate_v2(catalog2, pack_hashes(getattr(args, "pack", None)))
         if problems:
             sys.exit("error: generated schema-2 catalog is invalid: " + "; ".join(problems))
         data2 = canonical_bytes(catalog2)
@@ -1276,7 +1357,7 @@ def cmd_verify(args):
     if cat.get("schema") not in (1, 2):
         problems.append(f"schema {cat.get('schema')} is not 1 or 2")
     if cat.get("schema") == 2:
-        problems.extend(validate_v2(cat))
+        problems.extend(validate_v2(cat, pack_hashes(getattr(args, "pack", None))))
     exp = datetime.datetime.strptime(cat.get("expires", ""), "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=datetime.timezone.utc)
     if exp <= datetime.datetime.now(datetime.timezone.utc):
@@ -1330,11 +1411,17 @@ def main():
                         "listable keeps that catalog's signed windows block")
     g.add_argument("--verifier", choices=sorted(VERIFIERS), default="powershell",
                    help="Authenticode check (default powershell; 'none' lists no windows blocks)")
+    g.add_argument("--pack", action="append", default=[], metavar="FILE|DIR",
+                   help="a model pack manifest (or a directory of *.models.json): no schema-2 asset may "
+                        "hash to one of its files or build sources (§5.6.6); repeatable")
     g.set_defaults(func=cmd_generate)
 
     v = sub.add_parser("verify", help="check a catalog's signature and basic invariants")
     v.add_argument("catalog", help="path to stable.json")
     v.add_argument("--sig", help="signature path (default <catalog>.sig)")
+    v.add_argument("--pack", action="append", default=[], metavar="FILE|DIR",
+                   help="a model pack manifest (or a directory of *.models.json): refuse an asset that "
+                        "hashes to one of its files or build sources (§5.6.6); repeatable")
     v.set_defaults(func=cmd_verify)
 
     d = sub.add_parser("validate-detect", help=f"check a display plug-in's {DETECT_MANIFEST} (schema 1)")

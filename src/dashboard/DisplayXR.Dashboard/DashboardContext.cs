@@ -790,6 +790,143 @@ public sealed class DashboardContext
 
     private static string Tail(string s) => s.Length <= 400 ? s : s[^400..];
 
+    // ── Locally built models (conversion-provider-discovery.md §5.6.5) ─────
+    // The rows come from `conv models list --json`; Build, Cancel, Remove and Withdraw are CLI
+    // verbs. One build at a time from this Dashboard (the store allows one per recipe anyway).
+
+    public ModelBuildList? ModelBuilds { get; private set; }
+    public bool ModelBuildsLoading { get; private set; }
+    /// <summary>The model building now (pack/model), its progress from <c>--events</c>.</summary>
+    public string? BuildingKey { get; private set; }
+    public BuildProgress? BuildNow { get; private set; }
+    private IWatchProcess? _build;
+    private readonly Dictionary<string, BuildProgress> _buildResults = new();
+    private readonly HashSet<string> _buildTicks = new();
+
+    /// <summary>How the last build of a model ended (its result line), until the next one.</summary>
+    public BuildProgress? BuildResultOf(string key) => _buildResults.TryGetValue(key, out var r) ? r : null;
+    /// <summary>The accept tick: kept for this session only, never pre-ticked, cleared after each build.</summary>
+    public bool BuildTicked(string key) => _buildTicks.Contains(key);
+    public void SetBuildTicked(string key, bool on)
+    {
+        if (on) _buildTicks.Add(key); else _buildTicks.Remove(key);
+        Bump();
+    }
+    public void DismissBuildResult(string key)
+    {
+        if (_buildResults.Remove(key)) Bump();
+    }
+
+    /// <summary><c>conv models list --json</c>: on Components show, after every build action. An older CLI lists no buildable model.</summary>
+    public async Task LoadModelBuildsAsync()
+    {
+        if (ModelBuildsLoading) return;
+        ModelBuildsLoading = true;
+        Bump();
+        try
+        {
+            var r = await Cli.RunAsync(ModelBuildCommands.List, InfoTimeout);
+            if (r.Started && !r.TimedOut && ModelBuildList.TryParse(r.Json, out var list)) ModelBuilds = list;
+        }
+        catch (Exception ex) { DashboardLog.Error("conv models list", ex); }
+        finally { ModelBuildsLoading = false; }
+        Bump();
+    }
+
+    /// <summary>
+    /// Build: with the tick, <c>conv research on</c> first (the tick says it turns research-only
+    /// models on for this user), then <c>conv models fetch … --accept-license … --events</c>, whose
+    /// NDJSON lines drive the progress; the result line says how it ended.
+    /// </summary>
+    public async Task StartBuildAsync(BuildableModel m)
+    {
+        if (BuildingKey is not null) return;
+        bool ticked = _buildTicks.Contains(m.Key);
+        var commands = ModelBuildRow.BuildCommands(m, ticked);
+        BuildingKey = m.Key;
+        BuildNow = BuildProgress.Starting;
+        _buildResults.Remove(m.Key);
+        Bump();
+        for (int i = 0; i < commands.Count - 1; i++)
+        {
+            DashboardLog.Info($"build: displayxr-cli {commands[i]}");
+            var r = await Cli.RunAsync(commands[i], ActionTimeout);
+            if (!r.Ok)
+            {
+                FinishBuild(m.Key, BuildNow with { Result = "policy", Hint = r.Summary });
+                return;
+            }
+        }
+        var fetch = commands[^1];
+        DashboardLog.Info($"build: displayxr-cli {fetch}");
+        try
+        {
+            _build = Cli.StartStream(fetch,
+                line => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                {
+                    if (BuildingKey != m.Key || BuildNow is null) return;
+                    BuildNow = BuildNow.Apply(line);
+                    Bump();
+                }),
+                code => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                {
+                    var p = BuildNow ?? BuildProgress.Starting;
+                    FinishBuild(m.Key, p.Result is null ? p with { Result = code == 0 ? "built" : "build-failed" } : p);
+                }),
+                note => DashboardLog.Info($"build: {note}"));
+        }
+        catch (Exception ex)
+        {
+            DashboardLog.Error("build", ex);
+            FinishBuild(m.Key, BuildProgress.Starting with { Result = "build-failed", Hint = ex.Message });
+        }
+    }
+
+    private void FinishBuild(string key, BuildProgress result)
+    {
+        DashboardLog.Info($"build: {key} -> {result.Result} {result.Hint}");
+        _buildResults[key] = result;
+        _buildTicks.Remove(key);
+        BuildingKey = null;
+        BuildNow = null;
+        _build = null;
+        Bump();
+        _ = LoadModelBuildsAsync();
+    }
+
+    /// <summary>Cancel: the CLI creates the build's cancel file; the build ends <c>build-cancelled</c> on its own.</summary>
+    public async Task CancelBuildAsync(BuildableModel m)
+    {
+        DashboardLog.Info($"build: displayxr-cli {ModelBuildCommands.Cancel(m)}");
+        var r = await Cli.RunAsync(ModelBuildCommands.Cancel(m), ActionTimeout);
+        if (!r.Ok) Toast("The build could not be cancelled. It stops on its own if the Dashboard is closed.");
+    }
+
+    public async Task RemoveBuiltModelAsync(BuildableModel m)
+    {
+        await RunActionsAsync("model-build", ModelBuildCommands.Remove(m));
+        await LoadModelBuildsAsync();
+    }
+
+    /// <summary>Withdraw: this user's acceptance record goes; AllowResearchOnly stays as it is (Settings turns it off).</summary>
+    public async Task WithdrawLicenceAsync(BuildLicence l)
+    {
+        await RunActionsAsync("model-build", ModelBuildCommands.Withdraw(l));
+        await LoadModelBuildsAsync();
+    }
+
+    /// <summary>Get / Update the builder: its catalog item (<c>tool.catalog_id</c>) through the install engine, like every install here.</summary>
+    public async Task GetBuilderAsync(BuildableModel m)
+    {
+        if (CatalogRead?.List?.Find(m.ToolCatalogId) is not { } item)
+        {
+            Toast("The model builder is not in the Catalog that could be read. Try again later.");
+            return;
+        }
+        await RunCatalogAsync(item.HasUpdate ? CatalogVerb.Update : CatalogVerb.Install, item);
+        await LoadModelBuildsAsync();
+    }
+
     public bool HasMultipleAdapters => Info?.Gpu is { Probed: true } g && g.Adapters.Count > 1;
 
     public string? PreferredPlugin => Dp?.Preferred;

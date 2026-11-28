@@ -1025,7 +1025,8 @@ cmd_detect(const struct dxr_catalog *c, bool json)
 	cJSON_ArrayForEach(it, c->items)
 	{
 		const cJSON *rules = cJSON_GetObjectItemCaseSensitive(it, "detect");
-		if (!cJSON_IsArray(rules) || dxr_item_find(c, dxr_item_id(it)) != it) {
+		// §5.6.6: a research item is never "detected" (it installs only when named).
+		if (!cJSON_IsArray(rules) || dxr_item_find(c, dxr_item_id(it)) != it || dxr_item_research(it)) {
 			continue;
 		}
 		char why_hi[256], why_any[256];

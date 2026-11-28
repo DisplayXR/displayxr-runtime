@@ -516,7 +516,9 @@ public class ComponentRowsTests
         Assert.Null(groups[0].Rows[0].Status);
         Assert.Equal(RowStatus.Available, groups[0].Rows[1].Status);
         Assert.Null(Assert.Single(groups[1].Rows).Status);
-        Assert.Null(ComponentRows.CatalogClassOf("conversion_models"));
+        Assert.Null(ComponentRows.CatalogClassOf("stereo_camera"));
+        // §5.6.6: the model builder's catalog rows sit with the models (no installed row joins one).
+        Assert.Equal("model_builder", ComponentRows.CatalogClassOf("conversion_models"));
         Assert.Equal("workspace_controller", ComponentRows.CatalogClassOf("workspace_controller"));
     }
 

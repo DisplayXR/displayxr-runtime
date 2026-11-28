@@ -1474,6 +1474,70 @@ TEST_CASE("install --default: the recommended set plus high-confidence hardware"
 	CHECK(text(p).find("Nothing to install.") != std::string::npos);
 }
 
+TEST_CASE("research items (§5.6.6): never pre-ticked, badged, and installing one builds nothing")
+{
+	// The model builder as the catalog lists it, plus the two keys a catalog
+	// must not give a research item (recommended, a high-confidence detect
+	// rule): dxr-get still never selects it on its own.
+	std::string body = V2;
+	const size_t end = body.rfind("\n ]\n}");
+	REQUIRE(end != std::string::npos);
+	body.insert(end, R"json(,
+  { "id": "open-conversion-model-builder", "class": "model_builder", "registered_id": "open-model-builder",
+    "name": "Model builder", "publisher": "displayxr", "version": "1.0.0", "research": true, "recommended": true,
+    "license": { "class": "open", "spdx": "BSL-1.0" },
+    "detect": [ { "kind": "edid", "man": 44048, "prod": 16711, "confidence": "high", "note": "hostile" } ],
+    "assets": { "windows-x64": { "version": "1.0.0", "file": "ModelBuilderSetup-1.0.0.exe", "size": 3000000,
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "urls": ["https://example.invalid/mb.exe"],
+      "signature": { "kind": "authenticode", "signer": "Leia, Inc." },
+      "installer": { "kind": "exe", "args": ["/S"], "scope": "machine", "elevation": "required" },
+      "installed": { "kind": "registration_row" } } } })json");
+	Cat cat(body.c_str());
+	REQUIRE(cat.rc == DXR_GET_OK);
+	Machine m;
+	m.sz[RT_VER] = "2.70.0";
+	m.edids = {{44048, 16711}};
+	const cJSON *it = dxr_item_find(&cat.c, "open-conversion-model-builder");
+	REQUIRE(it != nullptr); // a known class
+	CHECK(dxr_item_research(it));
+
+	// install --default and the ensure-for hardware pass never pick it.
+	dxr_plan p = default_plan(cat, m);
+	INFO(text(p));
+	CHECK(step(p, "open-conversion-model-builder") == nullptr);
+	CHECK(step(p, "leia-sr") != nullptr); // the same EDID still selects the real plug-in
+	p = plan(cat, m, "browser", DXR_PLAN_ENSURE);
+	CHECK(step(p, "open-conversion-model-builder") == nullptr);
+
+	// list --json: not recommended, never detected, the badge.
+	dxr_env e = m.env();
+	cJSON *all = dxr_list_catalog(&cat.c, &e, false, false);
+	const cJSON *r = row(all, "open-conversion-model-builder");
+	REQUIRE(r != nullptr);
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(r, "recommended")));
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(r, "research")));
+	CHECK(std::string(cJSON_GetObjectItem(r, "badge")->valuestring) == "Research preview (non-commercial)");
+	CHECK(std::string(cJSON_GetObjectItem(r, "detected")->valuestring) == "none");
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(row(all, "leia-sr"), "research")));
+	cJSON_Delete(all);
+
+	// Named, it installs: its own installer and nothing else (no model, no
+	// other item); the install is recognised by its ModelBuilders row.
+	p = plan(cat, m, "open-conversion-model-builder", DXR_PLAN_INSTALL);
+	INFO(text(p));
+	CHECK(p.gate == DXR_GET_OK);
+	CHECK(p.todo == 1);
+	for (int i = 0; i < p.n; i++) {
+		const std::string id = p.steps[i].id;
+		CHECK((id == "open-conversion-model-builder" || id == "runtime"));
+	}
+	char path[512];
+	REQUIRE(dxr_installed_path(it, path, sizeof(path)));
+	CHECK(std::string(path) == "HKLM\\Software\\DisplayXR\\ModelBuilders\\open-model-builder\\Version");
+	m.sz[path] = "1.0.0";
+	CHECK(plan(cat, m, "open-conversion-model-builder", DXR_PLAN_INSTALL).todo == 0);
+}
+
 TEST_CASE("uninstall: what elevation cannot fix is reported before elevation is asked for")
 {
 	dxr_receipt rs[3] = {receipt("runtime", "2.70.0", SHA_RT), receipt("leia-sr", "2.23.0", SHA_LEIA, "runtime"),
