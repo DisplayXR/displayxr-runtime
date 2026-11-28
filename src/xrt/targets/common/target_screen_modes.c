@@ -352,6 +352,15 @@ target_screen_modes_fill_status(const struct xrt_screen_list *list,
 		}
 		const bool fits = u_screen_modes_table_fits(t, atlas_w, atlas_h) || !t->sized;
 		u_screen_modes_fill_status(t, fits, &sc->mode_3d);
+		// The driver whose list this is: the screen's own plug-in, or the head
+		// device's (the active plug-in) for a copy of the head's list.
+		const struct xrt_plugin_iface *active = target_plugin_get_active();
+		const char *driver = t->list_source == U_SCREEN_MODES_LIST_PLUGIN ? t->plugin_id
+		                     : active != NULL && active->id != NULL       ? active->id
+		                                                                  : "";
+		if (sc->mode_3d.valid) {
+			(void)snprintf(sc->mode_3d.driver, sizeof(sc->mode_3d.driver), "%s", driver);
+		}
 	}
 	free(local);
 	free(t);

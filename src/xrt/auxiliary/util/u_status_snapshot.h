@@ -312,6 +312,31 @@ void
 u_status_mode_3d_mark_active(struct xrt_status_mode_3d *m3);
 
 /*!
+ * ADR-066 C1 x display dashboard phase 7: is screen @p sc the system-default
+ * screen, with a known 3D-mode table that belongs to another display driver
+ * than the one that claims (weaves) it? That is the case after
+ * `dp use <id> --screen <primary>`: the preference moves only the screen's
+ * weaving DP (at the next session); the head device, and with it the 3D-mode
+ * table apps are sized for and `dp mode set` reaches, stays the active
+ * plug-in's at every time - now, at the next session, after a service restart.
+ * Pure.
+ */
+bool
+u_status_mode_3d_driver_differs(const struct xrt_status_screen *sc);
+
+/*!
+ * When @ref u_status_mode_3d_driver_differs, write the top-level `reason` that
+ * says so ("its 3D modes are those of the head display driver '<driver>';
+ * '<claim>' only weaves it"), replacing a stored-choice reason (the driver
+ * split is why a name the weaving driver offers is not in this table).
+ * Called after the stored choice was applied. Pure.
+ *
+ * @return true when the note was written.
+ */
+bool
+u_status_mode_3d_note_driver(struct xrt_status_screen *sc);
+
+/*!
  * @name Stable enum spellings (as serialised)
  * @{
  */

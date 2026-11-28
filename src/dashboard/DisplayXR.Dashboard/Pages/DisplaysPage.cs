@@ -235,7 +235,8 @@ public sealed class DisplaysPage : Page
         }
         else
         {
-            // A stored choice, no modes reported: nothing to pick from, the choice stays visible.
+            // A stored choice, no modes reported, or one mode on a display another driver weaves:
+            // nothing to pick from; the choice (or the mode drawn) stays visible, with the note.
             var stored = U.Text(StatusText.Mode3DStoredText(mode));
             stored.VerticalAlignment = VerticalAlignment.Center;
             value = stored;

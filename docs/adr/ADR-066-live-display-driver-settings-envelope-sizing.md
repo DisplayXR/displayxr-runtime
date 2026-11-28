@@ -279,10 +279,20 @@ other kinds are explicit choices.
     "setting": "<name>" | null,
     "source": "user|machine|driver_default|runtime_default",
     "reason": "…" | null,
+    "driver": "<plug-in id>" | null,
     "choices": [{"name": "…", "label": "…", "views": 2, "tracked": true, "passthrough": false,
                  "applies": "now|restart_app|not_supported", "reason": "…" | null}]
   }
   ```
+  - `driver` is the display driver whose declared list `choices` is (added 2026-11-27). On the
+    system-default screen that is **always the head device's plug-in**, also when a per-screen
+    display-processor preference (`dp use <id> --screen <key>`) gave the screen another driver
+    (`claim.plugin_id`). That preference moves only the screen's weaving DP, at the next session
+    (display dashboard phase 7, `plugin-discovery.md` §1.1): the head device, the table apps are sized
+    for, the slot-1 mapping and what `dp mode set` reaches stay the active plug-in's now, at the next
+    session and after a service restart. Only a preference for every screen (`dp use <id>`) changes
+    the head device. Every other screen's `driver` is its own plug-in (or the head's, for a screen
+    whose plug-in declares no list of its own).
   - `label` comes from the driver's declared entry (`mode_name`).
   - `active` is the entry slot 1 maps to now: what is drawn. It is null only when the screen's
     driver declares no 3D modes now.
@@ -296,7 +306,15 @@ other kinds are explicit choices.
     '<name>' is not offered by this display's driver; the default is used" (a name the table does
     not list: an entry the driver no longer declares, or a hand-written typo), "… cannot apply here;
     the default is used" (a `not_supported` entry), or "this display's driver declares no 3D modes
-    now" (no table; `active` null, `choices` empty). A reader offers a reset on a non-null reason.
+    now" (no table; `active` null, `choices` empty). A reader offers a reset on a non-null reason
+    when a choice is stored.
+  - On the **system-default screen whose `driver` differs from `claim.plugin_id`** the top-level
+    `reason` says so instead, and wins over a stored-choice reason (the split is why a name the
+    weaving driver offers is missing): "its 3D modes are those of the head display driver '<driver>';
+    '<claim>' only weaves it". The table is shown as it is, not replaced by the weaving driver's: it
+    is what slot 1 maps to and what `dp mode set` changes. `dp mode list` adds that the weaving
+    driver's own modes need it chosen for every screen; the Dashboard keeps the 3D-mode row, without
+    a picker when there is one mode, with that note.
 - **The runtime computes `applies` and `reason` itself**, in `u_device_rendering_modes_fill_status`
   (the head device) and `u_screen_modes_fill_status` (every other screen). The 3D mode is a
   runtime-owned choice, so no driver `get_setting_status` speaks for it (the "Not supported here"
