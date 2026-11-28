@@ -81,15 +81,21 @@ COMPONENT_INSTALL_MARKER_LINUX_leia_plugin="/usr/lib/displayxr/plugins/050-leia-
 
 # --- conversion_open ---
 # Open-model conversion provider (ADR-053 P4). Windows: DisplayXROpenConversionSetup-*.exe
-# (registers ConversionProviders\open-conversion). Linux: a per-user tarball with its own
-# install.sh, not a .deb, so the .deb glob is empty here (warn-and-skip). No macOS build yet.
+# (registers ConversionProviders\open-conversion). Linux: displayxr-open-conversion_<ver>_amd64.deb,
+# a system install (root-owned, so platform-trusted) into /usr/lib/displayxr/plugins: the
+# manifest checked below in the plug-in root, the provider with its ONNX Runtime, OpenVINO and
+# packs in plugins/open-conversion/. Depends on displayxr-runtime. Model weights are not in it:
+# the runtime's model store downloads them on first use into the service user's
+# $XDG_DATA_HOME/displayxr/models. The release also keeps the per-user tarball
+# (displayxr-open-conversion-<ver>-linux-x86_64.tar.gz, its own install.sh), which no table
+# here names. No macOS build yet.
 COMPONENT_REPO_conversion_open="DisplayXR/displayxr-conversion-open"
 COMPONENT_PKG_MACOS_conversion_open=""
 COMPONENT_EXE_WINDOWS_conversion_open="DisplayXROpenConversionSetup-*.exe"
-COMPONENT_DEB_LINUX_conversion_open=""
+COMPONENT_DEB_LINUX_conversion_open="displayxr-open-conversion_*_amd64.deb"
 COMPONENT_INSTALL_MARKER_MACOS_conversion_open=""
 COMPONENT_INSTALL_MARKER_WINDOWS_conversion_open="HKLM\Software\DisplayXR\ConversionProviders\open-conversion"
-COMPONENT_INSTALL_MARKER_LINUX_conversion_open=""
+COMPONENT_INSTALL_MARKER_LINUX_conversion_open="/usr/lib/displayxr/plugins/200-open-conversion-conversion-provider.json"
 
 # --- leia_conversion ---
 # Leia 2D-to-3D conversion provider (ADR-053), split out of the Leia SR plug-in

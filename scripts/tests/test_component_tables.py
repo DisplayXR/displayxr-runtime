@@ -115,6 +115,35 @@ class OptIn(unittest.TestCase):
                     self.assertTrue(line.lstrip().lower().startswith("if "), line)
 
 
+class LinuxDebTable(unittest.TestCase):
+    """The Linux meta-bundle (displayxr-installer scripts/build-bundle-linux.sh) reads
+    COMPONENT_DEB_LINUX_<name> as a required `gh release download --pattern`, and every
+    package it chains goes into one apt-get transaction."""
+
+    def deb_components(self):
+        return re.findall(r'(?m)^COMPONENT_DEB_LINUX_(\w+)="([^"]+)"', SH)
+
+    def test_a_deb_glob_names_one_amd64_package(self):
+        for name, glob in self.deb_components():
+            with self.subTest(component=name):
+                self.assertRegex(glob, r"^[a-z0-9][a-z0-9.+-]*_\*_amd64\.deb$")
+                self.assertTrue(sh_var(f"COMPONENT_REPO_{name}"))
+
+    def test_a_linux_marker_is_an_absolute_system_path(self):
+        for name, marker in re.findall(r'(?m)^COMPONENT_INSTALL_MARKER_LINUX_(\w+)="([^"]+)"', SH):
+            with self.subTest(component=name):
+                self.assertTrue(marker.startswith(("/usr/", "/opt/")), marker)
+                # A marker without a package to put it there could never be satisfied.
+                self.assertTrue(sh_var(f"COMPONENT_DEB_LINUX_{name}"), name)
+
+    def test_open_conversion_deb(self):
+        # displayxr-conversion-open scripts/package_deb.sh: the package name and the
+        # discovery manifest it installs into the runtime's system plug-in root.
+        self.assertEqual(sh_var("COMPONENT_DEB_LINUX_conversion_open"), "displayxr-open-conversion_*_amd64.deb")
+        self.assertEqual(sh_var("COMPONENT_INSTALL_MARKER_LINUX_conversion_open"),
+                         "/usr/lib/displayxr/plugins/200-open-conversion-conversion-provider.json")
+
+
 class CatalogTable(unittest.TestCase):
     def test_every_catalog_component_is_a_known_component(self):
         for comp in list(gen_catalog.COMPONENTS) + list(gen_catalog.V2_ONLY_COMPONENTS):
