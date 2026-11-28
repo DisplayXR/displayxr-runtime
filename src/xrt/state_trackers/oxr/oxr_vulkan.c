@@ -11,6 +11,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
+
+#include "xrt/xrt_config_os.h"
+#ifdef XRT_OS_LINUX_DESKTOP
+#include <link.h> // dl_iterate_phdr: translation-layer host detection
+#endif
 
 #include "util/u_misc.h"
 #include "util/u_debug.h"
@@ -76,6 +82,101 @@ snprint_luid(char *str, size_t size, xrt_luid_t *luid)
  *
  */
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * `DXR_VK_ENABLE1_NO_LINUX_WSI`: `auto` (default) drops the Linux window-system
+ * surface extensions from the enable1 instance answer only inside a Windows-API
+ * translation-layer host process (see oxr_vk_host_is_translation_layer());
+ * `1` always drops them, `0` never does.
+ */
+DEBUG_GET_ONCE_TRISTATE_OPTION(vk_enable1_no_linux_wsi, "DXR_VK_ENABLE1_NO_LINUX_WSI")
+
+static int
+oxr_vk_find_unix_ntdll(struct dl_phdr_info *info, size_t size, void *data)
+{
+	(void)size;
+	(void)data;
+	const char *name = info->dlpi_name;
+	if (name == NULL) {
+		return 0;
+	}
+	// The translation layer's Unix-side core is "<...>/<arch>-unix/ntdll.so".
+	const char *suffix = "-unix/ntdll.so";
+	size_t n = strlen(name);
+	size_t s = strlen(suffix);
+	return (n >= s && strcmp(name + n - s, suffix) == 0) ? 1 : 0;
+}
+
+/*!
+ * True when this runtime is loaded into the Unix side of a Windows-API
+ * translation layer: a Windows app reaching the Linux runtime through a
+ * bridged OpenXR loader. That host builds the app's VkInstance through its own
+ * Vulkan thunks, which know the Windows surface names and the host's
+ * VK_KHR_xlib_surface but not VK_KHR_xcb_surface / VK_KHR_wayland_surface.
+ */
+static bool
+oxr_vk_host_is_translation_layer(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		cached = dl_iterate_phdr(oxr_vk_find_unix_ntdll, NULL) != 0 ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+static bool
+oxr_vk_enable1_drop_linux_wsi(void)
+{
+	switch (debug_get_tristate_option_vk_enable1_no_linux_wsi()) {
+	case DEBUG_TRISTATE_ON: return true;
+	case DEBUG_TRISTATE_OFF: return false;
+	case DEBUG_TRISTATE_AUTO:
+	default: return oxr_vk_host_is_translation_layer();
+	}
+}
+
+/*!
+ * Copy @p in to @p out without the Linux window-system surface extension names.
+ * VK_KHR_surface stays: every host knows it.
+ */
+static void
+oxr_vk_strip_linux_wsi(const char *in, char *out, size_t out_size)
+{
+	static const char *const drop[] = {"VK_KHR_xcb_surface", "VK_KHR_wayland_surface"};
+	size_t o = 0;
+	out[0] = '\0';
+	const char *p = in;
+	while (*p != '\0') {
+		while (*p == ' ') {
+			p++;
+		}
+		const char *start = p;
+		while (*p != '\0' && *p != ' ') {
+			p++;
+		}
+		size_t len = (size_t)(p - start);
+		if (len == 0) {
+			break;
+		}
+		bool skip = false;
+		for (size_t i = 0; i < ARRAY_SIZE(drop); i++) {
+			if (strlen(drop[i]) == len && strncmp(drop[i], start, len) == 0) {
+				skip = true;
+			}
+		}
+		if (skip || o + len + 2 > out_size) {
+			continue;
+		}
+		if (o > 0) {
+			out[o++] = ' ';
+		}
+		memcpy(out + o, start, len);
+		o += len;
+		out[o] = '\0';
+	}
+}
+#endif
+
 XrResult
 oxr_vk_get_instance_exts(struct oxr_logger *log,
                          struct oxr_system *sys,
@@ -83,10 +184,36 @@ oxr_vk_get_instance_exts(struct oxr_logger *log,
                          uint32_t *namesCountOutput,
                          char *namesString)
 {
-	size_t length = strlen(xrt_gfx_vk_instance_extensions) + 1;
+	const char *exts = xrt_gfx_vk_instance_extensions;
 
-	OXR_TWO_CALL_HELPER(log, namesCapacityInput, namesCountOutput, namesString, length,
-	                    xrt_gfx_vk_instance_extensions, XR_SUCCESS);
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*
+	 * An enable1 app must enable this string verbatim. Inside a Windows-API
+	 * translation layer the app's VkInstance is created by the layer's own
+	 * Vulkan thunks, which cannot enable the Linux surface extensions, so
+	 * vkCreateInstance fails with VK_ERROR_EXTENSION_NOT_PRESENT and the app
+	 * sees XR_ERROR_RUNTIME_UNAVAILABLE. The hosted window still presents: the
+	 * native target falls back to an Xlib surface over the same X11 window
+	 * when the instance has no VK_KHR_xcb_surface (#2322).
+	 */
+	char filtered[512];
+	if (oxr_vk_enable1_drop_linux_wsi()) {
+		oxr_vk_strip_linux_wsi(exts, filtered, sizeof(filtered));
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			oxr_warn(log,
+			         "enable1 instance extensions without the Linux surface names "
+			         "(translation-layer host or DXR_VK_ENABLE1_NO_LINUX_WSI=1): %s",
+			         filtered);
+		}
+		exts = filtered;
+	}
+#endif
+
+	size_t length = strlen(exts) + 1;
+
+	OXR_TWO_CALL_HELPER(log, namesCapacityInput, namesCountOutput, namesString, length, exts, XR_SUCCESS);
 }
 
 /*!
