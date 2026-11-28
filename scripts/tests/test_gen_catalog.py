@@ -500,6 +500,98 @@ class Schema2Validation(unittest.TestCase):
         self.assertIn("listing.url must be an https URL", self.problems())
 
 
+# --------------------------------------------------------------------------- §5.6.6 model builder
+
+def builder_item(**over) -> dict:
+    """The model builder as build_catalog_v2 lists it, with an asset."""
+    item = {
+        "id": "open-conversion-model-builder",
+        "class": "model_builder",
+        "registered_id": "open-model-builder",
+        "name": "Model builder",
+        "publisher": "displayxr",
+        "version": "1.0.0",
+        "research": True,
+        "license": {"class": "open", "spdx": "BSL-1.0"},
+        "assets": {"windows-x64": gen_catalog.v2_asset(win(
+            "DisplayXRModelBuilderSetup-1.0.0.exe", "1.0.0", SHA_C, ["/S"],
+            "HKLM\\Software\\DisplayXR\\ModelBuilders\\open-model-builder\\Version"))},
+    }
+    item.update(over)
+    return item
+
+
+class ModelBuilderItem(unittest.TestCase):
+    def setUp(self):
+        self.v2 = gen_catalog.build_catalog_v2(v1_fixture())
+        self.v2["items"].append(builder_item())
+
+    def problems(self, forbidden=None) -> str:
+        return "\n".join(gen_catalog.validate_v2(self.v2, forbidden))
+
+    def test_builder_item_is_valid(self):
+        self.assertEqual(gen_catalog.validate_v2(self.v2), [])
+
+    def test_class_needs_registered_id(self):
+        del self.v2["items"][-1]["registered_id"]
+        self.assertIn("class model_builder needs registered_id", self.problems())
+
+    def test_research_forbids_recommended_and_detect(self):
+        self.v2["items"][-1]["recommended"] = True
+        self.v2["items"][-1]["detect"] = [{"kind": "edid", "man": 1, "prod": 2, "confidence": "high"}]
+        text = self.problems()
+        self.assertIn("a research item must not be recommended", text)
+        self.assertIn("a research item must not carry detect rules", text)
+
+    def test_model_builder_must_be_research(self):
+        del self.v2["items"][-1]["research"]
+        self.assertIn("a model_builder item must be research: true", self.problems())
+        self.v2["items"][-1]["research"] = "yes"
+        self.assertIn("research must be true or false", self.problems())
+
+    def test_research_is_allowed_on_other_classes_too(self):
+        self.v2["items"][2]["research"] = True
+        self.assertEqual(gen_catalog.validate_v2(self.v2), [])
+
+    def test_an_asset_that_is_a_pack_file_or_source_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pack = Path(tmp) / "dxr-open-sharp.models.json"
+            pack.write_text(json.dumps({
+                "schema": 2, "pack": "dxr-open-sharp", "models": [{
+                    "name": "sharp", "variants": [{"files": [{"sha256": SHA_A.upper(), "size": 1}]}],
+                    "local_build": {"sources": [{"role": "checkpoint", "sha256": SHA_C, "size": 2}]},
+                }],
+            }))
+            hashes = gen_catalog.pack_hashes([tmp])
+        self.assertEqual(hashes[SHA_A], "dxr-open-sharp/sharp file")
+        self.assertEqual(hashes[SHA_C], "dxr-open-sharp/sharp source 'checkpoint'")
+        # The builder's own asset hashes to the pack's checkpoint: refused.
+        text = self.problems(hashes)
+        self.assertIn("open-conversion-model-builder", text)
+        self.assertIn("source 'checkpoint'", text)
+        # The runtime's asset hashes to a model file: refused too.
+        self.assertIn("sharp file", text)
+        self.assertEqual(gen_catalog.validate_v2(self.v2, {"d" * 64: "elsewhere"}), [])
+
+    def test_derivation_writes_research_and_never_recommended(self):
+        meta = gen_catalog.V2_ITEMS["model_builder"]
+        self.assertTrue(meta["research"])
+        self.assertNotIn("recommended", meta)
+        v1 = v1_fixture()
+        extra = {"model_builder": {"recommended": "1.0.0", "windows": win(
+            "DisplayXRModelBuilderSetup-1.0.0.exe", "1.0.0", SHA_C, ["/S"],
+            "HKLM\\Software\\DisplayXR\\ModelBuilders\\open-model-builder\\Version")}}
+        v2 = gen_catalog.build_catalog_v2(v1, extra=extra)
+        item = [i for i in v2["items"] if i["id"] == "open-conversion-model-builder"][0]
+        self.assertIs(item["research"], True)
+        self.assertNotIn("recommended", item)
+        self.assertNotIn("detect", item)
+        self.assertEqual(item["class"], "model_builder")
+        self.assertEqual(item["license"], {"class": "open", "spdx": "BSL-1.0"})
+        self.assertEqual(gen_catalog.validate_v2(v2), [])
+        self.assertEqual(gen_catalog.RESEARCH_BADGE, "Research preview (non-commercial)")
+
+
 # --------------------------------------------------------------------------- #2737
 
 MANIFEST = {

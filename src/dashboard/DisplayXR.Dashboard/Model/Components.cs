@@ -324,7 +324,7 @@ public sealed record ComponentItem(string Name, Level Level, IReadOnlyList<(stri
                                    RegisteredController? Controller = null, PolicyRow? Policy = null, string? Id = null,
                                    bool BuiltIn = false, IReadOnlyList<(string Label, string Text)>? Facts = null,
                                    PlainState State = PlainState.None, string? Summary = null,
-                                   IReadOnlyList<(string Label, string Text)>? LineFacts = null)
+                                   IReadOnlyList<(string Label, string Text)>? LineFacts = null, string? Badge = null)
 {
     /// <summary>What the row's Details lists, label by label: its state facts, then its technical lines.</summary>
     public IReadOnlyList<(string Label, string Text)> DetailFacts =>

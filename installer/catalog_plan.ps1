@@ -262,6 +262,13 @@ foreach ($r in @($rows)) {
 
     $detected = ([string](Get-Prop $r 'detected')) -eq 'high'
     $recommended = (Get-Prop $r 'recommended') -eq $true
+    # A research item (`research: true`, the model builder; conversion-provider-
+    # discovery.md section 5.6.6) is never pre-ticked: not by `recommended`, not by
+    # detection, not by the installed-update rule, not by a keyword. Only its own
+    # id in -Select ticks it. dxr-get already reports it neither recommended nor
+    # detected; this does not rely on that.
+    $research = (Get-Prop $r 'research') -eq $true
+    if ($research) { $recommended = $false; $detected = $false }
 
     $selectable = ($status -eq 'missing' -or $status -eq 'outdated')
     # On this machine now. An unavailable row can be an installed item whose
@@ -273,7 +280,7 @@ foreach ($r in @($rows)) {
         if ($wantRecommended -and $recommended) { $selected = $true }
         if ($wantDetected -and $detected) { $selected = $true }
         # Already installed => ticked: the update comes with the runtime.
-        if ($wantInstalled -and $status -eq 'outdated' -and -not $selected) { $selected = $true; $keptForUpdate = $true }
+        if ($wantInstalled -and $status -eq 'outdated' -and -not $selected -and -not $research) { $selected = $true; $keptForUpdate = $true }
         foreach ($n in $names) { if ($wantIds -contains $n) { $selected = $true } }
     }
 
@@ -288,6 +295,7 @@ foreach ($r in @($rows)) {
     # one version, the one it ends up with; the version an update replaces is
     # in the description. Nothing left to fetch reads "cached".
     $nm = Clean $name 80
+    if ($research) { $nm = "$nm (research preview)" }
     switch ($status) {
         'current' { $label = Fit-Label 'Installed - ' $nm " $installed" }
         'outdated' { $label = Fit-Label $(if ($sizeText) { "Update, $sizeText - " } else { 'Update, cached - ' }) $nm " $target" }
@@ -309,6 +317,8 @@ foreach ($r in @($rows)) {
         if ($unmet.Count -gt 0) { $desc = "Also needs, and does not install: $($unmet -join ', ') (not found). $desc" }
         if ($detected) { $desc = "Matching hardware was detected. $desc" }
         elseif ($recommended) { $desc = "Recommended. $desc" }
+        # The badge first. Installing the builder builds nothing and downloads no model.
+        if ($research) { $desc = "Research preview (non-commercial). Installs the builder only. $desc" }
         # The row shows the new version only; the one it replaces is here.
         if ($keptForUpdate) { $desc = "Updates the installed $installed. Clear the box to keep that version. $desc" }
         elseif ($status -eq 'outdated') { $desc = "Updates the installed $installed. $desc" }

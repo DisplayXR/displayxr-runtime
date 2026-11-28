@@ -64,6 +64,11 @@ static const struct
     {"tracking_provider", "TrackingProviders", true},
     {"workspace_controller", "WorkspaceControllers", true},
     {"companion", "PoseConsumers", true},
+    // §5.6.6 (conversion-provider-discovery.md): a signed tool the CLI runs on the
+    // user's request to build a research-only model. Registered under
+    // ModelBuilders\<id> (its `Version` value is how an install is recognised);
+    // neither the runtime nor the service loads it.
+    {"model_builder", "ModelBuilders", false},
     {"app", NULL, false},
     {"sdk", NULL, false},
 };
@@ -339,6 +344,12 @@ const char *
 dxr_item_class(const cJSON *item)
 {
 	return jstr(item, "class");
+}
+
+bool
+dxr_item_research(const cJSON *item)
+{
+	return cJSON_IsTrue(item != NULL ? cJSON_GetObjectItemCaseSensitive(item, "research") : NULL);
 }
 
 const char *
@@ -1217,7 +1228,10 @@ build_plan(const struct dxr_catalog *c,
 		cJSON_ArrayForEach(it, c->items)
 		{
 			char why[256];
+			// A research item is never selected without being asked for by name
+			// (§5.6.6), whatever its catalog entry says about detection.
 			if (it == x || it == b->runtime || dxr_item_find(c, dxr_item_id(it)) != it ||
+			    dxr_item_research(it) ||
 			    !dxr_detect_rules(jarr(it, "detect"), env, true, why, sizeof(why))) {
 				continue;
 			}
@@ -1373,6 +1387,12 @@ dxr_make_default_plan(const struct dxr_catalog *c,
 		const cJSON *rec = cJSON_GetObjectItemCaseSensitive(it, "recommended");
 		char why[200];
 		if (id == NULL || dxr_item_find(c, id) != it || it == dxr_runtime_item(c) || n >= DXR_MAX_STEPS) {
+			continue;
+		}
+		// §5.6.6: a research item (`research: true`, the model builder) is never
+		// in the default set: not recommended, not by detection, even if a
+		// catalog says so. It installs only when the user names it.
+		if (dxr_item_research(it)) {
 			continue;
 		}
 		// Hardware evidence outranks the recommendation as the stated reason.
@@ -1628,10 +1648,17 @@ dxr_list_catalog(const struct dxr_catalog *c, const struct dxr_env *env, bool ou
 		}
 		const cJSON *aliases = jarr(it, "aliases");
 		cJSON_AddItemToObject(x, "aliases", aliases ? cJSON_Duplicate(aliases, 1) : cJSON_CreateArray());
+		// §5.6.6: a research item is never pre-ticked: not recommended, never
+		// "detected", and it carries the badge a setup page shows.
+		const bool research = dxr_item_research(it);
 		cJSON_AddBoolToObject(x, "recommended",
-		                      cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(it, "recommended")));
+		                      !research && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(it, "recommended")));
+		cJSON_AddBoolToObject(x, "research", research);
+		if (research) {
+			cJSON_AddStringToObject(x, "badge", DXR_RESEARCH_BADGE);
+		}
 		char why[256];
-		const cJSON *rules = jarr(it, "detect");
+		const cJSON *rules = research ? NULL : jarr(it, "detect");
 		const bool high = dxr_detect_rules(rules, env, true, why, sizeof(why));
 		const bool any = high || dxr_detect_rules(rules, env, false, why, sizeof(why));
 		cJSON_AddStringToObject(x, "detected", high ? "high" : (any ? "low" : "none"));

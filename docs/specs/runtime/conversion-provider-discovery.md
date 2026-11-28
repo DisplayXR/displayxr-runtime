@@ -1173,8 +1173,9 @@ variant's files), `local_build` {`recipe`, `variant`, `tool` {`id`, `catalog_id`
 `machine` {`phys_mb`, `free_mb`, `os`, `os_version`}, the store volume's free space).
 
 - **Badge:** `Research preview (non-commercial)`. Title: the model name; a line "Built on this PC
-  from the official file. DisplayXR does not host this model." and "Model and licence by <source
-  licence `name`'s owner>, licence: `license.link`" (shown as a link).
+  from the official file. DisplayXR does not host this model." and "Model and licence: <source
+  licence `name`>" with `license.link` as a link. (The pack names no licence owner as a field,
+  so the row quotes the licence's own name rather than deriving an owner from it.)
 - **Facts:** Download (sum of `sources[].size`), Space needed while building (`needs.disk_mb`),
   Memory needed to build (`needs.ram_mb`), Size when installed (sum of the model's files), Licence
   (`name`).
@@ -1185,8 +1186,13 @@ variant's files), `local_build` {`recipe`, `variant`, `tool` {`id`, `catalog_id`
   this licence. I will use this model for non-commercial research only, and I allow DisplayXR to use
   research-only models on this account."*
 - **Actions:** no builder installed → **Get the builder** (installs `tool.catalog_id` through the
-  catalog, §5.6.6); else **Build** (enabled only when ticked, the machine meets `needs`, and the
-  gate can be turned on); while running, **Cancel**; when installed, **Remove**.
+  catalog, §5.6.6); a builder below `tool.min_version` → **Update the builder**; else **Build**
+  (enabled only when ticked, the machine meets `needs`, and the gate can be turned on); while
+  running, **Cancel**; when installed, **Remove**. With the tick, Build runs `conv research on`
+  and then `conv models fetch <pack> --model <name> --accept-license <id> --events`; the tick is
+  shown again whenever this user's record for this text **or** the gate is missing (a new text,
+  or the gate turned off in Settings since). The builder's catalog row sits in the same section
+  with the badge; with no such section it is listed with the apps.
 - **Progress:** from `--events`: "Downloading the official file: X of Y MB", then "Converting on
   this PC: step n of m (<phase>)", then "Checking and storing". Percent from `done / total` when
   `total` > 0, else an indeterminate bar.
@@ -1229,7 +1235,10 @@ variant's files), `local_build` {`recipe`, `variant`, `tool` {`id`, `catalog_id`
   nothing and never writes `AllowResearchOnly` or an acceptance record.
 - **No model weights, sources or derived files are ever a catalog asset or inside one.** The
   catalog generator's `verify` refuses an asset whose sha256 equals any registered pack file or
-  `sources[]` sha256, and the builder's CI asserts that no file in its installer does.
+  `sources[]` sha256, and the builder's CI asserts that no file in its installer does. As built
+  the generator has no registry of packs: they are passed to it, `gen_catalog.py generate|verify
+  --pack <manifest|dir>` (repeatable), and the check covers every item asset and every external
+  prerequisite's asset.
 - The runtime bundle and `versions.json`: the builder is **not** in the default bundle; whether it
   gets a `versions.json` field follows the membership rule there (an installable released asset),
   added by its first release, opt-in like `--with browser`.

@@ -162,6 +162,17 @@ dxr_runtime_item(const struct dxr_catalog *c);
 bool
 dxr_class_is_loaded(const char *item_class);
 
+//! The badge a front end shows on a `research: true` item (conversion-provider-discovery.md §5.6.6).
+#define DXR_RESEARCH_BADGE "Research preview (non-commercial)"
+
+/*!
+ * `research: true` (§5.6.6): the item installs only when named. Never in
+ * `install --default` or an `ensure-for` hardware pass, never "recommended" or
+ * "detected" in `list --json`, whatever else its entry says.
+ */
+bool
+dxr_item_research(const cJSON *item);
+
 //! Registry value holding the item's installed version. false when the catalog does not say.
 bool
 dxr_installed_path(const cJSON *item, char *out, size_t out_size);

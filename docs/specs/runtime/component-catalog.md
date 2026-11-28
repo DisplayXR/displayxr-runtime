@@ -237,8 +237,8 @@ every component class, on several platforms.
 |---|---|---|
 | `id` | yes | catalog id, `[a-z0-9][a-z0-9-]*`, or `<publisher-id>.<name>` for a third-party item. Unique across `id` and `aliases` of the whole document. Never reused |
 | `aliases` | no | other names a client accepts for this item. The first-party items carry their schema-1 component name here (`leia-sr` ← `leia_plugin`), so `ensure-for leia_plugin` keeps resolving |
-| `class` | yes | `runtime`, `display_processor`, `input_provider`, `conversion_provider`, `tracking_provider`, `workspace_controller`, `companion`, `app`, `sdk`. A client skips an item whose class it does not know |
-| `registered_id` | for the six registered classes | the id the component registers under in its class root (`DisplayProcessors\<id>`, `InputProviders\<id>`, `ConversionProviders\<id>`, `TrackingProviders\<id>`, `WorkspaceControllers\<id>`; POSIX: the manifest `id`). It is what `displayxr-cli <class> list` shows, and how a client joins a catalog item to an installed component |
+| `class` | yes | `runtime`, `display_processor`, `input_provider`, `conversion_provider`, `tracking_provider`, `workspace_controller`, `companion`, `model_builder`, `app`, `sdk`. A client skips an item whose class it does not know. `model_builder` (conversion-provider-discovery.md §5.6.6) is the signed tool `conv models fetch` runs to build a research-only model on the user's machine; it registers under `ModelBuilders\<id>` and is always a `research` item |
+| `registered_id` | for the seven registered classes | the id the component registers under in its class root (`DisplayProcessors\<id>`, `InputProviders\<id>`, `ConversionProviders\<id>`, `TrackingProviders\<id>`, `WorkspaceControllers\<id>`, `ModelBuilders\<id>`; POSIX: the manifest `id`). It is what `displayxr-cli <class> list` shows, and how a client joins a catalog item to an installed component |
 | `also_provides` | no | `[{ "class", "registered_id" }]` for a plug-in that carries components of more than one class (ADR-054 §5) |
 | `name` | yes | display name |
 | `summary` | no | one line, plain text, at most 200 characters |
@@ -254,6 +254,7 @@ every component class, on several platforms.
 | `license` | no | see § Licence. Absent = no statement; a client shows "see publisher" |
 | `detect` | no | array of rules, as schema 1's `leia_plugin.detect`, for any item. A `high`-confidence match pre-ticks the item in a setup UI and lets `ensure-for` install it unattended; a `low` one is reported only |
 | `recommended` | no | `true` puts the item in the recommended set a setup UI pre-ticks without a hardware match (the open conversion provider) |
+| `research` | no | `true` (conversion-provider-discovery.md §5.6.6): the item exists for research-only use. A client shows the badge `Research preview (non-commercial)` and **never selects it on its own**: it is not in `install --default`, not in an `ensure-for` hardware pass, never pre-ticked, never reported recommended or detected, whatever else the entry says. It forbids `recommended` and `detect` (the generator's `validate_v2` refuses them), and `model_builder` items must carry it. Installing such an item lays down its own files and registration only |
 | `links` | no | `{ "homepage", "support", "privacy", "eula", "source", "listing" }`, each `https`. `listing` is the target of a link-out item |
 
 **Platforms.** `windows-x64`, `linux-x86_64`, `macos-universal`, `android-arm64`. A client

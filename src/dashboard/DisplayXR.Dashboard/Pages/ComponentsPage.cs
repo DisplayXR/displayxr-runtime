@@ -56,6 +56,7 @@ public sealed class ComponentsPage : Page
         // ADR-054 N3e: the policy rows behind the Enabled / Preferred controls.
         foreach (var c in ComponentClasses.All) _ = Ctx.LoadPolicyAsync(c);
         _ = Ctx.LoadCatalogAsync();
+        _ = Ctx.LoadModelBuildsAsync(); // §5.6.5: the buildable models' rows
         _tick ??= new DispatcherTimer(TimeSpan.FromSeconds(1), DispatcherPriority.Background, (_, _) => UpdateInPlace());
         _tick.Start();
     }
@@ -93,6 +94,13 @@ public sealed class ComponentsPage : Page
         Launch.UpdateInPlace();
         if (_elapsed is not null && Ctx.CatalogOp is { } op)
             _elapsed.Text = CatalogText.Elapsed(DateTime.Now - op.Started);
+        // A build's progress moves without a rebuild (a rebuild would scroll the licence text back up).
+        if (Ctx.BuildNow is { } bp && _buildText is not null && _buildBar is not null)
+        {
+            _buildText.Text = bp.Text;
+            _buildBar.IsIndeterminate = bp.Fraction is null;
+            if (bp.Fraction is { } f) _buildBar.Value = f * 100;
+        }
     }
 
     private IReadOnlyList<ComponentSection> Sections() =>
@@ -198,6 +206,18 @@ public sealed class ComponentsPage : Page
         sb.Append(Ctx.CatalogBackground?.ItemId);
         if (Ctx.CatalogResult is { } res) sb.Append(res.ItemId).Append(res.Outcome.Title);
         sb.Append(Ctx.ActivatingItem).Append(Ctx.BuyStarting).Append(Ctx.BuyPending?.ItemId);
+        // §5.6.5: the buildable rows' inputs (the progress text itself is updated in place).
+        if (Ctx.ModelBuilds is { } mb)
+        {
+            sb.Append(mb.AllowResearchOnly).Append(mb.ResearchLockedOff).Append(mb.PhysMb).Append(mb.FreeMb);
+            foreach (var m in mb.Models)
+            {
+                sb.Append(m.Key).Append(m.Installed).Append(m.ToolInstalled).Append(m.ToolCurrent).Append(m.LicenceAccepted)
+                  .Append(Ctx.BuildTicked(m.Key)).Append(Ctx.BuildResultOf(m.Key)?.Result);
+                foreach (var l in m.Licences) sb.Append(l.Accepted).Append(l.AcceptedAt);
+            }
+        }
+        sb.Append(Ctx.BuildingKey).Append(Ctx.BuildNow?.Fraction is null).Append('|');
         if (Ctx.BuyNote is { } bn) sb.Append(bn.ItemId).Append(bn.Plan.Kind).Append(bn.Plan.Title);
         if (Ctx.ActivationResult is { } ar) sb.Append(ar.ItemId).Append(ar.Outcome.Title);
         sb.Append('|');
@@ -251,7 +271,12 @@ public sealed class ComponentsPage : Page
             page.Children.Add(U.Wrapped(_filter != RowFilter.Updates ? "Nothing to show."
                 : CatalogLive ? "Everything is up to date." : "Updates are listed when DisplayXR can check for them.", "empty"));
         // One section per row, full width: a two-column grid stretched a short card beside a tall one.
+        _buildText = null;
+        _buildBar = null;
         foreach (var g in groups) page.Children.Add(SectionCard(g));
+        // §5.6.5: with no 2D-to-3D models section to sit in, the buildable models have a card of their own.
+        if (!groups.Any(g => g.Section.Id == "conversion_models") && BuildRows() is { } alone)
+            page.Children.Add(U.Card(U.VStack(14, U.Text("2D-to-3D models", "group"), alone)));
         return page;
     }
 
@@ -354,6 +379,8 @@ public sealed class ComponentsPage : Page
         // ADR-054 N6 Part 2: per screen, whose eyes the views follow and the display's viewer policy.
         if (s.Id == ComponentClass.Tracking.SectionId())
             body.Children.Add(TrackingScreensTable());
+        // §5.6.5: the models this PC can build itself.
+        if (s.Id == "conversion_models" && BuildRows() is { } builds) body.Children.Add(builds);
         return U.Card(body);
     }
 
@@ -646,6 +673,8 @@ public sealed class ComponentsPage : Page
         if (face.Status is { } st) U.AddFlow(head, U.Chip(st.Text, st.Level), 6, 4);
         if (face.State is { } state) U.AddFlow(head, U.Chip(state.Text, state.Level), 6, 4);
         if (face.WorksWithDisplay) U.AddFlow(head, U.Chip("Works with your display", Level.Ok), 6, 4);
+        // §5.6.6: "Research preview (non-commercial)" on a research item (the model builder).
+        if (item.Badge is { Length: > 0 } badge) U.AddFlow(head, U.Chip(badge, Level.Info), 6, 4);
         var col = U.VStack(2, head);
         if (item.Summary is { Length: > 0 } summary) col.Children.Add(U.Wrapped(summary, "soft"));
         var g = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*") };
@@ -969,7 +998,7 @@ public sealed class ComponentsPage : Page
         if (i.Publisher.Length > 0) lines.Add($"By {i.Publisher}");
         // The face line is what it does; the publisher is in Details.
         return new ComponentItem(i.Name, row.Status == RowStatus.Available ? Level.Plain : Level.Ok,
-                                 Array.Empty<(string, Level)>(), lines, Summary: CatalogText.About(i));
+                                 Array.Empty<(string, Level)>(), lines, Summary: CatalogText.About(i), Badge: i.ResearchBadge);
     }
 
     /// <summary>
@@ -1099,6 +1128,139 @@ public sealed class ComponentsPage : Page
         if (SafeUrl.TryHttps(url, out var u)) ToolTip.SetTip(b, $"Opens {u!.Host} in your browser");
         else b.IsEnabled = false;
         return b;
+    }
+
+    // ── Locally built models (conversion-provider-discovery.md §5.6.5) ─────
+
+    private TextBlock? _buildText;
+    private ProgressBar? _buildBar;
+
+    /// <summary>One row per buildable model: badge, what it is, its facts, the licence text, the tick, the action.</summary>
+    private Control? BuildRows()
+    {
+        if (Ctx.ModelBuilds is not { Models.Count: > 0 } list) return null;
+        var col = U.VStack(18);
+        foreach (var m in list.Models)
+        {
+            var row = ModelBuildRow.For(m, list, Ctx.BuildTicked(m.Key), Ctx.BuildingKey == m.Key, ModelBuildRow.ReadFile,
+                                        ModelBuildRow.DriveOf(list.StoreRoot));
+            col.Children.Add(BuildRow(row, list));
+        }
+        return col;
+    }
+
+    private Control BuildRow(ModelBuildRow r, ModelBuildList list)
+    {
+        var m = r.Model;
+        var name = U.Wrapped(r.Title, "value");
+        name.FontWeight = FontWeight.SemiBold;
+        var head = U.Flow(8, 4, name);
+        U.AddFlow(head, U.Chip(r.Badge, Level.Info), 6, 4);
+        if (m.Installed) U.AddFlow(head, U.Chip("Installed", Level.Ok), 6, 4);
+        var col = U.VStack(8, head);
+        col.Children.Add(U.Wrapped(r.Lines[0], "soft"));
+        foreach (var l in m.Licences)
+        {
+            var line = U.Flow(6, 2, U.Wrapped($"Model and licence: {l.Name}", "soft"));
+            if (l.Link.Length > 0) U.AddFlow(line, LinkButton("Licence", l.Link, "link"), 6, 2);
+            col.Children.Add(line);
+        }
+        var facts = new U.KvList(210);
+        foreach (var (label, value) in r.Facts) facts.Add(label, value);
+        col.Children.Add(facts);
+
+        // The licence text, in full, scrollable; only once its hash matched the pack's.
+        if (r.LicenceText is { } text)
+        {
+            var box = new TextBox
+            {
+                Text = text, IsReadOnly = true, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true,
+                MaxHeight = 180, FontSize = 12,
+            };
+            AutomationProperties.SetName(box, $"Licence text for {m.Name}");
+            col.Children.Add(box);
+        }
+        else col.Children.Add(U.Notice(Level.Warn, ModelBuildRow.UnverifiedText, "Nothing can be built until it is."));
+
+        // The tick: never pre-ticked; its words say it also turns on research-only models.
+        if (r.TickShown)
+        {
+            var tick = new CheckBox
+            {
+                Content = U.Wrapped(r.TickText, "value"), IsChecked = Ctx.BuildTicked(m.Key),
+                IsEnabled = Ctx.BuildingKey is null,
+            };
+            AutomationProperties.SetName(tick, r.TickText);
+            tick.IsCheckedChanged += (_, _) => Ctx.SetBuildTicked(m.Key, tick.IsChecked == true);
+            col.Children.Add(tick);
+        }
+        if (r.AcceptedLine is { } accepted)
+        {
+            var line = U.Flow(8, 2, U.Wrapped(accepted, "soft"));
+            if (r.WithdrawLicence is { } wl)
+            {
+                var w = U.Button("Withdraw", () => _ = Ctx.WithdrawLicenceAsync(wl), "link");
+                w.IsEnabled = Ctx.BuildingKey is null && !Ctx.ActionRunning;
+                ToolTip.SetTip(w, "Withdraws your acceptance. The model is no longer used on this account; its files stay until you remove them.");
+                U.AddFlow(line, w, 8, 2);
+            }
+            col.Children.Add(line);
+        }
+        if (r.Blocker is { } why)
+            col.Children.Add(list.ResearchLockedOff ? U.Notice(Level.Info, why, "") : U.Wrapped(why, "meta"));
+
+        // The one action the row offers now.
+        var actions = U.Flow(8, 6);
+        foreach (var a in r.Actions)
+        {
+            Button? b = a switch
+            {
+                ModelBuildAction.GetBuilder => U.Button("Get the builder", () => _ = Ctx.GetBuilderAsync(m), "primary", "sm"),
+                ModelBuildAction.UpdateBuilder => U.Button("Update the builder", () => _ = Ctx.GetBuilderAsync(m), "primary", "sm"),
+                ModelBuildAction.Build => U.Button("Build", () => _ = Ctx.StartBuildAsync(m), "primary", "sm"),
+                ModelBuildAction.Cancel => U.Button("Cancel", () => _ = Ctx.CancelBuildAsync(m), "outline", "sm"),
+                ModelBuildAction.Remove => U.Button("Remove", () => _ = Ctx.RemoveBuiltModelAsync(m), "outline", "sm"),
+                _ => null,
+            };
+            if (b is null) continue;
+            b.IsEnabled = a switch
+            {
+                ModelBuildAction.Build => r.BuildEnabled && Ctx.BuildingKey is null && !Ctx.CatalogBusy,
+                ModelBuildAction.Cancel => true,
+                ModelBuildAction.GetBuilder or ModelBuildAction.UpdateBuilder => !Ctx.CatalogBusy,
+                _ => Ctx.BuildingKey is null && !Ctx.ActionRunning,
+            };
+            AutomationProperties.SetName(b, $"{b.Content} {m.Name}");
+            U.AddFlow(actions, b, 8, 6);
+        }
+        if (actions.Children.Count > 0) col.Children.Add(actions);
+
+        // While it builds: one line and a bar, updated in place.
+        if (Ctx.BuildingKey == m.Key && Ctx.BuildNow is { } bp)
+        {
+            _buildText = U.Text(bp.Text, "value");
+            _buildBar = new ProgressBar { IsIndeterminate = bp.Fraction is null, Minimum = 0, Maximum = 100, Height = 4,
+                                          Value = (bp.Fraction ?? 0) * 100 };
+            AutomationProperties.SetName(_buildBar, $"Building {m.Name}");
+            var box = new Border { Child = U.VStack(8, _buildText, _buildBar) };
+            box.Classes.Add("field");
+            AutomationProperties.SetLiveSetting(box, AutomationLiveSetting.Polite);
+            col.Children.Add(box);
+        }
+        // How the last build ended: one message per result, dismissed with OK; a success is one quiet line.
+        else if (Ctx.BuildResultOf(m.Key) is { Result: { } result } done)
+        {
+            if (ModelBuildMessages.For(result, ModelBuildRow.DriveOf(list.StoreRoot), m.NeedsDiskMb, done.Log) is { } msg)
+            {
+                var n = U.Notice(msg.Level, msg.Text, done.Hint ?? "", U.Button("OK", () => Ctx.DismissBuildResult(m.Key), "quiet", "sm"));
+                AutomationProperties.SetLiveSetting(n, AutomationLiveSetting.Polite);
+                col.Children.Add(n);
+            }
+            else col.Children.Add(U.Wrapped(result == "ok" ? "Already installed." : "Built and installed on this PC.", "soft"));
+        }
+        var card = new Border { Child = col };
+        card.Classes.Add("field");
+        return card;
     }
 
     /// <summary>What is happening to this item now, or how the last thing ended, on its own row. Never both, never a stale spinner.</summary>
