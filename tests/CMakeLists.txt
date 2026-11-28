@@ -65,6 +65,7 @@ set(tests
     tests_cli_conv_warm_plan
     tests_cli_lever_catalog
     tests_cli_input_predict
+    tests_ipc_macos_keys
     tests_cli_dp_predict
     tests_cli_option_parse
     tests_component_setting_status
@@ -1568,6 +1569,11 @@ target_include_directories(
 	tests_cli_input_predict PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
 	)
 target_link_libraries(tests_cli_input_predict PRIVATE xrt-interfaces)
+
+# #2782: the macOS AppKit pump's key character -> Win32 VK code mapping. Plain C
+# with no AppKit dependency, so it runs on every platform.
+target_sources(tests_ipc_macos_keys PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/ipc/server/ipc_server_macos_keys.c)
+target_include_directories(tests_ipc_macos_keys PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/ipc/server)
 
 # N3b (ADR-054): the `dp list` twin — PreferredPlugin over ProbeOrder among
 # ENABLED plug-ins, a disabled one never predicted (the fallback takes over),
