@@ -5,50 +5,5 @@
     "INV-4.2",
     "INV-4.9"
   ],
-  "known": [
-    {
-      "app": "test_apps/cube_handle_vk_linux",
-      "rule": "INV-4.2"
-    },
-    {
-      "app": "test_apps/handle/cube_handle_gl_macos",
-      "rule": "INV-4.2"
-    },
-    {
-      "app": "test_apps/handle/cube_handle_metal_macos",
-      "rule": "INV-4.2"
-    },
-    {
-      "app": "test_apps/handle/cube_handle_vk_android",
-      "rule": "INV-4.2"
-    },
-    {
-      "app": "test_apps/handle/cube_handle_vk_macos",
-      "rule": "INV-4.2"
-    },
-    {
-      "app": "test_apps/handle/cube_zones_metal_macos",
-      "rule": "INV-4.2"
-    },
-    {
-      "app": "test_apps/handle/cube_zones_vk_macos",
-      "rule": "INV-4.2"
-    },
-    {
-      "app": "test_apps/hosted/cube_hosted_metal_macos",
-      "rule": "INV-4.2"
-    },
-    {
-      "app": "test_apps/texture/cube_zones_texture_gl_macos",
-      "rule": "INV-4.2"
-    },
-    {
-      "app": "test_apps/texture/cube_zones_texture_metal_macos",
-      "rule": "INV-4.2"
-    },
-    {
-      "app": "test_apps/zones/cube_zones_vk_android",
-      "rule": "INV-4.2"
-    }
-  ]
+  "known": []
 }
