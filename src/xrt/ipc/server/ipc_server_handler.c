@@ -3786,13 +3786,16 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 		eyes.is_tracking = session_tracking_or(ics, &((struct ipc_client_state *)ics)->tracking_any_locate,
 		                                       u_tracking_dp_viewer_present(&eyes));
 	}
-#elif defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
-	// macOS / desktop-Linux null+comp_multi service: THIS client's DP — its per-session DP,
-	// else its weave engine's (vk or Metal backend), the same eye source
-	// ipc_try_get_oop_view_poses uses for its views. Without this branch a
-	// macOS IPC session's XrViewEyeTrackingStateDXR.isTracking was constant
-	// FALSE (and the tracking-state edge event never fired) even while its
-	// located views and the weave itself tracked the head.
+#elif defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_ANDROID)
+	// macOS / desktop-Linux / Android comp_multi service: THIS client's DP — its
+	// per-session DP, else its weave engine's (vk or Metal backend), the same eye
+	// source ipc_try_get_oop_view_poses uses for its views. Without this branch an
+	// IPC session's XrViewEyeTrackingStateDXR.isTracking was constant FALSE (and
+	// the tracking-state edge event never fired) even while its located views and
+	// the weave itself tracked the head: the reply's eyes.valid=false made the
+	// client's fetch return false, so the derived value stayed at its default.
+	// Android was the last platform on the #else arm below: every
+	// Android IPC app read isTracking FALSE on a tracking Leia panel.
 	if (ics->xc != NULL) {
 		// N6 Part 1 (#2144): at the client's target time.
 		const bool have_dp = multi_compositor_get_eye_positions_at(multi_compositor(ics->xc), target_ns, &eyes);
