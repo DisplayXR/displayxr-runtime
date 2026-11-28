@@ -55,6 +55,7 @@ fi
 
 rm -f "$DP_ROOT/200-sim-display.json"
 rm -f "$DP_ROOT/200-sim-input-input-provider.json" "$DP_ROOT/250-sim-conversion-conversion-provider.json"
+rm -f "$DP_ROOT/150-gamepad-input-provider.json"
 # Leave other vendors' manifests + the shared root in place; prune if empty.
 rmdir "$DP_ROOT" 2>/dev/null || true
 
@@ -89,6 +90,39 @@ rm -f "$SHARE_ROOT/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
 rm -f "$SHARE_ROOT/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json"  # #886
 rmdir "$SHARE_ROOT/vulkan/explicit_layer.d" "$SHARE_ROOT/vulkan/implicit_layer.d" "$SHARE_ROOT/vulkan" 2>/dev/null || true
 
+# KDE window-geometry publisher (user-level): the KWin script, the bridge's
+# D-Bus activation file, and the script's enable key. Stop a running bridge.
+if [ "$SYSTEM" = 0 ]; then
+    if [ -d "$SHARE_ROOT/kwin/scripts/displayxr-window-geometry" ] ||
+        [ -f "$SHARE_ROOT/dbus-1/services/org.displayxr.WindowGeometry.service" ]; then
+        rm -rf "$SHARE_ROOT/kwin/scripts/displayxr-window-geometry"
+        rm -f "$SHARE_ROOT/dbus-1/services/org.displayxr.WindowGeometry.service"
+        if command -v kwriteconfig6 >/dev/null 2>&1; then
+            kwriteconfig6 --file kwinrc --group Plugins --key displayxr-window-geometryEnabled --delete || true
+            dbus-send --session --type=method_call --dest=org.kde.KWin /KWin org.kde.KWin.reconfigure \
+                >/dev/null 2>&1 || true
+        fi
+        pkill -f "$PREFIX/bin/displayxr-kwin-geometry-bridge" >/dev/null 2>&1 || true
+        echo "==> Removed the KDE window-geometry publisher"
+    fi
+fi
+
+# Hyprland (user-level): the bridge's unit and the managed window rules.
+if [ "$SYSTEM" = 0 ]; then
+    HGB_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/displayxr-hypr-geometry.service"
+    if [ -f "$HGB_UNIT" ]; then
+        if [ -d /run/systemd/system ]; then
+            systemctl --user disable --now displayxr-hypr-geometry.service >/dev/null 2>&1 || true
+        fi
+        rm -f "$HGB_UNIT"
+        [ -d /run/systemd/system ] && systemctl --user daemon-reload >/dev/null 2>&1 || true
+        echo "==> Removed the Hyprland window-geometry bridge"
+    fi
+    if [ -x "$PREFIX/bin/displayxr-hyprland-setup" ]; then
+        "$PREFIX/bin/displayxr-hyprland-setup" --remove || true
+    fi
+fi
+
 # DisplayXR Dashboard menu entry + icon.
 rm -f "$SHARE_ROOT/applications/displayxr-dashboard.desktop" \
     "$SHARE_ROOT/icons/hicolor/256x256/apps/displayxr-dashboard.png"
@@ -98,7 +132,9 @@ if [ "$SYSTEM" = 1 ]; then
     rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" "$PREFIX/bin/displayxr-conversion-host" "$PREFIX/bin/displayxr-tracking-host" "$PREFIX/bin/displayxr-dashboard" \
         "$PREFIX/bin/displayxr-gnome-extension-enable" \
         "$PREFIX/lib/openxr_displayxr.so" "$PREFIX/lib/libVkLayer_DXR_queue_lock.so" \
-        "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
+        "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so" \
+        /usr/local/share/displayxr/openxr_displayxr.json \
+        "$PREFIX/lib/displayxr/plugins/DisplayXR-Gamepad.so"
     rmdir -p "$PREFIX/lib/displayxr/plugins" 2>/dev/null || true
 else
     rm -rf "$PREFIX"

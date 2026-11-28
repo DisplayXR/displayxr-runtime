@@ -237,8 +237,15 @@ u_file_get_runtime_dir(char *out_path, size_t out_path_size)
 	return snprintf(out_path, out_path_size, "/tmp");
 
 #else
-	const char *cache = "~/.cache";
-	return snprintf(out_path, out_path_size, "%s", cache);
+	// No XDG_RUNTIME_DIR or XDG_CACHE_HOME (e.g. a bare container, or a
+	// process started outside a logind session): the XDG default
+	// $HOME/.cache. Never the literal "~/.cache": nothing expands the tilde,
+	// so the socket path became relative to the current directory.
+	const char *home = getenv("HOME");
+	if (home != NULL && home[0] != '\0') {
+		return snprintf(out_path, out_path_size, "%s/.cache", home);
+	}
+	return snprintf(out_path, out_path_size, "/tmp");
 #endif
 }
 

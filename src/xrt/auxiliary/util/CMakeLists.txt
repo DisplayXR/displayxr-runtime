@@ -99,6 +99,8 @@ add_library(
 	u_file.h
 	u_format.c
 	u_format.h
+	u_gamescope.c
+	u_gamescope.h
 	u_frame.c
 	u_frame.h
 	u_generic_callbacks.hpp

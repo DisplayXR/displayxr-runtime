@@ -539,6 +539,157 @@ Additive: no field changed meaning, so the schema stays `version: 1`. A
 consumer that finds no `hidden` (version 19 or older) treats the window as
 seen, which is what it had before.
 
+### 4.4 KWin script bridge (a stock KWin; SteamOS Desktop Mode)
+
+The KWin publisher of #1928 is a native KWin plug-in, built in a KWin fork and
+headed upstream. A stock KWin cannot load it. That includes SteamOS, whose
+KWin 6.4 lives on a read-only OS image, and which is KDE Plasma on Wayland by
+default from SteamOS 3.8 on. Until KDE ships a publisher, a stock Plasma gets a
+**geometry-only stand-in a user can install**. It has two parts, because a KWin
+script can *call* D-Bus but cannot own a name or serve an object:
+
+```
+KWin (stock)                         session bus                 runtime
+┌───────────────────────────┐  Publish(s)  ┌──────────────────────────────┐  GetWindows /   ┌───────────────┐
+│ KWin script                │────────────▶│ displayxr-kwin-geometry-bridge │  WindowsChanged │ comp_vk_native │
+│ contrib/kwin/              │  (D-Bus     │ owns org.displayxr.          │───────────────▶│ _wl_geom       │
+│  displayxr-window-geometry │  activates) │  WindowGeometry              │                 └───────────────┘
+└───────────────────────────┘              └──────────────────────────────┘
+```
+
+- **The script** (`contrib/kwin/displayxr-window-geometry`, installed to
+  `~/.local/share/kwin/scripts/`) builds the schema-1 snapshot from KWin's
+  scripting API. On every window add, remove, activate, geometry or output
+  change, and screen change, it calls
+  `org.displayxr.WindowGeometryFeed1.Publish(s)` on
+  `org.displayxr.WindowGeometry`. An identical snapshot is not re-sent.
+  - **Fields:** `pid`, `app_id` (desktop file name, else resource class),
+    `focus`, `xwayland`, `frame`, `buffer`, `monitor {x, y, w, h, scale,
+    device_scale}`, `moving`, `minimized`, `above` and `fullscreen`, plus a
+    top-level `layout_mode: "logical"`.
+  - **Rounding:** KWin's layout is always logical with a fractional scale per
+    output, so `device_scale` is the output's `devicePixelRatio`, as #1928
+    proposed. Positions are rounded, never truncated, because KWin keeps them
+    fractional.
+  - **Not sent:**
+    - `title`: GNOME gives titles only to callers it authorises (§12.5), and
+      a bridge cannot tell callers apart.
+    - `buffer_device`: a script cannot read the rect KWin paints, and §2 says
+      to leave the field out rather than guess. Consumers fall back to the
+      conversion, which can be one device pixel off after a pointer drag at a
+      fractional scale (#1928's measurement).
+    - Placement, the drag lattice, move sync, capture exclusion and the
+      workspace hotkey: they need KWin internals, and the native plug-in
+      carries them.
+- **The bridge** (`displayxr-kwin-geometry-bridge`, `src/xrt/targets/kwin_geometry_bridge/`,
+  serving through the shared `src/xrt/targets/wgeom_bus/`, as §4.5 does)
+  owns `org.displayxr.WindowGeometry` and serves `WindowGeometry1.GetWindows()`
+  (the latest snapshot; no windows before KWin's first) and `WindowsChanged(s)`
+  under the canonical identity of §4. It accepts `Publish` only from KWin's own
+  process (the caller's `/proc/<pid>/comm` is `kwin_wayland` or `kwin_x11`),
+  because a forged snapshot would move every app's weave phase. Before
+  republishing, it holds the input to the contract (`kwgb_payload.c`, unit test
+  `tests_kwgb_payload`): schema version 1 (absent = 1, anything else is
+  refused), a `windows` array of objects, at most 1 MiB, and `title` stripped
+  from every entry.
+- **It steps aside for a real publisher:**
+  - It requests the name with `DO_NOT_QUEUE | ALLOW_REPLACEMENT`, so a native
+    publisher that asks with `REPLACE_EXISTING` takes the name, and the bridge
+    exits on `NameLost`.
+  - It refuses to start outside a KDE session (`XDG_CURRENT_DESKTOP`), so it
+    can never hold the name the GNOME extension needs.
+  - The tarball's `install.sh` writes its D-Bus activation file
+    (`~/.local/share/dbus-1/services/org.displayxr.WindowGeometry.service`)
+    only in a KDE session, or with `--kwin`.
+  - It enables the script through `kwinrc` (`[Plugins]
+    displayxr-window-geometryEnabled`), never over a user who switched it off,
+    and asks the running KWin to `reconfigure`.
+- **Packaging.** Tarball only, user-level, which is what SteamOS can install.
+  The `.deb` does not ship it. On a desktop distribution the native plug-in of
+  #1928 is the publisher to package, under the `-kwin` virtual name of §4.
+- **Re-sync.** The bridge starts on the script's first `Publish` (D-Bus
+  activation) or on a consumer's first `GetWindows`. If it restarts, it holds
+  no snapshot until the next window change. Consumers handle that as §3's "no
+  window matches" row, staying display-scoped until the next change.
+- **Not verified on hardware.** The script's API use (KWin 6
+  `workspace.windowList()`, `Window.output.devicePixelRatio`,
+  `interactiveMoveResizeStarted`/`Finished`, `callDBus`) is from KWin 6's
+  scripting API. It has not run on SteamOS's KWin 6.4.
+
+### 4.5 Hyprland publisher (Omarchy)
+
+Hyprland (the compositor of Omarchy, Arch + Hyprland + uwsm) has no plug-in
+or script API a publisher can live in that DisplayXR ships, but it exposes
+everything §2 needs on its own IPC. So its publisher is one stand-alone
+process, with no feed interface:
+
+```
+Hyprland                               displayxr-hypr-geometry-bridge          runtime
+┌──────────────────────────┐ j/clients  ┌──────────────────────────────┐ GetWindows /   ┌───────────────┐
+│ .socket.sock (requests)   │──────────▶│ hgb_payload.c → schema 1      │ WindowsChanged │ comp_vk_native │
+│ .socket2.sock (events)    │──────────▶│ owns org.displayxr.          │──────────────▶│ _wl_geom       │
+└──────────────────────────┘ EVENT>>DATA│  WindowGeometry (wgeom_bus)  │                └───────────────┘
+                                         └──────────────────────────────┘
+```
+
+- **Input.** `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/` (`/tmp/hypr/<sig>/`
+  before Hyprland 0.40). Without the signature (a user unit started before
+  the compositor exported it), the one live instance under
+  `$XDG_RUNTIME_DIR/hypr/` is used; two live instances of one user are
+  ambiguous and none is used.
+  - `j/clients` and `j/monitors` on the request socket, one request per
+    connection, 500 ms timeout.
+  - Every event-socket line re-queries, coalesced to one re-query per 16 ms,
+    except events that cannot move or show a window (`windowtitle(v2)`,
+    `activelayout`, `submap`, `screencast(v2)`, `urgent`, `bell`,
+    `ignoregrouplock`, `lockgroups`, workspace create/destroy/rename, `custom`).
+    Unknown (newer) events re-query. Layer events count: Waybar opening or
+    closing changes the reserved area, and tiled windows move with it.
+  - Hyprland sends **no event for a resize or an interactive move**. The
+    bridge also polls: every 50 ms while a visible floating window exists
+    (a mouse drag), otherwise once a second (keyboard resizes of tiled
+    windows). `WindowsChanged` is emitted only when the snapshot text changes,
+    so polling is quiet on the bus.
+- **Mapping** (`hgb_payload.c`, unit test `tests_hgb_payload`):
+  - `layout_mode: "logical"`. A client's `at`/`size` and a monitor's `x`/`y`
+    are logical layout px. A monitor's `width`/`height` are its current mode
+    in device px, in scanout orientation, so the logical monitor is that size,
+    transposed for transforms 1, 3, 5 and 7, divided by `scale`.
+  - `frame` = `buffer` = `at` + `size`. Hyprland draws borders outside `at`,
+    and there is no client-side shadow to subtract.
+  - `monitor {x, y, w, h, scale, device_scale}`, with `scale` =
+    `device_scale` = the output's fractional scale (never an integer
+    `wl_output.scale`, §1.1), plus an additive `connector` (the output name).
+  - `buffer_device` = `round((at − monitor.xy) × scale)`, `round(size × scale)`.
+    This assumes Hyprland places a surface at `round(logical × scale)` device
+    px. Not verified on hardware: if a fractional-scale panel shows a
+    one-pixel phase error, drop the field and let consumers convert.
+  - `focus` = `focusHistoryID == 0`. `hidden` = not mapped, Hyprland-hidden
+    (a background tab of a group), or on a workspace its monitor is not
+    showing (neither `activeWorkspace` nor `specialWorkspace`).
+  - `pid`, `app_id` (= `class`), `xwayland`, `fullscreen` (a bool before
+    Hyprland 0.42, a number after) and `floating`.
+  - **Not sent:** `title` (as §4.4), `moving` (Hyprland reports no
+    interactive move; consumers settle on geometry alone, §2), `minimized`
+    (Hyprland has none), and windows with no pid or monitor.
+  - Placement, the drag lattice, move sync, capture exclusion and the
+    workspace hotkey stay GNOME-only. The installer's Hyprland config carries
+    a `bind` example for `displayxr-cli workspace launch <id>` in place of
+    `WorkspaceHotkey1`.
+- **Name ownership** is shared with the KWin bridge (`src/xrt/targets/wgeom_bus/`):
+  `DO_NOT_QUEUE | ALLOW_REPLACEMENT`, exit on `NameLost`, an empty snapshot
+  before the first one. It refuses to start unless `XDG_CURRENT_DESKTOP`
+  names Hyprland, `HYPRLAND_INSTANCE_SIGNATURE` is set, or a live Hyprland
+  socket exists (override: `DXR_HGB_ANY_DESKTOP=1`). While Hyprland is gone
+  (a compositor restart) it serves no windows and reconnects every 2 s.
+- **Started by systemd, not D-Bus activation.** `install.sh` (in a Hyprland
+  session, or with `--hyprland`) writes the user unit
+  `displayxr-hypr-geometry.service` (`WantedBy=graphical-session.target`,
+  which uwsm reaches on Omarchy). It writes no activation file: that file name
+  is the KWin bridge's, and consumers re-read the name when it appears (§3).
+- **Tested** against a fake Hyprland IPC in CI (`tests/hyprland/`), not on a
+  real Hyprland. See `docs/roadmap/omarchy-support.md`.
+
 ## 5. Known limitations / follow-ups (#817)
 
 (Capture-exclusion limitations are listed with it, in §6.6.)

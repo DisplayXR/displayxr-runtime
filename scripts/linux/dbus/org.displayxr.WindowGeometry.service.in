@@ -1,0 +1,12 @@
+# Copyright 2026, The DisplayXR Project
+# SPDX-License-Identifier: BSL-1.0
+#
+# D-Bus session activation for displayxr-kwin-geometry-bridge, the stock-KWin
+# stand-in publisher of org.displayxr.WindowGeometry1 (KDE Plasma / SteamOS
+# Desktop Mode). install.sh writes it to $XDG_DATA_HOME/dbus-1/services/ on
+# KDE only, with the installed bridge path substituted. The bridge refuses to
+# take the name on any desktop but KDE, so a GNOME session's own publisher
+# (the window-geometry@displayxr.org extension) is never stranded.
+[D-BUS Service]
+Name=org.displayxr.WindowGeometry
+Exec=@BRIDGE_BIN@

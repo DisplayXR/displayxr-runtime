@@ -4,7 +4,7 @@
 #   ./scripts/package_deb_linux.sh            # build (if needed) + stage + dpkg-deb
 #   ./scripts/package_deb_linux.sh --no-build # fail instead of building
 #
-# Output: dist/displayxr-runtime_<ver>_amd64.deb
+# Output: dist/displayxr-runtime_<ver>_<arch>.deb (amd64; arm64 on an arm64 host)
 #
 # Payload (installed layout — mirrors the CI-proven tarball's bin/ + sibling
 # lib/ so displayxr-cli's `$ORIGIN/../lib` RUNPATH resolves exactly as it does
@@ -149,6 +149,9 @@ PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -
 # changes nothing for a user: qwerty keeps the hand roles, no task moves.
 SIMINPUT_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimInput.so" -type f | head -1)"
 SIMCONV_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimConversion.so" -type f | head -1)"
+# The gamepad input provider (evdev reader; on SteamOS, Steam Input's virtual
+# pad). Presence-gated: inert with no pad attached. Optional, like the tarball.
+GAMEPAD_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-Gamepad.so" -type f 2>/dev/null | head -1 || true)"
 # `|| true`: no targets/service dir at all in a non-service build; the check
 # below turns that into the real error message.
 SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f 2>/dev/null | head -1 || true)"
@@ -308,6 +311,25 @@ install -m 0644 "$RUNTIME_SO"  "$STAGE/usr/lib/displayxr/lib/openxr_displayxr.so
 install -m 0644 "$PLUGIN_SO"   "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
 install -m 0644 "$SIMINPUT_SO" "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimInput.so"
 install -m 0644 "$SIMCONV_SO"  "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimConversion.so"
+if [ -n "$GAMEPAD_SO" ]; then
+    install -m 0644 "$GAMEPAD_SO" "$STAGE/usr/lib/displayxr/plugins/DisplayXR-Gamepad.so"
+    cat > "$STAGE/usr/lib/displayxr/plugins/150-gamepad-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "gamepad",
+        "display_name": "DisplayXR Gamepad",
+        "vendor":       "DisplayXR",
+        "version":      "$VERSION",
+        "binary_path":  "/usr/lib/displayxr/plugins/DisplayXR-Gamepad.so",
+        "probe_order":  150
+    }
+}
+EOF
+    chmod 0644 "$STAGE/usr/lib/displayxr/plugins/150-gamepad-input-provider.json"
+else
+    echo "note: DisplayXR-Gamepad.so not built — the .deb ships without the gamepad provider" >&2
+fi
 install -m 0644 "$SIMCONV_PACK" "$STAGE/usr/lib/displayxr/plugins/sim-conversion.models.json"
 mkdir -p "$STAGE/usr/lib/displayxr/plugins/sim-conversion-blobs"
 install -m 0644 "$(dirname "$SIMCONV_SO")/sim-conversion-blobs"/* "$STAGE/usr/lib/displayxr/plugins/sim-conversion-blobs/"
@@ -465,6 +487,7 @@ chmod 0644 "$STAGE/usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json
 # -lwayland-client and libwayland-dev is a build-time-only dependency.)
 STABLE_SONAMES=(
     libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 ld-linux-x86-64.so.2
+    ld-linux-aarch64.so.1           # libc6 on arm64 (SteamOS on Steam Frame, Linux ARM boxes)
     libstdc++.so.6 libgcc_s.so.1
     libvulkan.so.1                  # libvulkan1
     libcjson.so.1                   # libcjson1
@@ -482,6 +505,7 @@ STABLE_SONAMES=(
 # sim-input / sim-conversion plug-ins were never in it.
 ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$HOST_BIN" "$TRACKHOST_BIN" "$PLUGIN_SO"
     "$SIMINPUT_SO" "$SIMCONV_SO" "$VKLAYER_SO")
+[ -z "$GAMEPAD_SO" ] || ELF_FILES+=("$GAMEPAD_SO")
 # The dashboard's ELF host goes through the same checks (its DT_NEEDED are libc,
 # libm, libstdc++, libgcc_s ...; .NET's host needs glibc >= 2.23). The Skia /
 # HarfBuzz natives are INSIDE the single-file bundle, so neither objdump nor

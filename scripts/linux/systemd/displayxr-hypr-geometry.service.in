@@ -1,0 +1,15 @@
+[Unit]
+Description=DisplayXR window geometry for Hyprland (org.displayxr.WindowGeometry1)
+# Started with the graphical session (uwsm on Omarchy) and stopped with it. The
+# bridge exits at once, with status 0, outside a Hyprland session.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=@BRIDGE_BIN@
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

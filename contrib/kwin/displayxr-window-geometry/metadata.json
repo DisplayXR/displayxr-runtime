@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "The DisplayXR Project"
+            }
+        ],
+        "Category": "Windows and Tasks",
+        "Description": "Publishes window geometry to DisplayXR (org.displayxr.WindowGeometry1) so 3D apps can weave in a window on a stock KWin. Geometry only.",
+        "EnabledByDefault": false,
+        "Id": "displayxr-window-geometry",
+        "License": "BSL-1.0",
+        "Name": "DisplayXR window geometry",
+        "Version": "1"
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

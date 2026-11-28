@@ -34,9 +34,31 @@
 # the sim-display one; lower probe_order wins. Nothing here assumes sim-display
 # is the only display processor.
 #
-# Flags: --system  system-wide (needs root)
+# Every install also writes openxr_displayxr.json, a runtime manifest at a
+# fixed path ($PREFIX/ user-level, /usr/local/share/displayxr/ for --system). It lets one app use DisplayXR via
+# XR_RUNTIME_JSON without it being the ActiveRuntime. On SteamOS that is the
+# Steam launch option `XR_RUNTIME_JSON=<that path> %command%`: SteamVR claims
+# the user's ActiveRuntime back whenever it starts, so the ActiveRuntime alone
+# is not a stable way to select DisplayXR there.
+#
+# SteamOS (and any other image-based distro with a read-only /usr): only the
+# user-level default works. --system is refused there, since /usr/local and
+# /etc/xdg are on the read-only OS image or are reset by OS updates.
+#
+# Flags: --system  system-wide (needs root; not on SteamOS)
 #        --no-service  skip the systemd user units (displayxr-service)
 #        --no-gnome-extension  skip the GNOME Shell extension
+#        --kwin  set up the KDE Plasma window-geometry publisher (KWin script +
+#                bridge) even when this is not run from a KDE session; it is
+#                set up automatically when XDG_CURRENT_DESKTOP says KDE.
+#                User-level only.
+#        --no-kwin  never set it up
+#        --hyprland  set up the Hyprland (Omarchy) window-geometry bridge and
+#                window rules even when this is not run from a Hyprland
+#                session; automatic when one is detected. User-level only.
+#        --no-hyprland  never set it up
+#        --hypr-source  also add `source = ~/.config/hypr/displayxr.conf` to
+#                hyprland.conf (otherwise the line to add is printed)
 
 set -euo pipefail
 
@@ -45,12 +67,20 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SYSTEM=0
 NO_SERVICE=0
 NO_GNOME_EXT=0
+KWIN=auto
+HYPRLAND=auto
+HYPR_SOURCE=0
 for arg in "$@"; do
     case "$arg" in
     --system) SYSTEM=1 ;;
     --no-service) NO_SERVICE=1 ;;
     --no-gnome-extension) NO_GNOME_EXT=1 ;;
-    *) echo "Unknown option: $arg (supported: --system --no-service --no-gnome-extension)" >&2; exit 2 ;;
+    --kwin) KWIN=yes ;;
+    --no-kwin) KWIN=no ;;
+    --hyprland) HYPRLAND=yes ;;
+    --no-hyprland) HYPRLAND=no ;;
+    --hypr-source) HYPR_SOURCE=1 ;;
+    *) echo "Unknown option: $arg (supported: --system --no-service --no-gnome-extension --kwin --no-kwin --hyprland --no-hyprland --hypr-source)" >&2; exit 2 ;;
     esac
 done
 
@@ -58,6 +88,28 @@ done
     echo "error: run install.sh from the unpacked tarball root (lib/openxr_displayxr.so not found)" >&2
     exit 1
 }
+
+# --- SteamOS / read-only OS image -------------------------------------------
+# DXR_OS_RELEASE overrides the os-release path (CI tests the SteamOS branch in
+# a plain container with it).
+OS_RELEASE="${DXR_OS_RELEASE:-/etc/os-release}"
+IS_STEAMOS=0
+if [ -r "$OS_RELEASE" ] && grep -Eq '^(ID|ID_LIKE)=("?)steamos("?)$' "$OS_RELEASE"; then
+    IS_STEAMOS=1
+fi
+if [ "$SYSTEM" = 1 ]; then
+    if [ "$IS_STEAMOS" = 1 ]; then
+        echo "error: --system is not supported on SteamOS: /usr/local is on the read-only" >&2
+        echo "       OS image and OS updates replace it. Run ./install.sh without --system" >&2
+        echo "       (a user-level install into ~/.local/share/displayxr, no root needed)." >&2
+        exit 1
+    fi
+    if [ -d /usr/local ] && ! [ -w /usr/local ] && [ "$(id -u)" = 0 ]; then
+        echo "error: /usr/local is read-only on this system (an image-based OS?)." >&2
+        echo "       Run ./install.sh without --system for a user-level install." >&2
+        exit 1
+    fi
+fi
 
 if [ "$SYSTEM" = 1 ]; then
     [ "$(id -u)" = 0 ] || { echo "error: --system needs root (use sudo)" >&2; exit 1; }
@@ -126,6 +178,17 @@ cat > "$ACTIVE" <<EOF
 EOF
 echo "==> OpenXR ActiveRuntime: $ACTIVE"
 
+# The same manifest at a fixed path in the install tree, for XR_RUNTIME_JSON
+# (per-app selection; see the header). uninstall.sh removes it.
+if [ "$SYSTEM" = 1 ]; then
+    RUNTIME_JSON=/usr/local/share/displayxr/openxr_displayxr.json
+else
+    RUNTIME_JSON="$PREFIX/openxr_displayxr.json"
+fi
+mkdir -p "$(dirname "$RUNTIME_JSON")"
+cp "$ACTIVE" "$RUNTIME_JSON"
+echo "==> Per-app runtime manifest (XR_RUNTIME_JSON): $RUNTIME_JSON"
+
 # --- Display-processor discovery manifest ----------------------------------
 mkdir -p "$DP_ROOT"
 cat > "$DP_ROOT/200-sim-display.json" <<EOF
@@ -178,6 +241,26 @@ cat > "$DP_ROOT/250-sim-conversion-conversion-provider.json" <<EOF
 }
 EOF
 echo "==> Reference provider manifests: $DP_ROOT/200-sim-input-input-provider.json, $DP_ROOT/250-sim-conversion-conversion-provider.json"
+
+# --- Gamepad input provider (evdev; SteamOS: Steam Input's virtual pad) -----
+# Presence-gated: inert until a pad is attached. Registered only when the
+# tarball shipped it. `displayxr-cli input disable gamepad` turns it off.
+if [ -f "$PREFIX/lib/displayxr/plugins/DisplayXR-Gamepad.so" ]; then
+    cat > "$DP_ROOT/150-gamepad-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "gamepad",
+        "display_name": "DisplayXR Gamepad",
+        "vendor":       "DisplayXR",
+        "version":      "$(cat "$HERE/VERSION" 2>/dev/null || echo unknown)",
+        "binary_path":  "$PREFIX/lib/displayxr/plugins/DisplayXR-Gamepad.so",
+        "probe_order":  150
+    }
+}
+EOF
+    echo "==> Gamepad provider manifest: $DP_ROOT/150-gamepad-input-provider.json"
+fi
 
 # --- VK_LAYER_DXR_queue_lock (#902 / #2036) ---------------------------------
 # The Vulkan layer the runtime enables by name at xrCreateVulkanInstanceKHR so
@@ -280,6 +363,99 @@ EOF
     echo "    LOG OUT AND BACK IN for it to load: a Wayland session cannot reload GNOME Shell."
 fi
 
+# --- KDE Plasma: window-geometry publisher (KWin script + bridge) ------------
+# A stock KWin (SteamOS Desktop Mode) has no native publisher of
+# org.displayxr.WindowGeometry1 yet (#1928). The KWin script pushes geometry to
+# displayxr-kwin-geometry-bridge, which D-Bus activates on first use and which
+# serves the canonical name (wayland-window-geometry.md, "KWin script bridge").
+# User-level only. The D-Bus activation file goes in ONLY for KDE: anywhere
+# else the desktop's own publisher (the GNOME extension) owns that name.
+KWIN_ID="displayxr-window-geometry"
+KWIN_SRC="$HERE/share/kwin/scripts/$KWIN_ID"
+KWGB_SVC_IN="$HERE/share/dbus-1/services/org.displayxr.WindowGeometry.service.in"
+case ":${XDG_CURRENT_DESKTOP:-}:" in
+*:KDE:* | *:kde:*) IS_KDE=1 ;;
+*) IS_KDE=0 ;;
+esac
+if [ "$KWIN" = auto ]; then
+    [ "$IS_KDE" = 1 ] && KWIN=yes || KWIN=no
+fi
+if [ "$KWIN" = yes ] && [ "$SYSTEM" = 1 ]; then
+    echo "note: the KDE window-geometry publisher is user-level; run ./install.sh --kwin as the user"
+elif [ "$KWIN" = yes ] && [ -x "$PREFIX/bin/displayxr-kwin-geometry-bridge" ] && [ -d "$KWIN_SRC" ] &&
+    [ -f "$KWGB_SVC_IN" ]; then
+    mkdir -p "$DATA_ROOT/kwin/scripts" "$DATA_ROOT/dbus-1/services"
+    rm -rf "$DATA_ROOT/kwin/scripts/$KWIN_ID"
+    cp -r "$KWIN_SRC" "$DATA_ROOT/kwin/scripts/"
+    sed "s|@BRIDGE_BIN@|$PREFIX/bin/displayxr-kwin-geometry-bridge|" "$KWGB_SVC_IN" \
+        >"$DATA_ROOT/dbus-1/services/org.displayxr.WindowGeometry.service"
+    echo "==> KDE window-geometry publisher: $DATA_ROOT/kwin/scripts/$KWIN_ID"
+    echo "    + $DATA_ROOT/dbus-1/services/org.displayxr.WindowGeometry.service"
+    # Enable the script, never over a user who switched it off.
+    if command -v kwriteconfig6 >/dev/null 2>&1; then
+        WAS="$(kreadconfig6 --file kwinrc --group Plugins --key "${KWIN_ID}Enabled" 2>/dev/null || true)"
+        if [ "$WAS" = false ]; then
+            echo "    left disabled (you switched it off in System Settings > KWin Scripts)"
+        else
+            kwriteconfig6 --file kwinrc --group Plugins --key "${KWIN_ID}Enabled" true
+            if command -v dbus-send >/dev/null 2>&1 &&
+                dbus-send --session --type=method_call --dest=org.kde.KWin /KWin org.kde.KWin.reconfigure \
+                    >/dev/null 2>&1; then
+                echo "    enabled and loaded into the running KWin"
+            else
+                echo "    enabled; it loads at your next login"
+            fi
+        fi
+    else
+        echo "    enable it in System Settings > Window Management > KWin Scripts (\"DisplayXR window geometry\")"
+    fi
+fi
+
+# --- Hyprland (Omarchy): window-geometry bridge + window rules ---------------
+# Hyprland has no in-process publisher of org.displayxr.WindowGeometry1.
+# displayxr-hypr-geometry-bridge reads Hyprland's IPC sockets and serves it, as
+# a systemd user service tied to the graphical session (uwsm starts
+# graphical-session.target on Omarchy). No D-Bus activation file: that name is
+# the KDE bridge's, and the runtime re-reads the name when it appears.
+# displayxr-hyprland-setup writes the window rules a weave needs (no border,
+# rounding, blur, ...) in the installed Hyprland's syntax.
+# docs/roadmap/omarchy-support.md.
+IS_HYPRLAND=0
+case ":${XDG_CURRENT_DESKTOP:-}:" in
+*:Hyprland:* | *:hyprland:*) IS_HYPRLAND=1 ;;
+esac
+[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && IS_HYPRLAND=1
+if [ "$HYPRLAND" = auto ]; then
+    [ "$IS_HYPRLAND" = 1 ] && HYPRLAND=yes || HYPRLAND=no
+fi
+HGB_UNIT_IN="$HERE/share/systemd/user/displayxr-hypr-geometry.service.in"
+if [ "$HYPRLAND" = yes ] && [ "$SYSTEM" = 1 ]; then
+    echo "note: the Hyprland setup is user-level; run ./install.sh --hyprland as the user"
+elif [ "$HYPRLAND" = yes ] && [ -x "$PREFIX/bin/displayxr-hypr-geometry-bridge" ] && [ -f "$HGB_UNIT_IN" ] &&
+    [ -d "$HERE/share/hyprland" ]; then
+    mkdir -p "$PREFIX/share" "$CONFIG_ROOT/systemd/user"
+    rm -rf "$PREFIX/share/hyprland"
+    cp -R "$HERE/share/hyprland" "$PREFIX/share/"
+    sed "s|@BRIDGE_BIN@|$PREFIX/bin/displayxr-hypr-geometry-bridge|" "$HGB_UNIT_IN"         >"$CONFIG_ROOT/systemd/user/displayxr-hypr-geometry.service"
+    echo "==> Hyprland window-geometry bridge: $CONFIG_ROOT/systemd/user/displayxr-hypr-geometry.service"
+    if [ -d /run/systemd/system ] && systemctl --user daemon-reload 2>/dev/null; then
+        systemctl --user enable displayxr-hypr-geometry.service >/dev/null 2>&1 || true
+        if [ "$IS_HYPRLAND" = 1 ] && systemctl --user restart displayxr-hypr-geometry.service >/dev/null 2>&1; then
+            echo "    enabled and running"
+        else
+            echo "    enabled; it starts with your next Hyprland session"
+        fi
+    else
+        echo "    (no systemd user session detected — enable later:"
+        echo "     systemctl --user daemon-reload && systemctl --user enable --now displayxr-hypr-geometry.service)"
+    fi
+    if [ "$HYPR_SOURCE" = 1 ]; then
+        "$PREFIX/bin/displayxr-hyprland-setup" --source || true
+    else
+        "$PREFIX/bin/displayxr-hyprland-setup" || true
+    fi
+fi
+
 # --- DisplayXR Dashboard: applications-menu entry ----------------------------
 # The binary went in with bin/ above, beside the displayxr-cli it runs.
 if [ -x "$PREFIX/bin/displayxr-dashboard" ] && [ -f "$HERE/share/applications/displayxr-dashboard.desktop.in" ]; then
@@ -293,3 +469,17 @@ fi
 echo ""
 echo "DisplayXR installed. Sanity check:"
 echo "    $PREFIX/bin/displayxr-cli selftest"
+if [ "$HYPRLAND" = yes ] && [ "$SYSTEM" = 0 ]; then
+    echo ""
+    echo "Hyprland: native-Wayland apps weave windowed through the geometry bridge;"
+    echo "XWayland apps need the panel's output at scale 1. After a Hyprland upgrade,"
+    echo "re-run $PREFIX/bin/displayxr-hyprland-setup to update the window rules."
+fi
+if [ "$IS_STEAMOS" = 1 ]; then
+    echo ""
+    echo "SteamOS: SteamVR takes the OpenXR ActiveRuntime back when it starts. To run a"
+    echo "Steam game on DisplayXR regardless, set its launch options (Properties > General):"
+    echo "    XR_RUNTIME_JSON=$RUNTIME_JSON PRESSURE_VESSEL_FILESYSTEMS_RW=\$XDG_RUNTIME_DIR/displayxr_comp_ipc %command%"
+    echo "(64-bit OpenXR games only. Windows games under Proton need more; see"
+    echo " docs/roadmap/steamos-support.md, WS6.)"
+fi

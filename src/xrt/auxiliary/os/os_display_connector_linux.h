@@ -55,6 +55,42 @@ os_display_connector_normalise(const char *in, char *out, size_t out_size);
 void
 os_display_connector_annotate(struct os_display_desktop_info *mons, uint32_t count);
 
+/*!
+ * Infer a connector's current mode from the kernel's mode list (DRM sysfs
+ * `modes`, scanout orientation, preferred first) and the monitor's rect in
+ * the window-placement space, which is already turned the way the desktop
+ * presents the output. In order:
+ *
+ * 1. the rect is itself a mode: that mode, not turned;
+ * 2. the rect transposed is a mode: that mode, turned a quarter (the Steam
+ *    Deck: an 800x1280 mode under a 1280x800 desktop);
+ * 3. else the preferred (first) mode, turned a quarter when it and the rect
+ *    disagree about portrait vs landscape (scaling keeps the aspect, so only
+ *    a rotation flips it).
+ *
+ * @p out_w / @p out_h are in the PRESENTED orientation (swapped when
+ * @p out_quarter_turn is set), as @ref os_display_desktop_info::native_width
+ * requires. A rect of 0 x 0 (unknown) never infers a turn. Returns false, and
+ * writes nothing, when the list is empty.
+ */
+bool
+os_display_drm_pick_mode(const uint32_t *mode_w,
+                         const uint32_t *mode_h,
+                         uint32_t mode_count,
+                         uint32_t rect_w,
+                         uint32_t rect_h,
+                         uint32_t *out_w,
+                         uint32_t *out_h,
+                         bool *out_quarter_turn);
+
+/*!
+ * Map Mutter's logical-monitor transform (MetaMonitorTransform: 0 normal,
+ * 1/2/3 = 90/180/270, 4-7 the same flipped) to a rotation. Anything else is
+ * @ref OS_DISPLAY_ROTATION_UNKNOWN.
+ */
+enum os_display_rotation
+os_display_rotation_from_mutter(uint32_t transform);
+
 #ifdef __cplusplus
 }
 #endif

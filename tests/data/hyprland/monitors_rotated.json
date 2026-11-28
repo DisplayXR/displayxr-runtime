@@ -1,0 +1,16 @@
+[{
+    "id": 0,
+    "name": "DP-2",
+    "description": "Rotated panel (fixture)",
+    "width": 2560,
+    "height": 1600,
+    "refreshRate": 60.00000,
+    "x": -1280,
+    "y": 0,
+    "activeWorkspace": {"id": 1, "name": "1"},
+    "specialWorkspace": {"id": 0, "name": ""},
+    "scale": 1.25,
+    "transform": 1,
+    "focused": true,
+    "disabled": false
+}]

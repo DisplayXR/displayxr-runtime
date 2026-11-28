@@ -127,6 +127,7 @@
 #include "vk_native/comp_vk_native_window_xcb.h"
 #include "os/os_display_scale.h"
 #include "util/u_x11_scale.h"
+#include "util/u_gamescope.h"
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -6276,6 +6277,65 @@ vk_dp_refresh_resample_caps(struct comp_vk_native_compositor *c)
 	c->x11_1to1_evaluated = false;
 }
 
+/*!
+ * The X11 gate under gamescope (SteamOS Game Mode). The nested root is the
+ * game resolution Steam chose, gamescope scales it to the output, and it
+ * scales a smaller window up to the root: either is a resample, which a weave
+ * does not survive. Same policy as the rest of #1595 / #1831 — degrade only on
+ * positive evidence, weave anyway for a DP that tolerates a resample, and say
+ * how to fix it in the one line that announces the degrade.
+ */
+static void
+vk_x11_update_not_1to1_gamescope(struct comp_vk_native_compositor *c,
+                                 uint32_t panel_px_w,
+                                 uint32_t panel_px_h,
+                                 uint32_t root_w,
+                                 uint32_t root_h)
+{
+	uint32_t win_w = 0, win_h = 0;
+	if (c->target != NULL) {
+		comp_vk_native_target_get_dimensions(c->target, &win_w, &win_h);
+	}
+	const enum u_gamescope_1to1 v = u_gamescope_check_1to1(panel_px_w, panel_px_h, root_w, root_h, win_w, win_h);
+
+	switch (v) {
+	case U_GAMESCOPE_1TO1_UNKNOWN:
+		U_LOG_W("gamescope 1:1 gate: nothing to measure (panel %ux%u, game resolution %ux%u) — keeping the "
+		        "current weave state.",
+		        panel_px_w, panel_px_h, root_w, root_h);
+		return;
+	case U_GAMESCOPE_1TO1_YES:
+		U_LOG_I("gamescope 1:1 gate: game resolution %ux%u = the 3D panel's %ux%u, window %ux%u — weaving. "
+		        "(SteamOS Game Mode)",
+		        root_w, root_h, panel_px_w, panel_px_h, win_w, win_h);
+		vk_linux_apply_not_1to1(c, false);
+		return;
+	default: break;
+	}
+
+	if (c->display_processor != NULL && c->dp_tolerates_resample) {
+		U_LOG_W("gamescope 1:1 gate: %s (game %ux%u, window %ux%u, panel %ux%u), but this display "
+		        "processor's output tolerates a resample — weaving anyway.",
+		        u_gamescope_1to1_str(v), root_w, root_h, win_w, win_h, panel_px_w, panel_px_h);
+		vk_linux_apply_not_1to1(c, false);
+		return;
+	}
+	if (v == U_GAMESCOPE_1TO1_GAME_RES_SCALED) {
+		U_LOG_W(
+		    "NOT_1TO1 (gamescope): presenting 2D (no weave) — Steam runs this game at %ux%u and gamescope "
+		    "scales it to the %ux%u 3D panel; a resampled weave is a uniform double image. Fix: in Game "
+		    "Mode, the game's Properties > General > Game Resolution = Native (or %ux%u). (SteamOS)",
+		    root_w, root_h, panel_px_w, panel_px_h, panel_px_w, panel_px_h);
+	} else {
+		U_LOG_W(
+		    "NOT_1TO1 (gamescope): presenting 2D (no weave) — the window is %ux%u inside a %ux%u game "
+		    "resolution, and gamescope scales it to fill; a resampled weave is a uniform double image. Fix: "
+		    "run the app fullscreen at %ux%u. (SteamOS)",
+		    win_w, win_h, root_w, root_h, panel_px_w, panel_px_h);
+	}
+	vk_linux_apply_not_1to1(c, true);
+}
+
 static void
 vk_x11_update_not_1to1(struct comp_vk_native_compositor *c)
 {
@@ -6315,6 +6375,15 @@ vk_x11_update_not_1to1(struct comp_vk_native_compositor *c)
 	const uint32_t dev_h = si->display_desktop_native_height;
 	const uint32_t x11_w = si->display_desktop_width;
 	const uint32_t x11_h = si->display_desktop_height;
+
+	// SteamOS Game Mode: under gamescope the X root is the GAME resolution
+	// and gamescope scales it (and any smaller window) to its one output, so
+	// the connector-mode rule below never applies — gamescope's synthetic
+	// RandR output joins no connector. Its own verdict instead (u_gamescope.h).
+	if (u_gamescope_session()) {
+		vk_x11_update_not_1to1_gamescope(c, panel_px_w, panel_px_h, x11_w, x11_h);
+		return;
+	}
 
 	// Positive evidence only. The resolved monitor must BE the panel by its
 	// hardware mode, and that mode must be known.
@@ -16328,6 +16397,13 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		// connector) leaves direct_window NULL → fall through to XCB below, so
 		// the default path is untouched.
 		const char *ds_env = getenv("DXR_LINUX_DIRECT_SCANOUT");
+		// gamescope holds the DRM master and composites every game itself:
+		// there is no connector to acquire, so don't try (SteamOS Game Mode).
+		if (ds_env != NULL && ds_env[0] == '1' && u_gamescope_session()) {
+			U_LOG_W("DXR_LINUX_DIRECT_SCANOUT ignored under gamescope (SteamOS Game Mode owns the display) "
+			        "— XCB present");
+			ds_env = NULL;
+		}
 		if (ds_env != NULL && ds_env[0] == '1') {
 			xrt_result_t dret = comp_vk_native_window_direct_create(
 			    &c->vk, display_screen_left, display_screen_top, &c->direct_window);

@@ -256,8 +256,21 @@ jobs:
         run: |
           chmod +x "$DXR_DASHBOARD_BIN"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          ./scripts/build_linux.sh --hybrid --no-test
+          # --bundled-cjson: the tarball must not need libcjson.so.1, which
+          # SteamOS and the Steam Runtime lack (docs/roadmap/steamos-support.md).
+          ./scripts/build_linux.sh --hybrid --no-test --bundled-cjson
           ./scripts/package_linux.sh --no-build
+
+      - name: Tarball needs no system cJSON (SteamOS)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          mkdir -p /tmp/cjson-check && tar -C /tmp/cjson-check -xzf dist/displayxr-runtime-linux-*.tar.gz
+          if find /tmp/cjson-check -type f \( -name '*.so' -o -perm -u+x \) -exec sh -c \
+              'objdump -p "$1" 2>/dev/null | grep -q "NEEDED.*libcjson"' _ {} \; -print | grep .; then
+            echo "error: the files above link libcjson.so.1; build the tarball with --bundled-cjson" >&2
+            exit 1
+          fi
 
       - name: Runtime carries the checkout's version (#1790)
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -306,6 +319,180 @@ jobs:
           name: displayxr-runtime-linux-tarball
           path: dist/displayxr-runtime-linux-*.tar.gz
           if-no-files-found: error
+
+  # SteamOS proxy (docs/roadmap/steamos-support.md, WS1/WS8). SteamOS is Arch
+  # based with a read-only OS image, so this builds the tarball on Arch, runs
+  # the host unit tests that cover SteamOS-relevant code, and installs it the
+  # only way SteamOS allows: user-level, as a non-root user who cannot write
+  # /usr. The --system refusal is checked with a SteamOS os-release.
+  # NOT a required check yet (no org mirror of the image; Arch moves daily).
+  # Promote only after adding it to the LinuxPackaging-style doc-only contract.
+  # It also covers Omarchy (Arch + Hyprland; docs/roadmap/omarchy-support.md):
+  # the Hyprland geometry bridge against a fake Hyprland IPC on a private
+  # session bus, and the user-level install in a (faked) Hyprland session.
+  SteamOS:
+    name: SteamOS + Omarchy (Arch)
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
+      - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git cmake ninja pkgconf python binutils \
+            vulkan-headers vulkan-icd-loader vulkan-validation-layers glslang \
+            eigen systemd-libs \
+            libxcb libx11 libxrandr libxxf86vm wayland dbus \
+            mesa libglvnd
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build (hybrid, bundled cJSON) + headless selftest
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          CMAKE_BUILD_TYPE=Release ./scripts/build_linux.sh --hybrid --bundled-cjson
+
+      - name: Host unit tests (SteamOS-relevant)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          ctest --test-dir build --output-on-failure \
+            -R 'tests_u_file_socket_path|tests_aux_display_|tests_aux_x11_scale|tests_aux_wayland_geom|tests_aux_gamescope|tests_gamepad_|tests_kwgb_payload|tests_hgb_payload|tests_os_hyprland|tests_service_.*_linux'
+
+      - name: Hyprland geometry bridge vs a fake Hyprland (Omarchy)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          BRIDGE="$(find build/src/xrt/targets -maxdepth 2 -name displayxr-hypr-geometry-bridge -type f | head -1)"
+          test -x "$BRIDGE"
+          KEEP=1 dbus-run-session -- tests/hyprland/test_hypr_bridge.sh "$BRIDGE"
+
+      - name: Package (no dashboard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./scripts/package_linux.sh --no-build
+
+      - name: Omarchy user-level install (faked Hyprland session), uninstall
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          useradd -m omarchy
+          tar -C /home/omarchy -xzf dist/displayxr-runtime-linux-*.tar.gz
+          mkdir -p /home/omarchy/.config/hypr
+          echo 'source = ~/.config/hypr/monitors.conf' > /home/omarchy/.config/hypr/hyprland.conf
+          chown -R omarchy:omarchy /home/omarchy
+          runuser -u omarchy -- env -i HOME=/home/omarchy PATH=/usr/bin \
+            XDG_CURRENT_DESKTOP=Hyprland HYPRLAND_INSTANCE_SIGNATURE=fake DXR_HYPR_VERSION=0.54.0 \
+            bash -euo pipefail -c '
+            cd ~/displayxr-runtime-linux-*/
+            ./install.sh --hypr-source | tee /tmp/install-omarchy.log
+            P=~/.local/share/displayxr
+            test -x $P/bin/displayxr-hypr-geometry-bridge
+            test -x $P/bin/displayxr-hyprland-setup
+            grep -qx "ExecStart=$P/bin/displayxr-hypr-geometry-bridge" ~/.config/systemd/user/displayxr-hypr-geometry.service
+            grep -q "displayxr-hyprland-setup: managed" ~/.config/hypr/displayxr.conf
+            grep -qF "match:class ^(DisplayXR|displayxr-service)" ~/.config/hypr/displayxr.conf
+            grep -qx "source = $HOME/.config/hypr/displayxr.conf" ~/.config/hypr/hyprland.conf
+            # The KDE bridge is not set up on Hyprland (its D-Bus activation file would own the name).
+            test ! -e ~/.local/share/dbus-1/services/org.displayxr.WindowGeometry.service
+            # Outside a Hyprland session the bridge exits 0 and takes nothing.
+            env -u HYPRLAND_INSTANCE_SIGNATURE XDG_CURRENT_DESKTOP=GNOME XDG_RUNTIME_DIR=/tmp \
+              $P/bin/displayxr-hypr-geometry-bridge
+            ./uninstall.sh
+            test ! -e ~/.config/systemd/user/displayxr-hypr-geometry.service
+            test ! -e ~/.config/hypr/displayxr.conf
+            if grep -q displayxr ~/.config/hypr/hyprland.conf; then
+              echo "error: uninstall left a DisplayXR line in hyprland.conf" >&2; exit 1
+            fi
+            grep -qx "source = ~/.config/hypr/monitors.conf" ~/.config/hypr/hyprland.conf
+          '
+
+      - name: User-level install as a non-root user, selftest, uninstall
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          useradd -m deck
+          tar -C /home/deck -xzf dist/displayxr-runtime-linux-*.tar.gz
+          chown -R deck:deck /home/deck
+          cp scripts/smoke_service_linux.sh /home/deck/ && chown deck:deck /home/deck/smoke_service_linux.sh
+          printf 'NAME="SteamOS"\nID=steamos\nID_LIKE=arch\n' > /tmp/os-release-steamos
+          runuser -u deck -- env -i HOME=/home/deck PATH=/usr/bin bash -euo pipefail -c '
+            cd ~/displayxr-runtime-linux-*/
+            # --system must be refused on SteamOS, before anything is written.
+            if DXR_OS_RELEASE=/tmp/os-release-steamos ./install.sh --system; then
+              echo "error: --system was not refused on SteamOS" >&2; exit 1
+            fi
+            DXR_OS_RELEASE=/tmp/os-release-steamos ./install.sh | tee /tmp/install.log
+            grep -q "XR_RUNTIME_JSON=$HOME/.local/share/displayxr/openxr_displayxr.json PRESSURE_VESSEL_FILESYSTEMS_RW=" /tmp/install.log
+            test -f ~/.local/share/displayxr/openxr_displayxr.json
+            test -f ~/.config/openxr/1/active_runtime.json
+            unset XRT_PLUGIN_SEARCH_PATH
+            ~/.local/share/displayxr/bin/displayxr-cli info
+            ~/.local/share/displayxr/bin/displayxr-cli selftest
+            ~/smoke_service_linux.sh --bin-dir ~/.local/share/displayxr/bin
+            ./uninstall.sh
+            test ! -e ~/.local/share/displayxr
+            test ! -f ~/.config/openxr/1/active_runtime.json
+          '
+          # Nothing outside $HOME was written.
+          test ! -e /usr/local/share/displayxr
+
+  # Linux arm64 (docs/roadmap/steamos-support.md, WS7): SteamOS also runs on
+  # arm64 (Steam Frame) and Linux ARM boxes are common. Build + headless
+  # selftest + tarball install on GitHub's arm64 runner. Not a required check,
+  # and nothing is released for arm64 from it: no arm64 vendor plug-in (Leia SR
+  # is x86_64 only) exists to test against.
+  Arm64:
+    name: Linux arm64 (build only)
+    needs: DetectChanges
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libdbus-1-dev \
+            libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
+
+      - name: Build (hybrid) + headless selftest
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./scripts/build_linux.sh --hybrid
+
+      - name: Package + user-level install + selftest from installed paths
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          ./scripts/package_linux.sh --no-build
+          ls dist/displayxr-runtime-linux-aarch64-*.tar.gz
+          tar -C /tmp -xzf dist/displayxr-runtime-linux-aarch64-*.tar.gz
+          cd /tmp/displayxr-runtime-linux-aarch64-*/
+          ./install.sh --no-gnome-extension
+          unset XRT_PLUGIN_SEARCH_PATH
+          "$HOME/.local/share/displayxr/bin/displayxr-cli" selftest
+          ./uninstall.sh
 
   # Newest-toolchain gate (#1656): the Package job used to build in the NEXT-LTS
   # container and moved to 22.04 so the tarball it produces is portable, so the

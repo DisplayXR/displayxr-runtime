@@ -50,6 +50,11 @@
 #   # green there. (The .deb deliberately ships without GL/EGL — see the Deb
 #   # job's comment.)
 #
+# Prerequisites (Arch Linux, Omarchy, SteamOS dev images): the same set, as
+# the "SteamOS + Omarchy (Arch)" CI job installs it:
+#   sudo pacman -S --needed git cmake ninja pkgconf python binutils #       vulkan-headers vulkan-icd-loader vulkan-validation-layers glslang #       eigen systemd-libs libxcb libx11 libxrandr libxxf86vm wayland dbus #       mesa libglvnd
+#   (dbus here is also what builds the Hyprland and KWin geometry bridges.)
+#
 #   NOTE: install the dependencies BEFORE the first configure. CMake caches a
 #   failed feature probe permanently, so a package installed afterwards is not
 #   picked up — and the mismatch can wedge the tree outright (see --clean).
@@ -95,10 +100,32 @@
 #                                        # (handle, XR_DXR_xlib_window_binding,
 #                                        # Phase 3); running them needs a GPU + X
 #                                        # server
+#   ./scripts/build_linux.sh --bundled-cjson  # compile the bundled cJSON in
+#                                        # (hidden symbols) instead of linking
+#                                        # the system libcjson.so.1, which the
+#                                        # SteamOS base image and the Steam
+#                                        # Runtime do not have. The tarball is
+#                                        # built with it; the .deb is not (it
+#                                        # declares libcjson as a Depends).
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Arch / Omarchy: name the missing build tools before CMake caches a failed probe.
+if [ -f /etc/arch-release ]; then
+    missing=""
+    for t in cmake ninja pkg-config glslangValidator; do
+        command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+    done
+    [ -f /usr/include/dbus-1.0/dbus/dbus.h ] || missing="$missing dbus-headers"
+    if [ -n "$missing" ]; then
+        echo "note: missing on this Arch system:$missing" >&2
+        echo "      sudo pacman -S --needed git cmake ninja pkgconf python binutils vulkan-headers \\" >&2
+        echo "          vulkan-icd-loader vulkan-validation-layers glslang eigen systemd-libs libxcb libx11 \\" >&2
+        echo "          libxrandr libxxf86vm wayland dbus mesa libglvnd" >&2
+    fi
+fi
 # BUILD_DIR is overridable so the tree can be built out-of-source — e.g. the
 # .deb Docker test (scripts/test_deb_linux.sh) builds into a container-local
 # dir to avoid colliding with a host build/ cache on the bind-mounted repo.
@@ -110,6 +137,7 @@ RUN_TEST=ON
 BUILD_APPS=OFF
 CLEAN=OFF
 QWERTY=ON
+CJSON_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --service) SERVICE_MODE=ON ;;
@@ -119,6 +147,7 @@ for arg in "$@"; do
     --clean) CLEAN=ON ;;
     --qwerty) QWERTY=ON ;;
     --no-qwerty) QWERTY=OFF ;;
+    --bundled-cjson) CJSON_ARGS=(-DXRT_HAVE_SYSTEM_CJSON=OFF) ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -169,7 +198,8 @@ cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DXRT_BUILD_DRIVER_QWERTY=$QWERTY \
   -DXRT_FEATURE_DEBUG_GUI=OFF \
   -DXRT_FEATURE_WINDOW_PEEK=OFF \
-  -DXRT_HAVE_SDL2=OFF
+  -DXRT_HAVE_SDL2=OFF \
+  ${CJSON_ARGS[@]+"${CJSON_ARGS[@]}"}
 
 echo "=== Building runtime + displayxr-cli + sim_display plug-in ==="
 cmake --build "$BUILD_DIR"
@@ -301,9 +331,9 @@ if [ -n "$SIMTRACK_PLUGIN" ]; then
 EOF
 fi
 
-# Gamepad input provider (ADR-034 / ADR-054). Desktop Linux has no pad reader
-# yet (evdev follow-up): the provider DECLINES at probe, so staging the
-# manifest costs nothing and the dev tree matches macOS / Windows.
+# Gamepad input provider (ADR-034 / ADR-054). Desktop Linux reads pads over
+# evdev (prefers Steam Input's virtual pad on SteamOS); with no pad attached it
+# is inert, and the dev tree matches macOS / Windows.
 GAMEPAD_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-Gamepad.so" -type f | head -1)"
 if [ -n "$GAMEPAD_PLUGIN" ]; then
   cp "$GAMEPAD_PLUGIN" "$PLUGIN_DIR/"

@@ -1,0 +1,15 @@
+[{
+    "address": "0x1",
+    "mapped": true,
+    "hidden": false,
+    "at": [-1200, 100],
+    "size": [1000, 800],
+    "workspace": {"id": 1, "name": "1"},
+    "floating": false,
+    "monitor": 0,
+    "class": "cube_handle_vk",
+    "pid": 31337,
+    "xwayland": false,
+    "fullscreen": 0,
+    "focusHistoryID": 0
+}]

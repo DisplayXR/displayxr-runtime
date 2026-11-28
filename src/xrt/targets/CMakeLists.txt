@@ -51,6 +51,17 @@ if(XRT_FEATURE_SERVICE AND NOT ANDROID)
 	add_subdirectory(tracking_host)
 endif()
 
+# SteamOS / stock KDE Plasma: serves org.displayxr.WindowGeometry1 for the
+# DisplayXR KWin script (wayland-window-geometry.md, "KWin script bridge").
+# Hyprland (Omarchy): the same interface, read from Hyprland's IPC
+# (wayland-window-geometry.md, "Hyprland publisher"). Both bridges serve the
+# name through wgeom_bus.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID AND XRT_HAVE_DBUS)
+	add_subdirectory(wgeom_bus)
+	add_subdirectory(kwin_geometry_bridge)
+	add_subdirectory(hypr_geometry_bridge)
+endif()
+
 # Android diagnostics dashboard JNI bridge (#558) — reuses the CLI's
 # query core, so it needs targets/cli configured.
 if(ANDROID AND XRT_MODULE_CLI)

@@ -33,6 +33,9 @@
 #   share/systemd/user/displayxr.socket + displayxr.service.in  (#1744:
 #       install.sh substitutes the service path and enables the socket, so the
 #       service is socket-activated on first use)
+#   bin/displayxr-hypr-geometry-bridge + bin/displayxr-hyprland-setup +
+#       share/hyprland/ + share/systemd/user/displayxr-hypr-geometry.service.in
+#       (Hyprland / Omarchy; install.sh sets them up only on Hyprland)
 #   install.sh / uninstall.sh / README.md / VERSION
 #
 # v1 scope (#705): runtime + sim_display, user-level default. Config files
@@ -90,6 +93,11 @@ PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -
 # nothing for a user (qwerty keeps the hand roles; no conversion task moves).
 SIMINPUT_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimInput.so" -type f | head -1)"
 SIMCONV_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimConversion.so" -type f | head -1)"
+# The gamepad input provider: the evdev reader on desktop Linux (on SteamOS it
+# reads Steam Input's virtual pad). Presence-gated, inert with no pad attached.
+# Optional, so a build without it still packages; install.sh registers it only
+# when it shipped.
+GAMEPAD_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-Gamepad.so" -type f 2>/dev/null | head -1 || true)"
 VKLAYER_SO="$(find "$BUILD_DIR/src/xrt/targets/vk_layer" -maxdepth 1 -name libVkLayer_DXR_queue_lock.so -type f 2>/dev/null | head -1 || true)"
 
 for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
@@ -196,6 +204,11 @@ cp "$ROOT/scripts/linux/systemd/displayxr.socket" "$ROOT/scripts/linux/systemd/d
 cp "$RUNTIME_SO" "$STAGE/lib/"
 cp "$PLUGIN_SO" "$STAGE/lib/displayxr/plugins/"
 cp "$SIMINPUT_SO" "$SIMCONV_SO" "$SIMCONV_PACK" "$STAGE/lib/displayxr/plugins/"
+if [ -n "$GAMEPAD_SO" ]; then
+    cp "$GAMEPAD_SO" "$STAGE/lib/displayxr/plugins/"
+else
+    echo "note: DisplayXR-Gamepad.so not built — packaging without the gamepad provider" >&2
+fi
 cp -r "$(dirname "$SIMCONV_SO")/sim-conversion-blobs" "$STAGE/lib/displayxr/plugins/"
 cp "$VKLAYER_SO" "$STAGE/lib/"
 cp "$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock.json.in" "$STAGE/share/vulkan/"
@@ -203,6 +216,33 @@ cp "$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock_implicit.json.in" "$ST
 for f in $EXT_FILES; do cp "$EXT_SRC/$f" "$STAGE/share/gnome-shell/extensions/$EXT_UUID/"; done
 install -m 0755 "$ROOT/scripts/linux/displayxr-gnome-extension-enable" "$STAGE/bin/"
 install -m 0755 "$ROOT/scripts/linux/displayxr-restart-service" "$STAGE/bin/"
+# KDE Plasma / SteamOS Desktop Mode: the stock-KWin stand-in publisher of
+# org.displayxr.WindowGeometry1 (wayland-window-geometry.md, "KWin script
+# bridge") -- the KWin script, its bridge, and the bridge's D-Bus activation
+# file. Optional (the bridge needs libdbus at build time); install.sh sets them
+# up only in a KDE session.
+KWGB_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-kwin-geometry-bridge -type f 2>/dev/null | head -1 || true)"
+if [ -n "$KWGB_BIN" ]; then
+    install -m 0755 "$KWGB_BIN" "$STAGE/bin/"
+    mkdir -p "$STAGE/share/kwin/scripts" "$STAGE/share/dbus-1/services"
+    cp -r "$ROOT/contrib/kwin/displayxr-window-geometry" "$STAGE/share/kwin/scripts/"
+    cp "$ROOT/scripts/linux/dbus/org.displayxr.WindowGeometry.service.in" "$STAGE/share/dbus-1/services/"
+else
+    echo "note: displayxr-kwin-geometry-bridge not built (no libdbus?) — packaging without the KWin publisher" >&2
+fi
+# Hyprland (Omarchy): the geometry bridge, its systemd user unit, and the
+# window-rule setup with its templates (docs/roadmap/omarchy-support.md).
+# Optional like the KWin bridge; install.sh sets it up only on Hyprland.
+HGB_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-hypr-geometry-bridge -type f 2>/dev/null | head -1 || true)"
+if [ -n "$HGB_BIN" ]; then
+    install -m 0755 "$HGB_BIN" "$STAGE/bin/"
+    install -m 0755 "$ROOT/scripts/linux/hyprland/displayxr-hyprland-setup" "$STAGE/bin/"
+    mkdir -p "$STAGE/share/hyprland"
+    cp "$ROOT/scripts/linux/hyprland/"*.conf "$ROOT/scripts/linux/hyprland/displayxr.lua" "$STAGE/share/hyprland/"
+    cp "$ROOT/scripts/linux/systemd/displayxr-hypr-geometry.service.in" "$STAGE/share/systemd/user/"
+else
+    echo "note: displayxr-hypr-geometry-bridge not built (no libdbus?) — packaging without the Hyprland publisher" >&2
+fi
 cp "$ROOT/scripts/linux/install.sh" "$ROOT/scripts/linux/uninstall.sh" "$STAGE/"
 chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"
 echo "$VERSION" > "$STAGE/VERSION"
@@ -219,7 +259,8 @@ echo "$VERSION" > "$STAGE/VERSION"
 GLIBC_SYMS="$(objdump -T "$STAGE/bin"/* "$STAGE/lib/openxr_displayxr.so" "$STAGE/lib/libVkLayer_DXR_queue_lock.so" \
     "$STAGE/lib/displayxr/plugins/DisplayXR-SimDisplay.so" \
     "$STAGE/lib/displayxr/plugins/DisplayXR-SimInput.so" \
-    "$STAGE/lib/displayxr/plugins/DisplayXR-SimConversion.so" 2>/dev/null || true)"
+    "$STAGE/lib/displayxr/plugins/DisplayXR-SimConversion.so" \
+    "$STAGE/lib/displayxr/plugins/DisplayXR-Gamepad.so" 2>/dev/null || true)"
 GLIBC_FLOOR="$(echo "$GLIBC_SYMS" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1 || true)"
 if [ -n "$GLIBC_FLOOR" ]; then
     echo "$GLIBC_FLOOR" > "$STAGE/GLIBC_FLOOR"
@@ -231,7 +272,7 @@ fi
 cat > "$STAGE/README.md" <<EOF
 # DisplayXR runtime for Linux ($VERSION)
 
-Lightweight OpenXR runtime for 3D displays — Linux x86_64 build with the
+Lightweight OpenXR runtime for 3D displays — Linux $ARCH build with the
 vendor-neutral sim-display display processor.
 
 ## Install (user-level, no root)
