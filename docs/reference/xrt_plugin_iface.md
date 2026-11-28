@@ -167,8 +167,10 @@ Ownership of `*out_dev` is transferred to the runtime, which destroys the device
 3D mode, `rendering_mode_count = 2`, `mode_index` = the array position. If your display
 supports several 3D *kinds* (layouts, weaver variants), expose the choice as a setting
 (`describe_settings` ENUM + `get_setting`) read when you create the device, and fill mode 1
-from it — the kind applies the next time the runtime starts, never under running apps. Set
-`active_rendering_mode_index` to the mode you start in. The runtime enforces the contract
+from it — the kind applies the next time the runtime starts, never under running apps. You do
+not choose the mode apps start in: whatever `active_rendering_mode_index` you set, the runtime
+starts every app in mode 1 right after the trim and calls your `set_property(OUTPUT_MODE, 1)`
+(ADR-065 Amendment 1; only a developer pin, `OUTPUT_MODE_PINNED`, keeps yours). The runtime enforces the contract
 where it takes the table (right after `create_device`, again when your display info is
 applied): a longer table is trimmed to mode 0 plus one 3D mode (the one active at creation
 if it is 3D, else the first 3D one), with a WARN naming your plug-in and what was dropped,

@@ -80,7 +80,8 @@ modes with the kind fixed at start-up needs none of that.
    machine). A driver with one kind declares nothing new. `sim_display`'s kind is its existing
    `OUTPUT` setting; anaglyph stays the default kind (the only position-preserving one, so it
    composes with display zones), and `blend` finally has a run-time home.
-3. **`sim_display` starts in 2D.** A PC with no 3D display shows a normal picture; V (or 1, or
+3. ~~**`sim_display` starts in 2D.**~~ *Withdrawn by [Amendment 1](#amendment-1-2026-11-26-the-driver-never-decides-an-apps-start-mode):
+   the runtime starts every app in slot 1, for every driver.* (Original text:) A PC with no 3D display shows a normal picture; V (or 1, or
    an app request) turns the chosen kind on. `START_3D=1` starts it in the kind. `FORCE_MODE`
    remains a developer pin, limited to 0 or 1.
 4. **Sizing covers 2D and the selected kind.** `u_tiling_compute_system_atlas` takes its

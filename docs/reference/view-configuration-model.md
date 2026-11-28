@@ -294,8 +294,8 @@ removes: the session is moved out of a mode it cannot fill before its first
 frame ([below](#the-mode-floor-1499)). One direct consequence worth knowing
 before someone debugs it cold:
 
-- A CTS lane **forced** into quad (`SIM_DISPLAY_OUTPUT=quad`, plus `SIM_DISPLAY_START_3D=1`
-  since ADR-065) used to fail
+- A CTS lane **forced** into quad (`SIM_DISPLAY_OUTPUT=quad`; it starts in that kind, slot 1,
+  since ADR-065 Amendment 1) used to fail
   `xrLocateSpace_xrLocateViews` — not on its `views.size() == 2` assertion,
   which now passes, but on its **centroid check**: VIEW space was the centre of
   the fan, while the centroid of tiles 0 and 1 is not. #1502 closes that gap
@@ -532,8 +532,8 @@ CTS failure, so a box running it is out of contract on purpose.
 
 **Nothing in-tree actually renders more than 2 views of content.** The only
 device that ever sets `view_count > 2` is `sim_display`, whose Quad kind is
-opt-in (`SIM_DISPLAY_OUTPUT=quad`, with `SIM_DISPLAY_START_3D=1` or
-`SIM_DISPLAY_FORCE_MODE=1` to start or pin it) and self-described
+opt-in (`SIM_DISPLAY_OUTPUT=quad`; apps start in it since ADR-065 Amendment 1, and
+`SIM_DISPLAY_FORCE_MODE=1` pins it) and self-described
 as a *"view-inspection tool, not a sane default"*
 (`sim_display_device.c:52-56`). The Leia plug-in hardcodes
 `hmd->base.hmd->view_count = 2` on every platform (`src/drv_leia/leia_device.c:257`)
