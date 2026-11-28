@@ -210,7 +210,9 @@ build X" signal a downstream copy uses to re-pull.
   (`source_url`, the parent hash, the converter and its version) and carries the parent's
   licence. Where the licence allows us to publish the derivative, it goes to our model
   releases. Where it does not, as for Sharp, the user runs the conversion script locally
-  after downloading the official file.
+  after downloading the official file. *(Amended 2026-11-27: the runtime runs that conversion
+  itself through a signed builder, on the user's request; see "Amendment: research preview,
+  built locally".)*
 - **The model store's tamper rule is unchanged:** the host re-hashes a blob on first load.
   *Amended 2026-11-22, see "Amendment: verified on entry" below.*
 
@@ -323,6 +325,37 @@ downscaled pixels while `facts` were scaled to the caller's. The lift result's c
 a view of the file: only its `intrinsics` are re-expressed in the caller's pixels, with the scale
 the `facts` get, and the file is never rewritten. (The lift path asks for PLY, so today only the
 open provider's `SPLAT_FORMAT=sog` test switch reaches it.)
+
+### Amendment (2026-11-27): research preview, built locally by a signed builder
+
+Decision (David Fattal, 2026-11-27). SHARP becomes an opt-in **"Research preview
+(non-commercial)"** item that the Dashboard and the catalog can install. §5 already forbade hosting
+the weights and said the user runs the conversion script; what was missing was a way to do that
+without a Python environment and a terminal.
+
+- **We host nothing derived from the checkpoint.** The user's machine downloads the official
+  checkpoint from its upstream Hugging Face repository at a pinned revision (size + SHA-256
+  checked) and converts it locally with a **signed builder** we ship. The output is the pack's
+  existing blobs by SHA-256, so the model store's verification is unchanged.
+- **The builder is a catalog item** of a new class `model_builder`, flagged `research`: never in
+  the default install, never pre-ticked, never `recommended`. No weights, sources or derived files
+  are ever a catalog asset.
+- **The licence is shown and accepted before the download.** The pack ships the licence text and
+  pins its hash; acceptance is recorded per user, per licence id and per text hash, and the store
+  also checks it when it hands a model out, so a build by one user of a PC is not another user's
+  acceptance.
+- **The gate stays `AllowResearchOnly`.** No per-model allow: selection filters capabilities by
+  licence class and the provider picks the model inside its capability, so a per-model flag could
+  not open selection without a new ABI field. The Dashboard's single accept step records the
+  acceptance and turns the per-user `AllowResearchOnly` on, and says so in the tick's text. The CLI
+  never turns it on by itself.
+- **Only an explicit action builds** (`conv models fetch`, the Dashboard's Build button). A
+  provider's `model_request` and every installer still never fetch or build a research-only model.
+
+Contract: `conversion-provider-discovery.md` §5.6 (pack schema `local_build.tool` /
+`local_build.sources`, the builder's command line, progress events and exit codes, the store's
+sequence, the acceptance record, the Dashboard row, the catalog item). Out of scope: hosting
+converted weights, the default pack, partner / OEM material, Android.
 
 ## Consequences
 
