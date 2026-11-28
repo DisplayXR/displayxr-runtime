@@ -8,8 +8,8 @@ related: [ADR-010, ADR-020, ADR-022, ADR-028, ADR-030, ADR-041, ADR-047, ADR-051
 # ADR-066: Display-driver settings apply live; envelope sizing first, swapchain recreation as the rare path
 
 **Status:** Accepted (2026-11-23); C1 (per-screen 3D modes, applied live) and Part B (per-screen
-viewer tracking) implemented 2026-11-24, after runtime v2.70.5 (the QA build) was tagged; C2
-(swapchain recreation) is open. [Amendment 1](#amendment-1-2026-11-25-leiasr-multi-viewer-is-a-declared-3d-entry) (2026-11-25) reverses C1.5's
+viewer tracking) implemented 2026-11-24, after runtime v2.70.5 (the QA build) was tagged; C2/C3
+(swapchain recreation) are **not planned**, see [Amendment 2](#amendment-2-2026-11-28-no-swapchain-recreation-c2c3-not-planned). [Amendment 1](#amendment-1-2026-11-25-leiasr-multi-viewer-is-a-declared-3d-entry) (2026-11-25) reverses C1.5's
 "multi-viewer stays a driver setting": the vendor plug-in declares "LeiaSR multi-viewer" as a
 second 3D entry where the installed SR runtime can weave it.
 
@@ -814,6 +814,7 @@ event and the worst-case statement.**
   - *Windows:* the same against an IPC client and an in-process client.
 
 **Stage 5 — C2 / C3, recreation outside the declared list.**
+*Not planned (Amendment 2). Kept for the record.*
 - **Acceptance:** a test driver (or sim_display's Quad applied live through `settings_changed`)
   that adds a larger entry to its list at run time.
   - A displayxr-common app gets the table-changed event with the recreate bit and recreates; its log
@@ -915,3 +916,30 @@ them.
    for an IPC client) or on a live remap (C1.9). Nothing is woven before that, so nothing is drawn
    wrong today. Until then the driver must not assume that slot 1 is its own configured default:
    any state it keeps per entry starts from that default and is corrected by the first `OUTPUT_MODE`.
+
+## Amendment 2 (2026-11-28): no swapchain recreation (C2/C3 not planned)
+
+**Decision (project lead).** Swapchains are never recreated. An app sizes its swapchain once, at
+the worst case the runtime states over every declared entry of every screen
+(`XrDisplayRenderingWorstCaseDXR`, display_info v28), and every 3D-mode change inside that envelope
+applies live (C1). That covers every change a user can make from the Dashboard or the CLI on an
+installed driver.
+
+**What happens to the cases C2 listed.** A change outside the envelope a running instance was sized
+for (a driver installed or hot-plugged while apps run, a driver update with a larger entry, a
+setting that changes a driver's own list such as sim_display's Quad) is shown as
+`applies: restart_app` with its reason, as C1.3 already does, and takes effect when the app next
+starts. No running app is resampled into a mode it was not sized for.
+
+**Consequences.**
+- C2.1 to C2.8 and C3's resample and instance-loss paths are not built. Stage 5 is dropped.
+- `XR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR` stays **reserved**: no runtime sets
+  it, and apps must ignore it. ADR-010's "allocate once, never recreate" and ADR-065 decision 5 hold
+  without exception; INV-4.2 / INV-4.9 gain no exception and the linter is unchanged.
+- The `settings_changed` plug-in slot (C2.3) is not added. A driver setting other than the 3D mode
+  keeps the ADR-054 Amendment 3 rule (`RESTART_REQUIRED`).
+- App owners: size from the worst-case statement, not from the start-up mode table. Apps that size
+  from the start-up table only fit while every entry is no larger than slot 1 at start.
+
+**Reopen only if** a real product case needs a larger entry to apply without an app restart.
+
