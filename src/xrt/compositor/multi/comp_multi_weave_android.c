@@ -1326,7 +1326,7 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
 		// The caller re-publishes every frame and a drag / resize changes the
 		// rect on every one: WARN for the first geometry and a display change,
 		// INFO for a move or resize.
-		U_LOG_IFL(geometry_lifecycle ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+		U_LOG_IFL((geometry_lifecycle ? U_LOGGING_WARN : U_LOGGING_INFO), u_log_get_global_level(),
 		          "weave(#1036): present-owner window %d,%d %ux%u on display %d", origin_x, origin_y, client_w,
 		          client_h, display_id);
 	}
@@ -2848,7 +2848,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				mc->weave.sbs_first_use = true;
 			}
 			// The first output is a WARN; a re-allocation follows every resize step.
-			U_LOG_IFL(mc->weave.out_allocs_logged == 0 ? U_LOGGING_WARN : U_LOGGING_INFO,
+			U_LOG_IFL((mc->weave.out_allocs_logged == 0 ? U_LOGGING_WARN : U_LOGGING_INFO),
 			          u_log_get_global_level(), "weave(#1036): output %ux%u (%s layout)", want_w, want_h,
 			          nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"));
 			mc->weave.out_allocs_logged++;
@@ -3429,7 +3429,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				// Dirty on every drag step: WARN once per verdict, INFO after.
 				mc->weave.geometry_dirty = false;
 				const int verdict = fed ? 1 : 2;
-				U_LOG_IFL(mc->weave.rect_fed_logged != verdict ? U_LOGGING_WARN : U_LOGGING_INFO,
+				U_LOG_IFL((mc->weave.rect_fed_logged != verdict ? U_LOGGING_WARN : U_LOGGING_INFO),
 				          u_log_get_global_level(), "weave(#1036): window rect %s the DP phase slot",
 				          fed ? "fed to" : "NOT accepted by");
 				mc->weave.rect_fed_logged = verdict;
@@ -3557,7 +3557,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				acquire_imported = true;
 			} else {
 				// Once per session at WARN: a failing import fails every frame.
-				U_LOG_IFL(mc->weave.sync_import_warned ? U_LOGGING_INFO : U_LOGGING_WARN,
+				U_LOG_IFL((mc->weave.sync_import_warned ? U_LOGGING_INFO : U_LOGGING_WARN),
 				          u_log_get_global_level(),
 				          "weave v20: acquire sync_file import failed — CPU-polling it this frame");
 				mc->weave.sync_import_warned = true;

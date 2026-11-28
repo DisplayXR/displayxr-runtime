@@ -1159,7 +1159,7 @@ weave_create_output_dmabuf(struct vk_bundle *vk, struct multi_compositor *mc, ui
 	mc->weave.out_h = h;
 	mc->weave.out_is_dmabuf = true;
 	// The first output is a WARN; a re-allocation follows every resize step.
-	U_LOG_IFL(mc->weave.out_allocs_logged == 0 ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+	U_LOG_IFL((mc->weave.out_allocs_logged == 0 ? U_LOGGING_WARN : U_LOGGING_INFO), u_log_get_global_level(),
 	          "weave(#1699): output %ux%u is a dma-buf: fourcc 0x%08x modifier 0x%016" PRIx64
 	          " (%s from %u), %u plane(s), plane0 offset %u stride %u, %" PRIu64 " bytes",
 	          w, h, desc.drm_fourcc, desc.drm_modifier,
@@ -1675,7 +1675,7 @@ weave_feed_dp_geometry(struct multi_compositor *mc)
 		mc->weave.panel_frame = panel;
 		mc->weave.have_panel_frame = true;
 		U_LOG_IFL(
-		    lifecycle ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+		    (lifecycle ? U_LOGGING_WARN : U_LOGGING_INFO), u_log_get_global_level(),
 		    "weave(#1699): present origin (%d,%d) panel-relative (from %s; window %d,%d, panel X11 origin "
 		    "(%d,%d) %ux%u, device %ux%u @ %.4f) %s the DP phase slot%s",
 		    ox, oy, u_weave_origin_source_str(src), mc->weave.win_x, mc->weave.win_y, panel.screen_left,
@@ -2847,7 +2847,8 @@ weave_run_frame(struct vk_bundle *vk,
 			mc->weave.sbs_first_use = true;
 		}
 		// The first output is a WARN; a re-allocation follows every resize step.
-		U_LOG_IFL(mc->weave.out_allocs_logged == 0 ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+		U_LOG_IFL((mc->weave.out_allocs_logged == 0 ? U_LOGGING_WARN : U_LOGGING_INFO),
+		          u_log_get_global_level(),
 		          "weave(#1699): output %ux%u (%s layout), exported %s %" PRIu64 " bytes", want_w, want_h,
 		          nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"),
 		          want_dmabuf_out ? "dma-buf" : "OPAQUE_FD", (uint64_t)mc->weave.out_size);
@@ -3809,7 +3810,7 @@ comp_multi_weave_set_window_geometry_logical(struct xrt_compositor *xc,
 		// The caller re-publishes every frame and a drag / resize changes the
 		// rect on every one: WARN for the first geometry and a display change,
 		// INFO for a move or resize.
-		U_LOG_IFL(geometry_lifecycle ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+		U_LOG_IFL((geometry_lifecycle ? U_LOGGING_WARN : U_LOGGING_INFO), u_log_get_global_level(),
 		          "weave(#1699): present-owner window %d,%d %ux%u on display %d", origin_x, origin_y, client_w,
 		          client_h, display_id);
 	}

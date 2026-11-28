@@ -1019,7 +1019,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				overlay = NULL; // ownership transferred
 				// A double-buffered overlay alternates ids every frame: WARN
 				// for the first imports only (as Linux), INFO after.
-				U_LOG_IFL(mc->weave.overlay_imports_logged < 16 ? U_LOGGING_WARN : U_LOGGING_INFO,
+				U_LOG_IFL((mc->weave.overlay_imports_logged < 16 ? U_LOGGING_WARN : U_LOGGING_INFO),
 				          u_log_get_global_level(), "weave(#759) v4: overlay import cached (%ux%u)",
 				          mc->weave.overlay_w, mc->weave.overlay_h);
 				if (mc->weave.overlay_imports_logged < 16) {
