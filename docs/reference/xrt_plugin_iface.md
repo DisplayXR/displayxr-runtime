@@ -161,25 +161,32 @@ Construct the plug-in's `xrt_device` — the head / HMD-equivalent device for th
 
 Ownership of `*out_dev` is transferred to the runtime, which destroys the device via the usual `xrt_device::destroy` vtable method (not through this iface's `destroy`).
 
-**The device's rendering-mode table: two modes at run time
-([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md)).** Declare `rendering_modes[0]`
-= the flat 2D mode (1 view, `hardware_display_3d = false`) and `rendering_modes[1]` = your
-3D mode, `rendering_mode_count = 2`, `mode_index` = the array position. If your display
-supports several 3D *kinds* (layouts, weaver variants), expose the choice as a setting
-(`describe_settings` ENUM + `get_setting`) read when you create the device, and fill mode 1
-from it — the kind applies the next time the runtime starts, never under running apps. You do
+**The device's rendering-mode table: two slots at run time
+([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md),
+[ADR-066](../adr/ADR-066-live-display-driver-settings-envelope-sizing.md) C1).** Declare
+`rendering_modes[0]` = the flat 2D mode (1 view, `hardware_display_3d = false`) and
+`rendering_modes[1]` = your 3D mode, `mode_index` = the array position. If your display
+supports several 3D *kinds* (layouts, weaver variants the user picks between), declare each as
+a further 3D entry: the full list is the sizing envelope, apps still see two slots, and slot 1
+is the entry the screen's 3D mode names (a stored per-screen choice, else your
+`XRT_DEVICE_PROPERTY_CONFIGURED_3D_MODE` answer), switched live. A weaver variant with no
+geometry of its own qualifies (the Leia plug-in's "LeiaSR multi-viewer", ADR-066 Amendment 1). You do
 not choose the mode apps start in: whatever `active_rendering_mode_index` you set, the runtime
 starts every app in mode 1 right after the trim and calls your `set_property(OUTPUT_MODE, 1)`
 (ADR-065 Amendment 1; only a developer pin, `OUTPUT_MODE_PINNED`, keeps yours). The runtime enforces the contract
 where it takes the table (right after `create_device`, again when your display info is
-applied): a longer table is trimmed to mode 0 plus one 3D mode (the one active at creation
-if it is 3D, else the first 3D one), with a WARN naming your plug-in and what was dropped,
-and `hmd->view_count` is recomputed from what remains. A table whose mode 0 is not the 1-view
+applied): a longer table is presented as mode 0 plus one 3D mode (the stored choice, else your
+`CONFIGURED_3D_MODE`, else the one active at creation if it is 3D, else the first 3D one) with
+the rest kept behind `rendering_mode_count` for sizing and live remaps, a WARN naming your
+plug-in, and `hmd->view_count` taken over the declared envelope (every entry but the `START_UP_ONLY` ones). A table whose mode 0 is not the 1-view
 2D mode is kept as declared, with a WARN — it does not meet the contract. When the 3D mode
 kept is not your index 1, `XRT_DEVICE_PROPERTY_OUTPUT_MODE` still reaches your
 `set_property` / `get_property` in your own numbering, and for the duration of that call
 (under a lock the runtime owns) your device shows your own `rendering_mode_count`, so an
-index check and a `rendering_modes[index]` read still work — but declare two modes.
+index check and a `rendering_modes[index]` read still work. The head screen's entry reaches
+you only this way: `set_output_entry` is called on non-primary segment DPs alone (ADR-066
+Amendment 1, note 1), and the first `OUTPUT_MODE` of a session, not instance creation, tells
+you which entry slot 1 maps to (note 2).
 `XRT_MAX_RENDERING_MODES` and the struct layout are unchanged; this is not an ABI change.
 
 ### Per-API DP factories
@@ -701,7 +708,9 @@ other claimed screen's), and tells a DP made by your `create_dp_vk_for_screen` f
 to draw through `set_output_entry` (`xrt_display_processor_vk`, and its D3D11 / D3D12 / GL twins
 for a DP made by `create_dp_d3d11_for_screen` / `_d3d12_` / `_gl_`; each gated by `struct_size` and
 announced by `XRT_DP_{VK,D3D11,D3D12,GL}_HAS_OUTPUT_ENTRY`), in THIS list's numbering, before the
-`process_atlas` that hands it an atlas laid out as that entry's tiles.
+`process_atlas` that hands it an atlas laid out as that entry's tiles. That is a non-primary
+segment's DP only: the head screen's DP is never told through this slot, and follows the entry
+the head device receives through `set_property(OUTPUT_MODE)` (ADR-066 Amendment 1, note 1).
 
 On macOS a DP made by your `create_dp_metal_for_screen` factory is told the same through
 `xrt_display_processor_metal::set_output_entry` (appended after `get_eye_positions_at`, gated by

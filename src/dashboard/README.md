@@ -381,6 +381,12 @@ lines, the scope and command-line notes, the catalog detail and the removal sent
   | simulated display | `FORCE_MODE` | Always 2D | switch | on writes `0`; off always writes the default `-1` for this user (never an unset: `dp options` shows only the winning layer, so an unset could leave a machine-wide value winning); "Use the default" unsets; a stored `1` shows as its own state, *Always 3D preview*, with "Use the default" |
   | any driver | `MULTI_VIEWER` | Several viewers | drop-down | Follow the display's own setting `system`, On `on`, Off `off` |
 
+  `MULTI_VIEWER` is also an alias since [ADR-066 Amendment 1](../../docs/adr/ADR-066-live-display-driver-settings-envelope-sizing.md#amendment-1-2026-11-25-leiasr-multi-viewer-is-a-declared-3d-entry):
+  on a Windows Leia screen whose SR runtime can weave for several viewers, the plug-in declares
+  "LeiaSR multi-viewer" as its own 3D mode, so the choice is offered per screen as a 3D mode, and
+  `on` only makes that entry the default of a screen with no stored choice (which the runtime
+  applies live). Elsewhere it is the start-up driver setting it always was.
+
   The four-view kind carries "For checking four-view apps. Most apps show only two of the views, or
   stay in 2D." under the control while it is in force. The CLI's JSON has no per-value view count
   (and the status snapshot only the kind in force), so this is keyed on the value name `quad`.
