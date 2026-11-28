@@ -106,7 +106,7 @@ typedef void (*u_log_sink_func_t)(const char *file,
  */
 #define U_LOG_IFL(level, cond_level, ...)                                                                              \
 	do {                                                                                                           \
-		if (cond_level <= level) {                                                                             \
+		if ((cond_level) <= (level)) {                                                                         \
 			u_log(__FILE__, __LINE__, __func__, level, __VA_ARGS__);                                       \
 		}                                                                                                      \
 	} while (false)
@@ -137,7 +137,7 @@ typedef void (*u_log_sink_func_t)(const char *file,
  */
 #define U_LOG_XDEV_IFL(level, cond_level, xdev, ...)                                                                   \
 	do {                                                                                                           \
-		if (cond_level <= level) {                                                                             \
+		if ((cond_level) <= (level)) {                                                                         \
 			u_log_xdev(__FILE__, __LINE__, __func__, level, xdev, __VA_ARGS__);                            \
 		}                                                                                                      \
 	} while (false)
@@ -155,7 +155,7 @@ typedef void (*u_log_sink_func_t)(const char *file,
  */
 #define U_LOG_IFL_HEX(level, cond_level, data, data_size)                                                              \
 	do {                                                                                                           \
-		if (cond_level <= level) {                                                                             \
+		if ((cond_level) <= (level)) {                                                                         \
 			u_log_hex(__FILE__, __LINE__, __func__, level, data, data_size);                               \
 		}                                                                                                      \
 	} while (false)
@@ -173,7 +173,7 @@ typedef void (*u_log_sink_func_t)(const char *file,
  */
 #define U_LOG_XDEV_IFL_HEX(level, cond_level, xdev, data, data_size)                                                   \
 	do {                                                                                                           \
-		if (cond_level <= level) {                                                                             \
+		if ((cond_level) <= (level)) {                                                                         \
 			u_log_xdev_hex(__FILE__, __LINE__, __func__, level, xdev, data, data_size);                    \
 		}                                                                                                      \
 	} while (false)
