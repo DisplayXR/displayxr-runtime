@@ -1004,9 +1004,9 @@ against the plug-in repo, do not mark the CTS test FAIL.
 
 ### 10.2 `EyeVisibility` — both views land on one panel
 
-**Rule: switch to `SIM_DISPLAY_OUTPUT=sbs` with `SIM_DISPLAY_START_3D=1` for this
-one test (sim-display starts in 2D otherwise, and a CTS session cannot move it),
-and read the panel as two side-by-side images: LEFT half = left view, RIGHT half
+**Rule: switch to `SIM_DISPLAY_OUTPUT=sbs` for this one test (the runtime starts
+every session in mode 1, the 3D kind, since ADR-065 Amendment 1; `START_3D` is a
+no-op now), and read the panel as two side-by-side images: LEFT half = left view, RIGHT half
 = right view. Pass only if each half contains exactly one quad, of the right
 colour.**
 
@@ -1034,7 +1034,7 @@ is a real conformance defect, not a display artefact.
 Note `sbs` is **centre-cropped**, and the quads sit at x = ±1 m, i.e. toward the
 outer edges. A quad clipped by the crop is not the same as a quad suppressed by
 eye visibility. If a quad's presence is genuinely ambiguous, re-run this one
-test in `squeezed_sbs` (again with `SIM_DISPLAY_START_3D=1`), which places the
+test in `squeezed_sbs`, which places the
 tiles as-is with no crop, and judge there.
 
 ### 10.3 Stale-swapchain flicker versus weave-phase flicker
