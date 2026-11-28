@@ -159,6 +159,13 @@ public class ComponentRowsTests
     [InlineData("", @"C:\Program Files\Example\Runtime", false)]
     [InlineData(@"C:\Program Files\Example\Runtime\plugins\Pad.dll", null, false)]
     [InlineData(@"C:\Program Files\Example\Runtime\plugins\Pad.dll", "", false)]
+    // macOS .pkg: CLI in <root>/bin, plug-ins in <root>/lib/displayxr/plugins.
+    [InlineData("/Library/Application Support/DisplayXR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib", "/Library/Application Support/DisplayXR/bin", true)]
+    // Linux .deb: CLI in /usr/lib/displayxr/bin, plug-ins in /usr/lib/displayxr/plugins.
+    [InlineData("/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so", "/usr/lib/displayxr/bin", true)]
+    [InlineData("/Library/Application Support/DisplayXR/lib/libother.dylib", "/Library/Application Support/DisplayXR/bin", false)]
+    [InlineData("/Users/u/Library/Application Support/DisplayXR/lib/displayxr/plugins/x.dylib", "/Library/Application Support/DisplayXR/bin", false)]
+    [InlineData("/opt/x/lib/displayxr/plugins/x.dylib", "/opt/x/tools", false)] // only a CLI folder named bin has a sibling layout
     public void ShippedByRuntime_IsTheRuntimesPluginsFolder(string binary, string? runtimeDir, bool shipped) =>
         Assert.Equal(shipped, ComponentRows.ShippedByRuntime(binary, runtimeDir));
 

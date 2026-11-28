@@ -63,6 +63,11 @@ for rt in /etc/xdg/openxr/1/active_runtime.json /usr/local/share/openxr/1/active
     esac
 done
 
+echo "Removing DisplayXR Dashboard..."
+# Shipped inside the runtime component (build_installer.sh); quit it first.
+pkill -x displayxr-dashboard 2>/dev/null || true
+sudo rm -rf "/Applications/DisplayXR Dashboard.app"
+
 echo "Removing test app..."
 rm -rf "/Applications/DisplayXRCube.app"
 

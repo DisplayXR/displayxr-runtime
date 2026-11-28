@@ -15,3 +15,7 @@
 # DP plug-in loads into IT. (The bundle's CFBundleExecutable is a shell
 # launcher; the real Mach-O lives in Resources/.)
 Contents/Resources/cube_*               plugin-host.entitlements
+# DisplayXR Dashboard.app (.NET): its main executable, and the bundle (whose
+# signature re-signs that executable): the JIT entitlement.
+*Contents/MacOS/displayxr-dashboard     dotnet-app.entitlements
+*Dashboard.app                          dotnet-app.entitlements

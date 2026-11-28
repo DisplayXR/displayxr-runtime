@@ -15,7 +15,8 @@ namespace DisplayXR.Dashboard.Feed;
 /// Spawns the sibling <c>displayxr-cli</c> (<c>displayxr-cli.exe</c> on Windows):
 /// next to this executable (an installed runtime, <c>_package\bin</c>, or the
 /// Linux <c>/usr/lib/displayxr/bin</c> / <c>~/.local/share/displayxr/bin</c>),
-/// else the installed runtime's. Every child joins a kill-on-close job object on
+/// else the installed runtime's (on macOS <c>/Library/Application Support/DisplayXR/bin</c>:
+/// the Dashboard is an app bundle in <c>/Applications</c>, away from the runtime). Every child joins a kill-on-close job object on
 /// Windows, so no <c>displayxr-cli</c> outlives the dashboard, crash or not.
 /// </summary>
 public sealed class CliProcessSource : IProcessSource
@@ -42,18 +43,22 @@ public sealed class CliProcessSource : IProcessSource
         OperatingSystem.IsWindows()
             ? Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)
             : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        File.Exists);
+        File.Exists,
+        OperatingSystem.IsMacOS());
 
     /// <summary>
     /// The resolution order, pure for the tests: <c>DXR_DASHBOARD_CLI</c>, the
     /// directory of this executable, then the platform's installed locations —
     /// Windows <c>%ProgramFiles%\DisplayXR\Runtime</c>; Linux the .deb's
     /// <c>/usr/lib/displayxr/bin</c>, the tarball's
-    /// <c>~/.local/share/displayxr/bin</c>, then <c>/usr/bin</c>. Nothing found:
-    /// the sibling path (a run then reports it missing).
+    /// <c>~/.local/share/displayxr/bin</c>, then <c>/usr/bin</c>; macOS the .pkg's
+    /// <c>/Library/Application Support/DisplayXR/bin</c> (the service's own directory,
+    /// the one the service admits a status reader from, #960), then the postinstall's
+    /// <c>/usr/local/bin</c> link. Nothing found: the sibling path (a run then reports it missing).
     /// </summary>
     /// <param name="installRoot">Windows: Program Files. Elsewhere: the home directory.</param>
-    public static string Resolve(bool windows, string? overridePath, string baseDir, string installRoot, Func<string, bool> exists)
+    public static string Resolve(bool windows, string? overridePath, string baseDir, string installRoot, Func<string, bool> exists,
+                                 bool macos = false)
     {
         if (!string.IsNullOrWhiteSpace(overridePath) && exists(overridePath)) return overridePath;
         string name = CliFileName(windows);
@@ -61,6 +66,11 @@ public sealed class CliProcessSource : IProcessSource
         if (exists(beside)) return beside;
         string[] installed = windows
             ? [Join(true, installRoot, "DisplayXR", "Runtime", name)]
+            : macos
+            ? [
+                MacRuntimeBin + "/" + name,
+                "/usr/local/bin/" + name,
+              ]
             : [
                 "/usr/lib/displayxr/bin/" + name,
                 Join(false, installRoot, ".local", "share", "displayxr", "bin", name),
@@ -70,6 +80,9 @@ public sealed class CliProcessSource : IProcessSource
             if (exists(candidate)) return candidate;
         return beside;
     }
+
+    /// <summary>The macOS .pkg's runtime <c>bin</c> directory (service, CLI, satellites).</summary>
+    public const string MacRuntimeBin = "/Library/Application Support/DisplayXR/bin";
 
     // Path.Combine with the TARGET platform's separator, so the tests can check
     // both platforms' resolution from either host.

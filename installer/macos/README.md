@@ -14,6 +14,8 @@ sudo installer -pkg DisplayXR-Installer.pkg -target /
 |-----------|----------|
 | DisplayXR Runtime | `/Library/Application Support/DisplayXR/` |
 | OpenXR runtime registration | `/etc/xdg/openxr/1/active_runtime.json` |
+| DisplayXR Dashboard | `/Applications/DisplayXR Dashboard.app` (part of the runtime component; needs the .NET 10 SDK at build time) |
+| displayxr-cli | `/Library/Application Support/DisplayXR/bin/displayxr-cli` (linked from `/usr/local/bin`) |
 | SimCube OpenXR Test App | `/Applications/SimCubeOpenXR.app` |
 
 ## Run the Test App
@@ -38,7 +40,7 @@ Options: `anaglyph`, `sbs`, `blend`
 sudo "/Library/Application Support/DisplayXR/uninstall.sh"
 ```
 
-This removes the runtime, test app, OpenXR registration, and installer receipts.
+This removes the runtime, the DisplayXR Dashboard, the test app, the OpenXR registration, and installer receipts.
 
 ## Build the Installer Locally
 
