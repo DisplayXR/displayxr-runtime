@@ -1372,6 +1372,9 @@ jobs:
     if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-runtime' }}
     needs: [Runtime]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write   # dispatch publish-catalog.yml (last step)
     steps:
       - name: Mint App installation token
         id: app-token
@@ -1531,3 +1534,15 @@ jobs:
               "tag":         "${{ github.ref_name }}",
               "source_repo": "DisplayXR/displayxr-runtime"
             }
+
+      # The bump above is a bot push with [skip ci]: publish-catalog.yml's push and
+      # workflow_run triggers never see it (#2758). The installer is usually still
+      # the unsigned CI build here, so that run carries the previous runtime forward
+      # and its recheck job runs it again until the signed one is up. Dispatched with
+      # GITHUB_TOKEN, which may start a workflow_dispatch run. Non-fatal.
+      - name: Refresh the component catalog
+        if: steps.abi.outputs.rc == '0'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run publish-catalog.yml -R "$GITHUB_REPOSITORY" --ref main

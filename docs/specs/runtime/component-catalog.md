@@ -126,7 +126,11 @@ without the key is the only revocation.
 
 `publish-catalog.yml` (windows-latest) runs on a push to `main` touching `versions.json`
 (or the generator/workflow), after a successful `Bump versions.json` run (sibling bumps
-commit with `[skip ci]` and create no push run), weekly, and on dispatch. It mints the
+commit with `[skip ci]` and create no push run), weekly, and on dispatch. The runtime's
+own bump (`BumpVersionsJsonOnTag` in `build-windows.yml`, also `[skip ci]`) dispatches it.
+A bump usually lands before the signed asset replaces the unsigned CI one, so while any
+component's `windows.version` is not its `recommended` pin (`gen_catalog.py pending`), the
+workflow's `recheck` job dispatches it again after 15 minutes, up to 8 times (#2758). It mints the
 publish-bot App token (`displayxr-browser` to write; `displayxr-browser-pvt` to read the
 browser's floor), generates with `--previous` = the live catalog, verifies, and commits
 `feed/catalog/v1/stable.json` + `.sig` to `displayxr-browser` `main`. That commit is **not**

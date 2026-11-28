@@ -13,6 +13,7 @@ https://updates.displayxr.org/catalog/v1/stable.json (+ .sig) by
                             [--previous URL|FILE] [--out-v2 DIR2]
     gen_catalog.py verify   DIR/stable.json [--sig DIR/stable.json.sig]
     gen_catalog.py validate-detect displayxr-detect.json
+    gen_catalog.py pending  DIR/stable.json
 
 Display plug-ins (kind "display_plugin") describe themselves (#2737): each release
 may attach a `displayxr-detect.json` (schema 1: id, label, registry_version,
@@ -1297,6 +1298,23 @@ def cmd_verify(args):
     return 0
 
 
+def pending_components(catalog):
+    """Components whose pin is not what the catalog lists for Windows: the windows
+    block was carried forward from an older release, or there is none. Typically a
+    release whose signed asset had not replaced the unsigned CI one when this run
+    looked (#2758); publish-catalog.yml runs again later while this is non-empty."""
+    return [name for name, comp in catalog.get("components", {}).items()
+            if comp.get("windows", {}).get("version") != comp.get("recommended")]
+
+
+def cmd_pending(args):
+    with open(args.catalog, encoding="utf-8") as f:
+        cat = json.load(f)
+    for name in pending_components(cat):
+        print(name)
+    return 0
+
+
 def cmd_validate_detect(args):
     with open(args.manifest, encoding="utf-8") as f:
         m = json.load(f)
@@ -1340,6 +1358,10 @@ def main():
     d = sub.add_parser("validate-detect", help=f"check a display plug-in's {DETECT_MANIFEST} (schema 1)")
     d.add_argument("manifest", help=f"path to {DETECT_MANIFEST}")
     d.set_defaults(func=cmd_validate_detect)
+
+    p = sub.add_parser("pending", help="print the components whose pin is not listed yet, one per line")
+    p.add_argument("catalog", help="path to stable.json")
+    p.set_defaults(func=cmd_pending)
 
     args = ap.parse_args()
     return args.func(args)

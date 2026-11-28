@@ -16,14 +16,19 @@ name: Publish component catalog
 #   - push to main touching versions.json (a pin edited by hand in a PR);
 #   - workflow_run after "Bump versions.json" — sibling bumps commit with [skip ci],
 #     which creates no push run, so the push trigger alone would miss them;
-#   - weekly schedule — re-signs before the 30-day expiry and picks up a signed
-#     asset that replaced an unsigned CI one after the bump;
-#   - workflow_dispatch.
+#   - workflow_dispatch — also sent by build-windows.yml's BumpVersionsJsonOnTag after
+#     the runtime's own versions.json bump (a bot push with [skip ci], which neither
+#     trigger above sees), by /release after it swaps in the signed installer, and by
+#     this workflow's `recheck` job (below);
+#   - weekly schedule — re-signs before the 30-day expiry.
 #
 # A pin whose asset is not (yet) Authenticode-signed by an allowed signer is not
 # listed; the generator then carries forward the previously published, verified
 # windows block for that component (--previous), so a release in mid-signing never
-# makes a component unfetchable.
+# makes a component unfetchable. The bump usually lands minutes BEFORE the signed
+# asset replaces the unsigned CI one (#2758), so while any pin is not listed
+# (`gen_catalog.py pending`), the `recheck` job waits RECHECK_MINUTES and dispatches
+# this workflow again, at most RECHECK_MAX times in a row (`attempt` counts them).
 #
 # Windows runner: the Authenticode check is Get-AuthenticodeSignature.
 #
@@ -60,6 +65,10 @@ on:
         description: 'Also generate, sign and publish catalog/v2/stable.json (schema 2, ADR-064)'
         type: boolean
         default: false
+      attempt:
+        description: 'Re-check number after a pin that was not listed yet (set by the recheck job; leave 0)'
+        type: string
+        default: '0'
 
 permissions:
   contents: read
@@ -67,11 +76,10 @@ permissions:
 env:
   # "true" turns the schema-2 publish on. See the header.
   PUBLISH_V2: ${{ vars.DXR_PUBLISH_CATALOG_V2 == 'true' || inputs.publish_v2 == true }}
-
-concurrency:
-  # Never cancel mid-publish; queue. A later run regenerates from current main anyway.
-  group: publish-catalog
-  cancel-in-progress: false
+  # A signed asset normally replaces the CI one within minutes of the bump; these
+  # cover a signing run that waits for the runner for up to about two hours.
+  RECHECK_MINUTES: 15
+  RECHECK_MAX: 8
 
 jobs:
   publish:
@@ -79,6 +87,14 @@ jobs:
       github.repository == 'DisplayXR/displayxr-runtime' &&
       (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: windows-latest
+    # On the job, not the workflow, so a recheck waiting out its delay never holds
+    # the group. Never cancel mid-publish; queue. A later run regenerates from
+    # current main anyway.
+    concurrency:
+      group: publish-catalog
+      cancel-in-progress: false
+    outputs:
+      pending: ${{ steps.pending.outputs.names }}
     defaults:
       run:
         shell: bash
@@ -153,6 +169,16 @@ jobs:
           python -c "import json;c=json.load(open('out/stable.json'));print(json.dumps({k:{'recommended':v['recommended'],'windows':v.get('windows',{}).get('version'),'requires':v.get('requires')} for k,v in c['components'].items()},indent=1))" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Pins not listed yet
+        id: pending
+        run: |
+          set -euo pipefail
+          names=$(python scripts/gen_catalog.py pending out/stable.json | tr -d '\r' | paste -sd' ' -)
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+          if [ -n "$names" ]; then
+            echo "::notice::not listed at their pin yet (unsigned or missing asset): $names"
+          fi
+
       - name: Verify schema-2 catalog
         id: v2
         if: steps.generate.outputs.v2_generated == 'true'
@@ -203,3 +229,31 @@ jobs:
             git pull --rebase origin main
           done
           exit 1
+
+  # A pin that was not listable (#2758): look again later, after the signing flow has
+  # had time to replace the unsigned CI asset. Runs on ubuntu outside the publish
+  # group; only the dispatched run publishes. Skipped once nothing is pending.
+  recheck:
+    needs: publish
+    if: needs.publish.outputs.pending != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Wait, then dispatch this workflow again
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTEMPT: ${{ inputs.attempt || '0' }}
+          PENDING: ${{ needs.publish.outputs.pending }}
+          V2_INPUT: ${{ inputs.publish_v2 == true }}
+        run: |
+          set -euo pipefail
+          case "$ATTEMPT" in ''|*[!0-9]*) ATTEMPT=0 ;; esac
+          if [ "$ATTEMPT" -ge "$RECHECK_MAX" ]; then
+            echo "::warning::still not listed after $ATTEMPT re-checks: $PENDING. The weekly run, or a manual dispatch once the signed asset is up, picks it up."
+            exit 0
+          fi
+          sleep $((RECHECK_MINUTES * 60))
+          gh workflow run publish-catalog.yml -R "$GITHUB_REPOSITORY" --ref main \
+            -f attempt=$((ATTEMPT + 1)) -f publish_v2="$V2_INPUT"
+          echo "dispatched re-check $((ATTEMPT + 1))/$RECHECK_MAX for: $PENDING"
