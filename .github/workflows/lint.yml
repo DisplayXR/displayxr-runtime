@@ -42,6 +42,11 @@ name: lint
 #   clone lets the history tests replay v2.21.0 -> v2.21.1 (must bump on
 #   XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE) and v2.20.1 -> v2.21.0 (must not).
 #
+# - test_apps live-mode gate (in the downstream-pin-guard job, next to the
+#   app-linter unit tests): scripts/lint_test_apps.py lints every app under
+#   test_apps/ for the ADR-066 rules INV-2.10 / INV-4.2 / INV-4.9 only and
+#   fails on a finding its baseline does not list.
+#
 # Add other lightweight lint jobs here as needed (yaml validity,
 # CLAUDE.md presence, etc.).
 
@@ -378,6 +383,23 @@ jobs:
         # Hermetic. Pins the per-leg "requests modes but never uses dxr::ModeSwitch"
         # check: the runtime never eases a 2D<->3D switch, the app must.
         run: python3 scripts/tests/test_check_displayxr_app_mode_switch.py
+
+      - name: App-linter ADR-066 live-mode-table unit tests
+        # Hermetic. Pins INV-2.10 (re-read the rendering-mode table on
+        # XrEventDataRenderingModeTableChangedDXR), INV-4.2 (size the projection
+        # swapchain at XrDisplayRenderingWorstCaseDXR) and INV-4.9 (never
+        # xrCreateSwapchain from an event handler), plus the test_apps gate below.
+        run: python3 scripts/tests/test_check_displayxr_app_live_mode_table.py
+
+      - name: test_apps hold the ADR-066 live-mode contract
+        # Lints every app under test_apps/ for INV-2.10 / INV-4.2 / INV-4.9 only
+        # (the linter's other findings on these apps are not gated here) and
+        # fails on any finding scripts/lint_test_apps_baseline.json does not
+        # list. The in-tree apps drifted from this contract twice in one week:
+        # they read the mode table once (#2875) and sized from it. A baseline
+        # entry that no longer matches is a notice; drop it with
+        # `python3 scripts/lint_test_apps.py --update-baseline`.
+        run: python3 scripts/lint_test_apps.py
 
       - name: Drift-audit existing-issue lookup unit tests
         # Hermetic (gh stubbed). Pins that the weekly audit finds its own open
