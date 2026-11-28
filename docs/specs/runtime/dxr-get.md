@@ -563,6 +563,10 @@ itself elevated; a front end that wants that does it: [`displayxr-cli catalog`](
   60 s) and at most four attempts with 1 s, 4 s and 15 s between them. A child installer or
   uninstaller is waited for at most one hour; one still running after that is reported as
   failed (exit 30) and is not killed. Stopping the service waits at most 5 s per process.
+  While a child runs, the log gets a line every 30 s (`<item>: the installer is still running
+  (N s)`): a component's `/S` installer prints nothing, and a caller that bounds its wait by
+  time without output (the runtime installer's nsExec `/TIMEOUT`, #2841) needs that line to
+  tell a live install from a hung one.
 
 ## Detection (P2)
 
