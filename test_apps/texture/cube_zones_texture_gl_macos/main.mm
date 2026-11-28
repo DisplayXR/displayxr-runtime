@@ -2024,6 +2024,54 @@ static bool GetGLGraphicsRequirements(AppXrSession &app)
     return true;
 }
 
+//! (Re)read the runtime's rendering-mode table into the renderingMode* arrays
+//! and the active index. Called after xrCreateSession and again on
+//! XrEventDataRenderingModeChangedDXR and XrEventDataRenderingModeTableChangedDXR
+//! (XR_DXR_display_info v27, ADR-066 C1): a live 3D-mode change re-describes
+//! slot 1 (view count, tiles, scale, hardwareDisplay3D) under an unchanged
+//! index, and the frame loop reads its tiling from these arrays (#2852).
+static void EnumerateRenderingModes(AppXrSession &app)
+{
+    app.renderingModeCount = 0;
+    if (app.pfnEnumerateDisplayRenderingModesEXT && app.session != XR_NULL_HANDLE) {
+        uint32_t modeCount = 0;
+        XrResult enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, 0, &modeCount, nullptr);
+        if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
+            for (uint32_t i = 0; i < modeCount; i++) {
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
+                modes[i].next = nullptr;
+            }
+            enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, modeCount, &modeCount, modes.data());
+            if (XR_SUCCEEDED(enumRes)) {
+                app.renderingModeCount = modeCount > 8 ? 8 : modeCount;
+                LOG_INFO("Display rendering modes (%u):", modeCount);
+                for (uint32_t i = 0; i < app.renderingModeCount; i++) {
+                    strncpy(app.renderingModeNames[i], modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
+                    app.renderingModeNames[i][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
+                    app.renderingModeViewCounts[i] = modes[i].viewCount;
+                    app.renderingModeTileColumns[i] = modes[i].tileColumns;
+                    app.renderingModeTileRows[i] = modes[i].tileRows;
+                    app.renderingModeScaleX[i] = modes[i].viewScaleX;
+                    app.renderingModeScaleY[i] = modes[i].viewScaleY;
+                    app.renderingModeDisplay3D[i] = modes[i].hardwareDisplay3D ? true : false;
+                    app.renderingModeIsRequestable[i] = modes[i].isRequestable ? true : false;
+                    // v13 initial-mode-sync: trust runtime-reported active mode.
+                    if (modes[i].isActive) {
+                        app.currentModeIndex = modes[i].modeIndex;
+                    }
+                    LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%s)",
+                        modes[i].modeIndex, modes[i].modeName,
+                        modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows,
+                        modes[i].viewScaleX, modes[i].viewScaleY,
+                        modes[i].hardwareDisplay3D ? "yes" : "no");
+                }
+                g_input.renderingModeCount = app.renderingModeCount;
+            }
+        }
+    }
+}
+
 static bool CreateSession(AppXrSession &app, GLRenderer &r)
 {
     (void)r;
@@ -2124,45 +2172,8 @@ static bool CreateSession(AppXrSession &app, GLRenderer &r)
         }
     }
 
-    // Enumerate available rendering modes and store names
-    app.renderingModeCount = 0;
-    if (app.pfnEnumerateDisplayRenderingModesEXT && app.session != XR_NULL_HANDLE) {
-        uint32_t modeCount = 0;
-        XrResult enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, 0, &modeCount, nullptr);
-        if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
-            for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
-                modes[i].next = nullptr;
-            }
-            enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, modeCount, &modeCount, modes.data());
-            if (XR_SUCCEEDED(enumRes)) {
-                app.renderingModeCount = modeCount > 8 ? 8 : modeCount;
-                LOG_INFO("Display rendering modes (%u):", modeCount);
-                for (uint32_t i = 0; i < app.renderingModeCount; i++) {
-                    strncpy(app.renderingModeNames[i], modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
-                    app.renderingModeNames[i][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
-                    app.renderingModeViewCounts[i] = modes[i].viewCount;
-                    app.renderingModeTileColumns[i] = modes[i].tileColumns;
-                    app.renderingModeTileRows[i] = modes[i].tileRows;
-                    app.renderingModeScaleX[i] = modes[i].viewScaleX;
-                    app.renderingModeScaleY[i] = modes[i].viewScaleY;
-                    app.renderingModeDisplay3D[i] = modes[i].hardwareDisplay3D ? true : false;
-                    app.renderingModeIsRequestable[i] = modes[i].isRequestable ? true : false;
-                    // v13 initial-mode-sync: trust runtime-reported active mode.
-                    if (modes[i].isActive) {
-                        app.currentModeIndex = modes[i].modeIndex;
-                    }
-                    LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%s)",
-                        modes[i].modeIndex, modes[i].modeName,
-                        modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows,
-                        modes[i].viewScaleX, modes[i].viewScaleY,
-                        modes[i].hardwareDisplay3D ? "yes" : "no");
-                }
-                g_input.renderingModeCount = app.renderingModeCount;
-            }
-        }
-    }
+    // Enumerate available rendering modes (re-read on a live table change)
+    EnumerateRenderingModes(app);
 
     app.sessionState = XR_SESSION_STATE_UNKNOWN;
     app.sessionRunning = false;
@@ -3058,9 +3069,21 @@ static void PollEvents(AppXrSession &app)
         }
         case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
             auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
+            // Re-read the table first (it can change with the mode); the
+            // event's index stays authoritative.
+            EnumerateRenderingModes(app);
             LOG_INFO("Rendering mode changed: %u -> %u",
                 modeEvent->previousModeIndex, modeEvent->currentModeIndex);
             app.currentModeIndex = modeEvent->currentModeIndex;
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR: {
+            // v27: the table changed under an unchanged active index (a live
+            // 3D-mode change, ADR-066 C1). Re-read it and retile (#2852).
+            auto* tableEvent = (XrEventDataRenderingModeTableChangedDXR*)&event;
+            EnumerateRenderingModes(app);
+            app.currentModeIndex = tableEvent->activeModeIndex;
+            LOG_INFO("Rendering mode table changed (active %u)", tableEvent->activeModeIndex);
             break;
         }
         case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {

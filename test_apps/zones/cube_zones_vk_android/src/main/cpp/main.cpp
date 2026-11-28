@@ -1134,6 +1134,53 @@ active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_
 	*rows = r;
 }
 
+// (Re)read the runtime's rendering-mode table (view counts, tile layouts,
+// scales, hardwareDisplay3D) into g_modes and adopt the active index. Runs
+// from query_display_info_and_modes() and again on
+// XrEventDataRenderingModeChangedDXR and XrEventDataRenderingModeTableChangedDXR
+// (XR_DXR_display_info v27, ADR-066 C1): a live 3D-mode change re-describes
+// slot 1 under an unchanged index, and the frame loop reads its per-frame
+// view count + tile layout from g_modes (#2852).
+void
+enumerate_rendering_modes()
+{
+	if (g_pfnEnumModes != nullptr) {
+		uint32_t mc = 0;
+		if (g_pfnEnumModes(g_session, 0, &mc, nullptr) == XR_SUCCESS && mc > 0) {
+			if (mc > kMaxViews) {
+				mc = kMaxViews;
+			}
+			XrDisplayRenderingModeInfoDXR modes[kMaxViews] = {};
+			for (uint32_t i = 0; i < mc; ++i) {
+				modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
+			}
+			if (g_pfnEnumModes(g_session, mc, &mc, modes) == XR_SUCCESS) {
+				g_mode_count = mc;
+				LOGI("Rendering modes (%u):", mc);
+				for (uint32_t i = 0; i < mc; ++i) {
+					g_modes[i].view_count = modes[i].viewCount ? modes[i].viewCount : 1;
+					g_modes[i].tile_columns = modes[i].tileColumns ? modes[i].tileColumns : 1;
+					g_modes[i].tile_rows = modes[i].tileRows ? modes[i].tileRows : 1;
+					g_modes[i].view_scale_x = modes[i].viewScaleX > 0.0f ? modes[i].viewScaleX : 1.0f;
+					g_modes[i].view_scale_y = modes[i].viewScaleY > 0.0f ? modes[i].viewScaleY : 1.0f;
+					g_modes[i].hardware_3d = modes[i].hardwareDisplay3D != 0;
+					g_modes[i].requestable = modes[i].isRequestable != 0;
+					std::strncpy(g_modes[i].name, modes[i].modeName, sizeof(g_modes[i].name) - 1);
+					g_modes[i].name[sizeof(g_modes[i].name) - 1] = '\0';
+					LOGI("  [%u] %s views=%u tiles=%ux%u scale=%.2fx%.2f 3D=%d active=%d req=%d",
+					     modes[i].modeIndex, g_modes[i].name, g_modes[i].view_count,
+					     g_modes[i].tile_columns, g_modes[i].tile_rows, g_modes[i].view_scale_x,
+					     g_modes[i].view_scale_y, (int)g_modes[i].hardware_3d, (int)modes[i].isActive,
+					     (int)g_modes[i].requestable);
+					if (modes[i].isActive) {
+						g_current_mode.store(modes[i].modeIndex, std::memory_order_relaxed);
+					}
+				}
+			}
+		}
+	}
+}
+
 // Query display pixel dimensions (XR_DXR_display_info) + the runtime's
 // rendering modes, and the max view count the runtime advertises. Must run
 // AFTER create_session() (mode enumeration is session-scoped) and BEFORE
@@ -1177,41 +1224,7 @@ query_display_info_and_modes()
 
 	// Enumerate rendering modes (view counts, tile layouts, scales). The
 	// runtime reports which mode is active via isActive; we adopt it.
-	if (g_pfnEnumModes != nullptr) {
-		uint32_t mc = 0;
-		if (g_pfnEnumModes(g_session, 0, &mc, nullptr) == XR_SUCCESS && mc > 0) {
-			if (mc > kMaxViews) {
-				mc = kMaxViews;
-			}
-			XrDisplayRenderingModeInfoDXR modes[kMaxViews] = {};
-			for (uint32_t i = 0; i < mc; ++i) {
-				modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
-			}
-			if (g_pfnEnumModes(g_session, mc, &mc, modes) == XR_SUCCESS) {
-				g_mode_count = mc;
-				LOGI("Rendering modes (%u):", mc);
-				for (uint32_t i = 0; i < mc; ++i) {
-					g_modes[i].view_count = modes[i].viewCount ? modes[i].viewCount : 1;
-					g_modes[i].tile_columns = modes[i].tileColumns ? modes[i].tileColumns : 1;
-					g_modes[i].tile_rows = modes[i].tileRows ? modes[i].tileRows : 1;
-					g_modes[i].view_scale_x = modes[i].viewScaleX > 0.0f ? modes[i].viewScaleX : 1.0f;
-					g_modes[i].view_scale_y = modes[i].viewScaleY > 0.0f ? modes[i].viewScaleY : 1.0f;
-					g_modes[i].hardware_3d = modes[i].hardwareDisplay3D != 0;
-					g_modes[i].requestable = modes[i].isRequestable != 0;
-					std::strncpy(g_modes[i].name, modes[i].modeName, sizeof(g_modes[i].name) - 1);
-					g_modes[i].name[sizeof(g_modes[i].name) - 1] = '\0';
-					LOGI("  [%u] %s views=%u tiles=%ux%u scale=%.2fx%.2f 3D=%d active=%d req=%d",
-					     modes[i].modeIndex, g_modes[i].name, g_modes[i].view_count,
-					     g_modes[i].tile_columns, g_modes[i].tile_rows, g_modes[i].view_scale_x,
-					     g_modes[i].view_scale_y, (int)g_modes[i].hardware_3d, (int)modes[i].isActive,
-					     (int)g_modes[i].requestable);
-					if (modes[i].isActive) {
-						g_current_mode.store(modes[i].modeIndex, std::memory_order_relaxed);
-					}
-				}
-			}
-		}
-	}
+	enumerate_rendering_modes();
 	if (g_mode_count == 0) {
 		LOGW("No rendering modes enumerated — defaulting to a single 2-view SBS atlas");
 	}
@@ -2792,11 +2805,29 @@ poll_xr_events()
 				LOGI("session state -> %d", (int)e->state);
 				handle_session_state(e->state);
 			}
+		} else if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR) {
+			// v27: the table changed under an unchanged active index (a live
+			// 3D-mode change, ADR-066 C1). Re-read it and retile (#2852).
+			const auto *e = reinterpret_cast<const XrEventDataRenderingModeTableChangedDXR *>(&ev);
+			if (e->session == g_session) {
+				enumerate_rendering_modes();
+				if (e->activeModeIndex < g_mode_count) {
+					g_current_mode.store(e->activeModeIndex, std::memory_order_relaxed);
+				}
+				const RenderingModeInfo &m = active_mode();
+				LOGI("rendering mode table changed (active %u, %s): %u views, tiles %ux%u",
+				     e->activeModeIndex, m.name, m.view_count, m.tile_columns, m.tile_rows);
+			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
 			// The runtime's authoritative confirmation that the active mode
 			// changed (via xrRequestDisplayRenderingModeDXR or a vendor-side
 			// switch). Adopt it: drives the per-frame view count + tile layout.
 			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedDXR *>(&ev);
+			// Re-read the table first (it can change with the mode); the
+			// event's index stays authoritative.
+			if (e->session == g_session) {
+				enumerate_rendering_modes();
+			}
 			if (e->session == g_session && e->currentModeIndex < g_mode_count) {
 				g_current_mode.store(e->currentModeIndex, std::memory_order_relaxed);
 				LOGI("rendering mode -> %u (%s): %u views, tiles %ux%u", e->currentModeIndex,
