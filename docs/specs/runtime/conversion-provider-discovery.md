@@ -702,7 +702,7 @@ Schema 2 replaces the browser's `models.json` schema 1. The browser's store is d
 - **Signing.** A signed installer MUST NOT pre-fetch a non-commercial blob; the open-provider repo's CI asserts it.
 - **Blob identity.** `sha256` + `size` identify a blob; variants may share blobs.
 - **URL.** `<blobBaseUrl>/<sha256>.<format>`, unless the model gives its own `url` (§5.5).
-- **Locally built models (`local_build`).** A model whose bytes may not be redistributed can be produced on the user's box by a deterministic script instead (ADR-057 §5): the model carries `"local_build": { "script": "<repo-relative path>", … }` (other keys informational) and its files list the sha256 + size the script produces, like any blob. The store treats the bytes like any other blob (hash, stamp, the `AllowResearchOnly` gate on fetch and hand-out); only the outcome of a fetch that finds nothing changes: when the blob is not in the store and no source answered (no `url` / `blobBaseUrl`, or a mirror that does not have it), the result is **`build-locally`** (`CONV_STORE_BLOB_LOCAL_BUILD`), not `network`, and `conv models fetch` names the script. A `url` or `blobBaseUrl` that serves the bytes (a dev mirror) is still fetched normally. `model_request` for a missing locally built blob that nothing can serve (its URL is empty, or a `file://` path that does not exist — a pack with no `url` / `blobBaseUrl` resolves to its manifest's directory) **queues no download**: it returns false, logs `build-locally` with the script, and `model_resolve` reads `ABSENT` with `failure_reason = XRT_CONV_FAIL_MODEL` (missing; not `POLICY`, so a provider that names the model says it must be built rather than that a policy forbids it). This wins over `AllowDownloads` = 0; the `AllowResearchOnly` gate still answers first. It is not sticky: once the script has written and stamped the blob (it hashes the bytes first, which is the entry check) it reads `READY`; a blob written without a stamp is hashed and stamped by the next request. An http(s) mirror is a source and is fetched as usual.
+- **Locally built models (`local_build`).** A model whose bytes may not be redistributed can be produced on the user's box by a deterministic script instead (ADR-057 §5): the model carries `"local_build": { "script": "<repo-relative path>", … }` (other keys informational) and its files list the sha256 + size the script produces, like any blob. The store treats the bytes like any other blob (hash, stamp, the `AllowResearchOnly` gate on fetch and hand-out); only the outcome of a fetch that finds nothing changes: when the blob is not in the store and no source answered (no `url` / `blobBaseUrl`, or a mirror that does not have it), the result is **`build-locally`** (`CONV_STORE_BLOB_LOCAL_BUILD`), not `network`, and `conv models fetch` names the script. A `url` or `blobBaseUrl` that serves the bytes (a dev mirror) is still fetched normally. `model_request` for a missing locally built blob that nothing can serve (its URL is empty, or a `file://` path that does not exist — a pack with no `url` / `blobBaseUrl` resolves to its manifest's directory) **queues no download**: it returns false, logs `build-locally` with the script, and `model_resolve` reads `ABSENT` with `failure_reason = XRT_CONV_FAIL_MODEL` (missing; not `POLICY`, so a provider that names the model says it must be built rather than that a policy forbids it). This wins over `AllowDownloads` = 0; the `AllowResearchOnly` gate still answers first. It is not sticky: once the script has written and stamped the blob (it hashes the bytes first, which is the entry check) it reads `READY`; a blob written without a stamp is hashed and stamped by the next request. An http(s) mirror is a source and is fetched as usual. A model whose `local_build` also names a `tool` and `sources` can be built by the runtime itself, on the user's explicit request: §5.6.
 - **Validation.** `scripts/check_model_pack.py` (open-provider repo) checks the schema and the licence AND; `--verify-store` checks a store against its packs.
 
 ### 5.4 The store as built (P4, #2108)
@@ -848,6 +848,333 @@ Two optional model keys, so a pack can point at an upstream file (a vendor CDN, 
 - Research-only weights are still never bundled, mirrored or pre-fetched (§5.3); `url` exists so the
   user's own download can come from the official source.
 
+### 5.6 Locally built models: the builder contract (ADR-057 amendment 2026-11-27)
+
+A research-only model whose licence forbids us to publish its weights, or any file made from them,
+can still be installed from the Dashboard or the CLI: the user's machine downloads the **upstream
+checkpoint** from its official source at a pinned revision and converts it **on the machine** with
+a **signed builder** we ship. We host no weights and no derived file, ever. The first user is the
+SHARP pack (`dxr-open-sharp`, `displayxr-conversion-open`). §5.3's `local_build` rule still
+holds; this section adds what lets the runtime run the build itself instead of naming a script.
+
+#### 5.6.1 Pack schema: `local_build.tool` and `local_build.sources`
+
+A model is runtime-buildable when its `local_build` carries `recipe`, `variant`, `tool` and
+`sources`. A `local_build` without `tool` keeps today's behaviour (`build-locally`, script named).
+
+```jsonc
+"local_build": {
+  "script": "scripts/export_sharp.py",     // unchanged: the recipe's source, informational
+  "script_version": "1.0.0",               // unchanged: the recipe version these bytes come from
+  "deterministic": true,                   // required true for a buildable model
+  "recipe": "sharp-onnx",                  // build recipe id; models that share it can be built in one run
+  "variant": "int4",                       // the builder's --variant that produces THIS model's files
+  "tool": {
+    "id": "open-model-builder",            // registered id (§5.6.3) == catalog item registered_id
+    "catalog_id": "open-conversion-model-builder",   // the schema-2 catalog item (§5.6.6)
+    "min_version": "1.0.0",                // lowest builder version whose output equals this model's files
+    "signer": "first-party"                // Windows: one of DXR_FIRST_PARTY_SIGNERS (get_signers.h)
+  },
+  "sources": [{
+    "role": "checkpoint",                  // the builder's --source <role>=...
+    "url": "https://huggingface.co/apple/Sharp/resolve/<revision>/sharp_2572gikvuh.pt",
+    "revision": "50753d96c1f7ad0bae4184ddfb6aa98bca975f29",   // the url names it; informational
+    "sha256": "<64 hex>", "size": 2809738232,
+    "auth": null,                          // optional, §5.5 rules
+    "license": {
+      "id": "apple-amlr",                  // what --accept-license must equal
+      "name": "Apple Machine Learning Research Model licence",
+      "link": "https://huggingface.co/apple/Sharp/blob/<revision>/LICENSE",
+      "text": "dxr-open-sharp.apple-amlr.txt",   // beside the pack manifest, shipped with the provider
+      "text_sha256": "<64 hex>"            // of that file; what an acceptance record names
+    }
+  }],
+  "needs": { "ram_mb": 8192, "disk_mb": 10240, "os": ["windows>=10.0.19041", "linux", "macos"] }
+}
+```
+
+Rules:
+
+- **Output is the model's existing `variants[].files`** (sha256 + size). Nothing about a built blob
+  differs from a downloaded one: same `blobs/<sha256>`, same `.ok` stamp, same load check (§5.4).
+- **`sources[]`** are fetched by the store's own downloader (§5.4, §5.5: redirects, auth, size then
+  sha256 while streaming). A source is never a store blob and never kept: it lives in the build's
+  staging directory and is deleted with it. Every source carries a `license`; each distinct
+  `license.id` needs its own acceptance (§5.6.4).
+- **`license.text`** is a file shipped beside the pack (so it can be shown offline and pinned by
+  hash); the provider repo's CI checks it against `license.link` at the pinned revision. A text whose
+  sha256 is not `text_sha256` is refused: no row offers the build.
+- **`needs`** is the build's peak, not the model's run-time need (`variants[].min_ram_mb` keeps
+  that). `disk_mb` counts the sources, the builder's work files and the output, all on the store's
+  volume.
+- **A buildable model has no download path for its files**: no `url`, and its files are not under
+  any `blobBaseUrl` we publish. `check_model_pack.py` refuses a non-commercial model that has both
+  `local_build.tool` and a `url` / `blobBaseUrl` pointing at a host we run.
+- **Licence class is unchanged**: the model's `license.commercial` is false, so the capability stays
+  `RESEARCH_ONLY` and everything in §3.4 / §5.4 about `AllowResearchOnly` applies.
+
+#### 5.6.2 The builder's command line
+
+One executable per platform (`dxr-model-builder.exe`, `dxr-model-builder`). It holds every pinned
+dependency of every recipe it serves, so its output is byte-identical to the pack's hashes. It never
+runs as a server, never writes the store, the registry or the user's home directory.
+
+```
+dxr-model-builder describe --json
+dxr-model-builder build --recipe <id> --variant <v> [--variant <v> ...]
+                        --source <role>=<path | https-url> [...]
+                        --out <dir> --work <dir> --cancel-file <path>
+                        --accept-license <licence-id> [...] [--threads <n>]
+```
+
+- **`describe --json`** prints one object and exits 0: `{"v":1, "tool":"open-model-builder",
+  "version":"X.Y.Z", "recipes":[{"recipe","variants":[…], "sources":[{"role","sha256","size",
+  "license_id"}], "needs":{…}}]}`. The store compares `version` with `tool.min_version` and the
+  recipe's pins with the pack's `sources`; a disagreement is `build-tool-mismatch`.
+- **`--source`** takes a file (the runtime always passes a file it downloaded and verified) or an
+  `https` URL (standalone use; the builder downloads it into `--work`). Either way the builder
+  re-checks size and sha256 against **its own compiled-in pins** before reading a byte of it.
+- **`--accept-license`** must name every `license_id` of the recipe's sources, exactly. Missing or
+  different = exit 10, before any download or file read.
+- **Writes only into `--work` and `--out`**, both directories the store created inside the build's
+  staging directory (§5.6.3). The builder points every library cache (`TMP`, `TEMP`, `TMPDIR`, the
+  framework caches) into `--work`. Output files go flat into `--out`, named as it likes; the store
+  identifies them by hash, not by name. It deletes nothing outside `--work`.
+- **Progress** on **stdout**, one JSON object per line (UTF-8, `\n`), nothing else on stdout; human
+  text goes to stderr. Every line has `"v":1` and `"event"`. Unknown keys and events are ignored by
+  readers.
+
+  | `event` | keys | when |
+  |---|---|---|
+  | `start` | `tool`, `version`, `recipe`, `variants[]` | first line |
+  | `phase` | `phase` (`verify-source`, `download-source`, `prepare`, `export`, `convert`, `write`), `variant` (or null), `step`, `steps` | a phase begins |
+  | `progress` | `phase`, `done`, `total` (0 = unknown; bytes for downloads, units otherwise) | at most 4 per second |
+  | `output` | `variant`, `role`, `file` (relative to `--out`), `sha256`, `size` | a file is complete |
+  | `warning` | `message` | non-fatal |
+  | `error` | `code` (the exit-code name below), `message` | just before a non-zero exit |
+  | `done` | `ok` | last line |
+
+- **Exit codes** (the runtime maps each to a `conv models fetch` result, §5.6.3):
+
+  | code | name | meaning |
+  |---|---|---|
+  | 0 | `ok` | every requested variant written to `--out` |
+  | 1 | `internal` | anything not below |
+  | 2 | `usage` | bad arguments, unknown recipe or variant |
+  | 10 | `license` | `--accept-license` missing or not the recipe's licence id |
+  | 11 | `download` | a source URL could not be fetched (standalone use only) |
+  | 12 | `source-mismatch` | a source's size or sha256 is not the pinned one |
+  | 13 | `output-mismatch` | the builder's own check of its output against its pins failed |
+  | 14 | `memory` | out of memory (including a failed large allocation) |
+  | 15 | `disk` | out of disk space in `--work` or `--out` |
+  | 16 | `unsupported` | this machine cannot run the recipe (OS, CPU architecture or instruction set) |
+  | 17 | `cancelled` | the cancel file appeared, or SIGINT / SIGTERM / Ctrl+C / Ctrl+Break |
+
+- **Cancellation.** The builder checks `--cancel-file` at least once a second and exits 17 within
+  10 s of it appearing, leaving whatever it wrote in `--work` / `--out` (the store deletes the
+  staging directory).
+
+#### 5.6.3 Store behaviour: `conv models fetch` for a buildable model
+
+`displayxr-cli conv models fetch <pack> --model <name> [--model <name> ...] [--accept-license <id>]
+[--events] [--json]` (the Dashboard's Build button runs exactly this). **Only this explicit action
+runs a build.** `model_request` in the service or a satellite never does: a missing buildable model
+still reads `ABSENT` with `XRT_CONV_FAIL_MODEL` and logs `build-locally` (§5.3), and an installer
+never builds (`--installer` refuses a buildable model, as it refuses every non-commercial one).
+
+In order, failing closed (the first failure is the result; nothing is written to the store):
+
+1. **Policy.** The model is non-commercial, so the `AllowResearchOnly` gate (§3.1, POSIX §3.5) or
+   the per-run `--allow-research-only` must be on: else `policy`. Under HKLM `Policy\Lock` with HKLM
+   `AllowResearchOnly` = 0, nothing can turn it on and the result is `policy-locked`.
+2. **Licence.** Every source licence needs this user's acceptance record (§5.6.4) whose
+   `text_sha256` equals the pack's, or `--accept-license <id>` on this command, which writes the
+   record first (the CLI prints the licence name, link and the local text path when it does).
+   Else `build-license`.
+3. **Builder.** Found by `tool.id`:
+   - Windows: `HKLM\Software\DisplayXR\ModelBuilders\<id>` (64-bit view), values `Binary`
+     (absolute), `Version`, `DisplayName`, `UninstallString`, written by the builder's signed
+     installer, `Version` last.
+   - POSIX: `<id>.json` (`{"id","version","binary"}`) in `/usr/share/displayxr/model-builders/`
+     (the `.deb`) or `/Library/Application Support/DisplayXR/ModelBuilders/` (the macOS `.pkg`).
+   - Dev boxes only: `DXR_MODEL_BUILDER_<ID>=<path>`, honoured only with
+     `DXR_ALLOW_DEV_PLUGIN_PATHS` on a non-elevated process.
+
+   Absent = `build-tool-missing` (the result names `tool.catalog_id`). `Version` below
+   `tool.min_version` = `build-tool-old`.
+4. **Builder provenance**, through the shared classifier (`target_component_provenance_classify`,
+   plugin-discovery §4.3) with a stricter rule than the load gate, on every platform and whatever
+   `Trust\Enforce` says, because the store runs this binary:
+   - Windows: `signed` **and** the leaf CN is one of `DXR_FIRST_PARTY_SIGNERS`; or `allowlisted`.
+   - Linux / macOS: `platform-trusted` (root-owned file under a root-owned path, not group- or
+     world-writable); or `allowlisted` (`/etc/displayxr/trust/allowlist`).
+   - `dev-override` under the dev rule above. Anything else is `build-tool-untrusted`, with the
+     verdict's reason. `describe --json` must then agree with the pack (`build-tool-mismatch`).
+5. **Resources.** Free space on the store's volume ≥ `needs.disk_mb`, and the machine's physical
+   memory ≥ `needs.ram_mb`, and the OS in `needs.os`: else `build-disk`, `build-memory`,
+   `build-unsupported`, before any download.
+6. **Staging.** `<root>/staging/<nonce>/{source,work,out}`, created by this user on the store's
+   volume (so ingest is a rename). One build per `recipe` at a time per store: a second fetch
+   waits on a lock file `<root>/staging/<recipe>.lock` held by a live process, or reports `busy`
+   with `--events`. Stale staging directories (no live lock, older than 24 h, written by this user)
+   are deleted by the next build and by `conv models prune`.
+7. **Sources.** Downloaded into `source/` by the store's downloader (progress as a `phase` /
+   `progress` pair with `phase: "download-source"`). Failure = `build-download` (retryable) or
+   `bad-download` (size / hash).
+8. **Run.** The builder is started directly (no shell; argv array; working directory `work/`; a
+   minimal environment), in a Windows job object with kill-on-close / its own POSIX process group,
+   with every requested model's `variant` that shares the `recipe` (one source download serves
+   them). `--events` forwards each builder line to stdout unchanged. A builder that prints nothing
+   for 10 minutes is killed (`build-stalled`). Exit code → result: 10 `build-license`, 11
+   `build-download`, 12 `build-source-mismatch`, 13 / output mismatch `build-output-mismatch`, 14
+   `build-memory`, 15 `build-disk`, 16 `build-unsupported`, 17 `build-cancelled`, anything else
+   `build-failed`.
+9. **Ingest.** The store ignores the builder's `output` lines for trust: it hashes every regular
+   file in `out/`, matches `(sha256, size)` against the requested models' files, and moves each
+   match into `blobs/<sha256>` under the entry rule of §5.3 (this hash is the entry check; then
+   rename, `.ok` stamp last; `data` role before `model` role). A requested model with any file
+   unmatched is `build-output-mismatch` and none of its files is stamped; other models of the run
+   that matched are kept. Unmatched files are deleted. Then the staging directory is deleted, the
+   pack is recorded under `packs/`, and the result is `built`.
+
+**Cancel.** `displayxr-cli conv models cancel <pack> --model <name>` creates the running build's
+cancel file (`<root>/staging/<nonce>/cancel`); the builder exits 17; the store kills the process
+tree after a further 10 s and deletes the staging directory. Closing the fetch process does the
+same through the job object / process group.
+
+**Remove.** `displayxr-cli conv models remove <pack> --model <name>` deletes that model's blobs that
+no other model of a registered pack references. It does not touch `AllowResearchOnly` or the
+licence record.
+
+**JSON.** With `--json` the per-model entry of `fetch` keeps `name`, `result`, `hint` and adds
+`build`: `{ "tool", "tool_version", "provenance", "staging", "exit_code" }` for a model that ran a
+build. With `--events` the stdout stream is NDJSON: forwarded builder lines, the store's own
+`download-source` lines, and a final `{"v":1,"event":"result", …}` carrying that JSON object.
+
+**Hand-out.** Unchanged (§5.4) plus one rule: a model whose `local_build.sources` carry a licence is
+handed out to a process only when that process's user has an acceptance record for every such
+licence with the pack's `text_sha256`. Without one, `model_resolve` reads `ABSENT` with
+`XRT_CONV_FAIL_POLICY` and the log names the licence. This matters on Windows, where one store
+serves every user of the PC: another user's build is not this user's acceptance.
+
+#### 5.6.4 Licence acceptance and the `AllowResearchOnly` decision
+
+**Acceptance is per user, per licence id, per text hash.** It is never written by an installer and
+has no machine tier.
+
+| Platform | Where | Value |
+|---|---|---|
+| Windows | `HKCU\Software\DisplayXR\ConversionProviders\LicenceAccepted`, value `<licence-id>` (REG_SZ) | `"<text_sha256> <unix-seconds>"` |
+| Linux, macOS | file `conversion-licence-<licence-id>` in the per-user dir of §3.5, beside `conversion-allow-research-only` | `<text_sha256> <unix-seconds>\n` |
+
+A new licence text (another `text_sha256`) needs a new acceptance. `conv models license
+accept|withdraw|status <licence-id>` reads and writes it; withdrawing makes every model under that
+licence `ABSENT(POLICY)` for this user at the next resolve (blobs stay until `remove`).
+
+**Decision: the gate stays `AllowResearchOnly`, unchanged and global per user; there is no
+per-model allow.** The Dashboard's single accept step writes the acceptance record **and** turns on
+the per-user `AllowResearchOnly` (HKCU, or the §3.5 file), and its tick says so in words. Why:
+
+- Selection filters **capabilities** by licence class (§3.4 step 2), and the provider picks the
+  model inside its capability (`MODEL=auto`). A per-model allow could not open selection without a
+  new ABI field naming the model a capability will load; with the gate shut the capability is never
+  selected, whatever the store would hand out.
+- One gate keeps one code path that every reader already honours (selection, the store's fetch and
+  hand-out, `conv run`, `conv list`'s `policy.allow_research_only`) and one setting the user can
+  find and switch off.
+- What the per-model allow would have added, consent to *this* licence, is carried by the
+  acceptance record, which the store checks at hand-out (§5.6.3).
+
+The CLI does not turn the gate on by itself: `conv models fetch` asks for it (`policy`, with the
+`conv research on` hint), because a terminal user may want the per-run `--allow-research-only`
+only. Removing the model does not turn the gate off; the Dashboard's Settings toggle does.
+
+#### 5.6.5 Dashboard
+
+One row per buildable model in the **2D-to-3D models** section (`ModelPacks`, `Components.cs`), from
+`conv models list --json` (which gains, per model, `local_build` {`recipe`, `variant`, `tool`,
+`tool_installed`, `tool_version`, `needs`, `sources`[{`role`, `size`, `license`}]} and
+`license_accepted`).
+
+- **Badge:** `Research preview (non-commercial)`. Title: the model name; a line "Built on this PC
+  from the official file. DisplayXR does not host this model." and "Model and licence by <source
+  licence `name`'s owner>, licence: `license.link`" (shown as a link).
+- **Facts:** Download (sum of `sources[].size`), Space needed while building (`needs.disk_mb`),
+  Memory needed to build (`needs.ram_mb`), Size when installed (sum of the model's files), Licence
+  (`name`).
+- **Licence:** the full text from `license.text`, shown in the row (scrollable), after its sha256 is
+  checked; a mismatch hides the Build action and says "The licence text could not be verified."
+- **Tick** (never pre-ticked; shown unticked every time unless this user has a record for this text
+  hash, in which case it reads "Licence accepted on <date>" with a Withdraw link): *"I have read
+  this licence. I will use this model for non-commercial research only, and I allow DisplayXR to use
+  research-only models on this account."*
+- **Actions:** no builder installed → **Get the builder** (installs `tool.catalog_id` through the
+  catalog, §5.6.6); else **Build** (enabled only when ticked, the machine meets `needs`, and the
+  gate can be turned on); while running, **Cancel**; when installed, **Remove**.
+- **Progress:** from `--events`: "Downloading the official file: X of Y MB", then "Converting on
+  this PC: step n of m (<phase>)", then "Checking and storing". Percent from `done / total` when
+  `total` > 0, else an indeterminate bar.
+- **Machine check before Build:** physical memory below `needs.ram_mb` → disabled, "This PC has X GB
+  of memory; building needs Y GB."; free space below `needs.disk_mb` on the store's drive →
+  disabled, "Building needs Y GB free on <drive>; X GB is free."; `policy-locked` → hidden,
+  "Your administrator has turned off research-only models."
+- **Failure messages** (by result):
+
+  | result | message |
+  |---|---|
+  | `build-license` | "The licence was not accepted. Tick the box to build." |
+  | `build-download`, `bad-download` | "The official file could not be downloaded. Check the connection and try again." |
+  | `build-source-mismatch` | "The downloaded file is not the expected one, so nothing was built." |
+  | `build-output-mismatch` | "The built model did not match the expected files, so it was not installed. Update the builder and try again." |
+  | `build-memory` | "This PC ran out of memory while building. Close other apps and try again." |
+  | `build-disk` | "Not enough free space on <drive>. Free Y GB and try again." |
+  | `build-unsupported` | "This PC cannot build this model." |
+  | `build-cancelled` | "Cancelled. Nothing was installed." |
+  | `build-tool-missing`, `build-tool-old` | "Get the builder first." / "Update the builder first." (with the catalog action) |
+  | `build-tool-untrusted`, `build-tool-mismatch` | "The installed builder could not be verified. Reinstall it from the Catalog." |
+  | `build-stalled`, `build-failed` | "The build stopped unexpectedly. Try again; the log is in <path>." |
+
+#### 5.6.6 Catalog and installers
+
+- **The builder is a catalog item, never a model.** Schema-2 item (component-catalog.md § Item) with
+  a new class **`model_builder`** (an older client skips it, as it skips any unknown class), id
+  `open-conversion-model-builder`, `registered_id` `open-model-builder` (the `ModelBuilders\<id>`
+  row / POSIX manifest of §5.6.3), publisher DisplayXR, `license` `{ "class": "open", "spdx":
+  "BSL-1.0" }` (the builder's own code) and a new item key **`research: true`**, which a client
+  shows as the badge `Research preview (non-commercial)` and which forbids `recommended` and
+  `detect` on the item. So it is **never pre-ticked** and `install --default` never installs it.
+- **Assets:** signed like every asset (Authenticode by a first-party signer on Windows; a `.deb` /
+  `.pkg` installing into the platform-trusted paths of §5.6.3 on Linux / macOS, `provenance.mode`
+  `platform-trusted`). The installer writes the builder and its row; it downloads nothing, builds
+  nothing and never writes `AllowResearchOnly` or an acceptance record.
+- **No model weights, sources or derived files are ever a catalog asset or inside one.** The
+  catalog generator's `verify` refuses an asset whose sha256 equals any registered pack file or
+  `sources[]` sha256, and the builder's CI asserts that no file in its installer does.
+- The runtime bundle and `versions.json`: the builder is **not** in the default bundle; whether it
+  gets a `versions.json` field follows the membership rule there (an installable released asset),
+  added by its first release, opt-in like `--with browser`.
+
+#### 5.6.7 Platforms
+
+- **`AllowResearchOnly`** is read in `target_conv_policy_read`
+  (`src/xrt/targets/common/target_conv_status.c`): on Windows from HKCU / HKLM `ConversionProviders`
+  via `conv_select_resolve_research_only` (HKCU over HKLM unless `Policy\Lock`); on Linux and macOS
+  from the per-user file `conversion-allow-research-only` (`read_research_file`, §3.5, since #2759);
+  on Android not at all (always off). The POSIX setting therefore already exists and this contract
+  uses it unchanged; the acceptance record (§5.6.4) sits beside it in the same per-user dir and the
+  service's per-user dir poll covers both. (The `displayxr-conversion-open` README paragraph saying
+  the runtime reads it only from the Windows registry predates #2759.)
+- **Android:** out of scope; no builder, no buildable rows.
+
+#### 5.6.8 Out of scope
+
+- Hosting, mirroring or caching converted weights, or the upstream checkpoint, anywhere we run (no
+  release asset, no CDN, no `blobBaseUrl`, no remote endpoint fed from a built file).
+- Putting a buildable model in a default pack, the installer's pre-fetch set, or any default
+  install; building at install time.
+- Partner / OEM material: no vendor-specific builders, no OEM pre-builds or pre-acceptance, no
+  partner bundle that includes the builder or an acceptance.
+
 ---
 
 ## 6. Reference provider and stage
@@ -976,6 +1303,7 @@ Verbs (ADR-053); `lift caps|probe` stay as aliases.
 | `conv credential set\|delete\|status <name>` | the OS credential store | stores a provider's token (`set` reads one line from stdin; `status` never prints it). On macOS an item a DisplayXR binary made is readable by DisplayXR binaries without a prompt; one made with the `security` tool is not (its partition list names Apple's tools), and reads as `denied` — never a prompt, never a hang |
 | `conv jobs` / `conv cancel <id>` | DIAG | |
 | `conv models list\|verify\|prune\|fetch\|init` | local + registry | model store (§5.4) |
+| `conv models fetch\|cancel\|remove\|license` for a locally built model | local + registry + the builder | runs the signed builder, ingests its output by hash, records the licence acceptance (§5.6) |
 
 The CLI never loads a second model instance. When a service is reachable it asks it; otherwise it loads providers headless and calls `describe_cap` / `get_state` only, **never `warm`** (today's `probe_lift_caps_d3d11`, `cli_query.c:270-347`, which instantiates the module on WARP and waits up to 8 s, is retired). MCP `convert_file` and `get_conversion_status` are CLI-backed (ADR-051 D4).
 
