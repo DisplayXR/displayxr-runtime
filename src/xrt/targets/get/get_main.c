@@ -51,6 +51,8 @@
 //! How long a child installer or uninstaller is waited for. One that is still
 //! running after this is reported as failed; it is not killed.
 #define CHILD_WAIT_MS (60u * 60u * 1000u)
+//! #2841: how often run_child() says a child is still running.
+#define CHILD_HEARTBEAT_MS (30u * 1000u)
 //! How long an uninstaller that returned at once (NSIS re-executes itself from
 //! %TEMP%) is given to actually remove the component.
 #define UNINSTALL_SETTLE_MS (120u * 1000u)
@@ -652,8 +654,23 @@ run_child(const char *name, wchar_t *cmd, const char *what)
 	// sufficient for a plain installer. The wait is bounded: a child that is
 	// still running after an hour is hung, and this tool is run by installers
 	// that are themselves being waited for.
+	//
+	// #2841: a line every CHILD_HEARTBEAT_MS while the child runs. A component
+	// installer run with /S prints nothing, and the runtime installer waits on
+	// this process with nsExec /TIMEOUT, which counts time without OUTPUT: the
+	// heartbeat is what tells it "alive, still installing" apart from "hung".
 	DWORD code = 1;
-	if (WaitForSingleObject(pi.hProcess, CHILD_WAIT_MS) != WAIT_OBJECT_0) {
+	DWORD waited = 0;
+	DWORD w = WAIT_TIMEOUT;
+	while (waited < CHILD_WAIT_MS) {
+		w = WaitForSingleObject(pi.hProcess, CHILD_HEARTBEAT_MS);
+		if (w != WAIT_TIMEOUT) {
+			break;
+		}
+		waited += CHILD_HEARTBEAT_MS;
+		dxr_log("%s: the %s is still running (%u s)\n", name, what, (unsigned)(waited / 1000u));
+	}
+	if (w != WAIT_OBJECT_0) {
 		dxr_log("%s: the %s is still running after %u minutes -- not waiting any longer\n", name, what,
 		        CHILD_WAIT_MS / 60000u);
 		CloseHandle(pi.hProcess);

@@ -67,6 +67,12 @@
 ; file existed, which also means a runtime installer that dxr-get itself runs
 ; (`/S /NOSTART`) never calls back into dxr-get.
 ;
+; BOUNDED (#2841). Every dxr-get call runs with nsExec /TIMEOUT (time without
+; output, DXR_CAT_SILENCE_MS); dxr-get prints a line every 30 s while a
+; component's own installer runs. A call that is ended is reported like any
+; other failure, so the install step always reaches the finish page.
+; $INSTDIR\install-steps.log gets a line before and after each such call.
+;
 ; NEVER THE RUNTIME. Every install this file triggers passes `--no-runtime`:
 ; dxr-get must not start a second runtime installer from inside this one. An
 ; item that needs a newer runtime than this one is refused (exit 41) and
@@ -105,6 +111,14 @@
 ; Slots in the component list. More listed items than slots: the ticked ones
 ; are kept and the page says how many are not shown.
 !define DXR_CAT_SLOTS 8
+
+; #2841: the longest time a dxr-get call may print NOTHING before it is
+; stopped (nsExec /TIMEOUT counts time since the last output line). dxr-get
+; prints download progress, and a line every 30 s while a component's own
+; installer runs, so 10 minutes of silence means it is hung. A stopped call is
+; reported like any other failure and Setup goes on to the finish page: the
+; install page must never be left waiting on a process that will not answer.
+!define DXR_CAT_SILENCE_MS 600000
 
 ; IDC_INTROTEXT of the components page (the text above the list).
 !define DXR_CAT_IDC_TOP 1006
@@ -489,15 +503,25 @@ Function DxrCatInstallOne
 	${EndIf}
 	ClearErrors
 	; --no-runtime: never a second runtime installer inside this one.
-	nsExec::ExecToLog '$R1 install $R8 --yes --no-runtime$R2'
+	Push "catalog: dxr-get install $R8 - started"
+	Call DxrStepLog
+	nsExec::ExecToLog /TIMEOUT=${DXR_CAT_SILENCE_MS} '$R1 install $R8 --yes --no-runtime$R2'
 	Pop $R3
+	Push "catalog: dxr-get install $R8 - returned $R3"
+	Call DxrStepLog
 	${If} $R3 == 0
 		DetailPrint "Catalog: $R9 - done."
 		Return
 	${EndIf}
-	; Exit codes: docs/specs/runtime/dxr-get.md.
+	; Exit codes: docs/specs/runtime/dxr-get.md. nsExec's own two answers
+	; are words, not numbers (#2841).
 	StrCpy $R4 "dxr-get reported $R3"
-	${If} $R3 == 10
+	${If} $R3 == "timeout"
+		StrCpy $R4 "dxr-get stopped answering and was ended after 10 minutes without output"
+		StrCpy $DxrCatRetry 1
+	${ElseIf} $R3 == "error"
+		StrCpy $R4 "dxr-get could not be started"
+	${ElseIf} $R3 == 10
 		StrCpy $R4 "no connection, or the catalog could not be read"
 		StrCpy $DxrCatOffline 1
 	${ElseIf} $R3 == 11
@@ -546,14 +570,23 @@ Function DxrCatInstallDefault
 	${EndIf}
 	ClearErrors
 	DetailPrint "Catalog: installing the default set (dxr-get install --default)"
-	nsExec::ExecToLog '$R1 install --default --yes --no-runtime$R2'
+	Push "catalog: dxr-get install --default - started"
+	Call DxrStepLog
+	nsExec::ExecToLog /TIMEOUT=${DXR_CAT_SILENCE_MS} '$R1 install --default --yes --no-runtime$R2'
 	Pop $R3
+	Push "catalog: dxr-get install --default - returned $R3"
+	Call DxrStepLog
 	${If} $R3 == 0
 		DetailPrint "Catalog: default set - done (items dxr-get skipped are listed above)."
 		Return
 	${EndIf}
 	StrCpy $R4 "dxr-get reported $R3"
-	${If} $R3 == 10
+	${If} $R3 == "timeout"
+		StrCpy $R4 "dxr-get stopped answering and was ended after 10 minutes without output"
+		StrCpy $DxrCatRetry 1
+	${ElseIf} $R3 == "error"
+		StrCpy $R4 "dxr-get could not be started"
+	${ElseIf} $R3 == 10
 		StrCpy $R4 "no connection, or the catalog could not be read"
 	${ElseIf} $R3 == 11
 		StrCpy $R4 "the catalog failed its signature check"

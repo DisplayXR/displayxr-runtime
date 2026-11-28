@@ -308,6 +308,42 @@ Function DumpLog
 		Pop $5
 FunctionEnd
 
+; #2841: one timestamped line appended to $INSTDIR\install-steps.log, written
+; and closed at once. install.log is the details list dumped at the END of a
+; section, so an install that stops inside a section leaves no trace of where
+; it stopped; this file is written before and after every step that waits on
+; another program, so the last line names the step that did not return.
+; in: the text on the stack. Preserves every register.
+Function DxrStepLog
+	Exch $0
+	Push $1
+	Push $2
+	Push $3
+	Push $4
+	Push $5
+	Push $6
+	Push $7
+	Push $8
+	${GetTime} "" "L" $2 $3 $4 $5 $6 $7 $8
+	ClearErrors
+	FileOpen $1 "$INSTDIR\install-steps.log" a
+	${IfNot} ${Errors}
+		FileSeek $1 0 END
+		FileWrite $1 "$4-$3-$2 $6:$7:$8 $0$\r$\n"
+		FileClose $1
+	${EndIf}
+	ClearErrors
+	Pop $8
+	Pop $7
+	Pop $6
+	Pop $5
+	Pop $4
+	Pop $3
+	Pop $2
+	Pop $1
+	Pop $0
+FunctionEnd
+
 ; Pure NSIS Lowercase function (Installer)
 Function StrLower
   Exch $0 ; Input string
@@ -919,7 +955,12 @@ Function CloseRuntimeClients
 	; excluded because THIS PowerShell's command line contains the pattern:
 	; spelled whole, the sweep matches itself, kills itself mid-pipeline and
 	; can stop before reaching the browser's process.
-	nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference='SilentlyContinue'; $$roots=@('$INSTDIR','$1') | Where-Object { $$_ }; Get-CimInstance Win32_Process | Where-Object { $$e=$$_.ExecutablePath; $$c=$$_.CommandLine; ($$e -and ($$roots | Where-Object { $$e.StartsWith($$_ + '\', 'OrdinalIgnoreCase') })) -or ($$c -and $$_.ProcessId -ne $$PID -and $$c.Contains('--utility-sub-type=device.mojom.' + 'XRDeviceService')) } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force }"`
+	; #2841: bounded. A WMI query can block on a broken WMI repository, and
+	; this sweep prints nothing, so two minutes of silence ends it; the
+	; ClientDllWritable check that follows still decides whether to go on.
+	Push "runtime: closing DisplayXR clients"
+	Call DxrStepLog
+	nsExec::ExecToLog /TIMEOUT=120000 `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference='SilentlyContinue'; $$roots=@('$INSTDIR','$1') | Where-Object { $$_ }; Get-CimInstance Win32_Process | Where-Object { $$e=$$_.ExecutablePath; $$c=$$_.CommandLine; ($$e -and ($$roots | Where-Object { $$e.StartsWith($$_ + '\', 'OrdinalIgnoreCase') })) -or ($$c -and $$_.ProcessId -ne $$PID -and $$c.Contains('--utility-sub-type=device.mojom.' + 'XRDeviceService')) } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force }"`
 	Pop $0
 
 	; Process exit and image unmap are not instantaneous even after
@@ -999,6 +1040,11 @@ Section "DisplayXR Runtime" SecRuntime
 	ReadRegStr $DxrPrevRuntimeVersion HKLM "Software\DisplayXR\Runtime" "Version"
 
 	SetOutPath "$INSTDIR"
+
+	; #2841: this run's step record only.
+	Delete "$INSTDIR\install-steps.log"
+	Push "runtime: started (Setup ${VERSION})"
+	Call DxrStepLog
 
 	; Close DisplayXR processes holding the runtime, then PROVE the client DLL
 	; is writable before touching a single file or registry value (#1268).
@@ -1754,9 +1800,18 @@ Section "Conversion models (default pack)" SecModels
 	${EndIf}
 	Call DxrResolveModelsPack
 	DetailPrint "Conversion models: pre-fetching the default pack from $R2"
-	nsExec::ExecToLog '"$INSTDIR\displayxr-cli.exe" conv models fetch "$R2" --prefetch --installer'
+	; #2841: bounded like the catalog's dxr-get calls. The fetch prints a line
+	; per progress step, so ten minutes of silence means it is stuck; the
+	; models then download on first use, as on any other failure.
+	Push "models: conv models fetch - started"
+	Call DxrStepLog
+	nsExec::ExecToLog /TIMEOUT=600000 '"$INSTDIR\displayxr-cli.exe" conv models fetch "$R2" --prefetch --installer'
 	Pop $R3
-	${If} $R3 != 0
+	Push "models: conv models fetch - returned $R3"
+	Call DxrStepLog
+	${If} $R3 == "timeout"
+		DetailPrint "Conversion models: the pre-fetch stopped answering and was ended after 10 minutes without output; the missing models download on first use."
+	${ElseIf} $R3 != 0
 		DetailPrint "Conversion models: pre-fetch incomplete (exit $R3); the missing models download on first use."
 	${EndIf}
 	models_done:
@@ -1978,6 +2033,7 @@ Section "Uninstall"
 	Delete "$INSTDIR\displayxr-dashboard.exe"
 	Delete "$INSTDIR\DisplayXR_win64.json"
 	Delete "$INSTDIR\install.log"
+	Delete "$INSTDIR\install-steps.log"
 
 	; Sweep remaining executables, DLLs, and manifests so RMDir can succeed
 	Delete "$INSTDIR\*.exe"
