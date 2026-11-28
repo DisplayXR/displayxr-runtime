@@ -87,7 +87,7 @@ rather than workflow logic:
 |---|---|---|
 | `abi` | `XRT_PLUGIN_API_VERSION_CURRENT` changed | leia `android`, vendor-template `windows` |
 | `features` | the **feature surface** of the track's headers changed (below) | leia `linux`, leia `windows` (since v2.25.2: an appended D3D11 slot compiled out at the old pin, leia-plugin#295), leia-conversion `all` (over the conversion-provider headers) |
-| `layout` | **any byte** changed in the include closure of the track's `layout_headers` (below) | ultraleap `all` |
+| `layout` | **any byte** changed in the include closure of the track's `layout_headers` (below) | ultraleap `all`, tracking-open `all` |
 | `manual` | never — human-owned; `reason` required | — |
 
 **`abi`** compares `XRT_PLUGIN_API_VERSION_CURRENT` at both tags — the same
@@ -160,6 +160,18 @@ from a layout change. For such a provider a repin is a request for a new release
 the Ultraleap track are the ones that repository's own `scripts/runtime_range.py`
 hashes: the headers the runtime reads or writes through, plus the two aux headers
 whose functions the provider imports from the runtime library.
+
+The open tracking provider (`displayxr-tracking-open`) is the second `layout` track:
+its hands role fills `struct xrt_device` the same way, from a **vendored, generated**
+copy of the runtime headers (it links nothing of the runtime). Its roots are the
+headers its sources and its two plug-in headers include (`xrt_device.h`,
+`xrt_input_plugin.h`, `xrt_tracking_plugin.h`, `xrt_tracking.h`, `xrt_results.h`).
+Its `DXR_RUNTIME_GIT_TAG` is metadata naming the release the copy was generated from,
+so a repin PR must regenerate `include/xrt/` in the same change. The literal must be a
+`vX.Y.Z` tag for `decide` to evaluate the track; a `git describe` string is an error
+on every runtime release. Unlike the Ultraleap item, its catalog item carries a
+floor and no maximum: a repin asks for a rebuild, it does not declare the old build
+broken.
 
 ```
 scripts/downstream_pin_bump.py verdict --from v2.69.2 --to v2.69.3 --repo displayxr-ultraleap --track all

@@ -144,6 +144,27 @@ V2_ONLY_COMPONENTS = [
         "runtime_exact": {"file": "CMakeLists.txt", "cmake_set": "DXR_RUNTIME_GIT_TAG"},
     },
     {
+        # The open camera tracking provider: one installer, one DLL, two
+        # registered roles (V2_ITEMS: `registered_id` + `also_provides`).
+        "name": "tracking_open",
+        "pin": "tracking_open",
+        "repo": "displayxr-tracking-open",
+        "asset": "DisplayXROpenTrackingSetup-{v}.exe",
+        # /S only: like the other providers, an unattended install restarts the
+        # service so the new provider is probed (the installer's /NOSTART is for
+        # a caller that restarts the service itself).
+        "args": ["/S"],
+        "registry_version": "HKLM\\Software\\DisplayXR\\Plugins\\OpenTracking\\Version",
+        # A floor, not an exact range. Its hands role fills raw struct xrt_device
+        # from vendored headers, the ADR-063 concern that gives the Ultraleap item
+        # runtime.min == max; here the downstream-pins.json `layout` track asks
+        # for a rebuild when those headers change, and no maximum is predicted
+        # (the spec: `max` is for a known break). The variable does not exist at
+        # any release yet: until one sets it the item is listed with no floor
+        # (warned, not guessed).
+        "floor": {"file": "CMakeLists.txt", "cmake_set": "DXR_TRACKING_MIN_RUNTIME_VERSION"},
+    },
+    {
         # The DisplayXR Shell: one registered workspace controller, a component
         # the user picks. Schema 1 never listed it (its three names are frozen).
         "name": "shell",
@@ -962,6 +983,17 @@ V2_ITEMS = {
             },
         ],
     },
+    "tracking_open": {
+        "id": "open-tracking",
+        "class": "tracking_provider",
+        "registered_id": "open-tracking",
+        # The same binary is also the hands input provider (ADR-034): one item,
+        # because one installer lays down and removes both registrations.
+        "also_provides": [{"class": "input_provider", "registered_id": "open-tracking-hands"}],
+        "name": "Open camera tracking",
+        "summary": "Head, eye and hand tracking from a webcam, with open models.",
+        # Not `recommended`: it opens a camera, so a user picks it by name.
+    },
     "shell": {
         # ADR-064 worked example. Not `recommended`: a setup UI lists it
         # unticked, and the user picks it.
@@ -1048,6 +1080,8 @@ def build_catalog_v2(v1, *, manifests=None, extra=None):
         item["class"] = meta["class"]
         if "registered_id" in meta:
             item["registered_id"] = meta["registered_id"]
+        if "also_provides" in meta:
+            item["also_provides"] = [dict(r) for r in meta["also_provides"]]
         item["name"] = meta["name"]
         if "summary" in meta:
             item["summary"] = meta["summary"]
@@ -1151,6 +1185,33 @@ def _research_problems(where, item):
     return out
 
 
+def _also_provides_problems(where, item):
+    """`also_provides` (ADR-054 §5): the other registered roles of the same binary.
+    Each is a registered class with an id; no role is listed twice, and the item's
+    own role is not repeated in it."""
+    roles = item.get("also_provides")
+    if roles is None:
+        return []
+    if not isinstance(roles, list) or not roles:
+        return [f"{where}: also_provides must be a non-empty array"]
+    out = []
+    seen = {(item.get("class"), item.get("registered_id"))}
+    for i, r in enumerate(roles):
+        rwhere = f"{where} also_provides[{i}]"
+        if not isinstance(r, dict) or sorted(r) != ["class", "registered_id"]:
+            out.append(f"{rwhere}: must be exactly {{class, registered_id}}")
+            continue
+        if r["class"] not in V2_REGISTERED_CLASSES:
+            out.append(f"{rwhere}: class {r['class']!r} is not a registered class")
+        if not isinstance(r["registered_id"], str) or not V2_ID_RE.match(r["registered_id"]):
+            out.append(f"{rwhere}: registered_id is not [a-z0-9-]")
+        key = (r["class"], r["registered_id"])
+        if key in seen:
+            out.append(f"{rwhere}: role {key} is listed twice")
+        seen.add(key)
+    return out
+
+
 def validate_v2(cat, forbidden_sha256=None):
     """Structural problems of a schema-2 catalog, as strings. Empty list = valid.
 
@@ -1184,6 +1245,7 @@ def validate_v2(cat, forbidden_sha256=None):
             problems.append(f"{where}: unknown class {cls!r}")
         if cls in V2_REGISTERED_CLASSES and not item.get("registered_id"):
             problems.append(f"{where}: class {cls} needs registered_id")
+        problems += _also_provides_problems(where, item)
         pub = publishers.get(item.get("publisher"))
         if pub is None:
             problems.append(f"{where}: publisher {item.get('publisher')!r} is not in publishers")

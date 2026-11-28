@@ -31,7 +31,7 @@ VERSIONS = json.loads((REPO_ROOT / "versions.json").read_text(encoding="utf-8"))
 
 # The out-of-tree providers: each has its own repo, a plug-in ABI gate of its own
 # and an opt-in flag, whether or not it has had its first release.
-PROVIDERS = ("leia_conversion", "ultraleap")
+PROVIDERS = ("leia_conversion", "ultraleap", "tracking_open")
 
 
 def sh_var(name: str) -> str | None:
@@ -113,6 +113,61 @@ class OptIn(unittest.TestCase):
             for line in BAT.splitlines():
                 if f"call :install_component {name} " in line:
                     self.assertTrue(line.lstrip().lower().startswith("if "), line)
+
+
+class ProviderAbiGates(unittest.TestCase):
+    """check_plugin_abi.py --component: every ABI a provider negotiates must match."""
+
+    def run_gate(self, component, files):
+        from unittest import mock
+        import io
+        import contextlib
+
+        def fetch(url):
+            for suffix, text in files.items():
+                if url.endswith(suffix):
+                    return text
+            raise abi.urllib.error.HTTPError(url, 404, "Not Found", None, None)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(abi, "_fetch", fetch), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = abi.check_component(component, "v0.2.0", str(REPO_ROOT), None)
+        return rc, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def header(prefix, n):
+        return f"#define {prefix}_{n} {n}\n#define {prefix}_CURRENT {prefix}_{n}\n"
+
+    def test_tracking_open_is_gated_on_both_of_its_abis(self):
+        repo, headers = abi.COMPONENT_GATES["tracking_open"]
+        self.assertEqual(set(headers), {abi.TRACKING_PLUGIN_HEADER_PATH, abi.INPUT_PLUGIN_HEADER_PATH})
+        self.assertEqual(abi.COMPONENT_VENDORED_HEADERS["tracking_open"], "include/xrt")
+        runtime = abi.tree_abis(REPO_ROOT)
+        t = runtime["XRT_TRACKING_PLUGIN_API_VERSION_CURRENT"]
+        i = runtime["XRT_INPUT_PLUGIN_API_VERSION_CURRENT"]
+        cmake = 'set(DXR_RUNTIME_GIT_TAG "v2.53.0-17-ge5d7ffa57")\n'  # metadata, not a release tag
+        good = {
+            "/CMakeLists.txt": cmake,
+            "/include/xrt/xrt_tracking_plugin.h": self.header("XRT_TRACKING_PLUGIN_API_VERSION", t),
+            "/include/xrt/xrt_input_plugin.h": self.header("XRT_INPUT_PLUGIN_API_VERSION", i),
+        }
+        rc, out, _ = self.run_gate("tracking_open", good)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("runtime_pin=", out)  # an unparsable metadata pin is not reported, nor fatal
+        # Either ABI moving alone is a mismatch.
+        for name, prefix, cur in (("xrt_tracking_plugin.h", "XRT_TRACKING_PLUGIN_API_VERSION", t),
+                                  ("xrt_input_plugin.h", "XRT_INPUT_PLUGIN_API_VERSION", i)):
+            with self.subTest(header=name):
+                files = dict(good)
+                files["/include/xrt/" + name] = self.header(prefix, cur + 1)
+                rc, _, err = self.run_gate("tracking_open", files)
+                self.assertEqual(rc, 1)
+                self.assertIn(prefix + "_CURRENT", err)
+        # A release without the hands role's header cannot be checked: rc 2, not a pass.
+        files = dict(good)
+        del files["/include/xrt/xrt_input_plugin.h"]
+        self.assertEqual(self.run_gate("tracking_open", files)[0], 2)
 
 
 class CatalogTable(unittest.TestCase):

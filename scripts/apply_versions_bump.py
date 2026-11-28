@@ -37,8 +37,11 @@ import sys
 # ordinary field and this table has nothing to say about it. `leia_conversion`
 # left this table that way (first release v0.1.0); it stays `ultraleap`'s
 # preferred neighbour, so the two providers sit together in the file.
+# `tracking_open` (the open camera tracking provider) sits next to the other
+# open provider, `conversion_open`.
 FIRST_RELEASE_FIELDS = {
     "ultraleap": "leia_conversion",
+    "tracking_open": "conversion_open",
 }
 
 # Where a first-release field goes when its preferred neighbour is not in the

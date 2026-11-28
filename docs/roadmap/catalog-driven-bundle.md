@@ -279,9 +279,10 @@ shell, MCP tools, Leia SR plug-in, open conversion provider, five demos
 ### Already needed, independent of the rest
 
 `scripts/check_bundle_coverage.ps1` fails on any `versions.json` key that is neither chained nor
-listed in `$IntentionallyUnbundled`. The first release of the Leia conversion provider or of the
-Ultraleap provider adds a key (`leia_conversion`, `ultraleap`) and the mirror carries it there
-in the same run, so **both names must be in `$IntentionallyUnbundled` before either release**.
+listed in `$IntentionallyUnbundled`. The first release of the Leia conversion provider, of the
+Ultraleap provider or of the open tracking provider adds a key (`leia_conversion`, `ultraleap`,
+`tracking_open`) and the mirror carries it there in the same run, so **each name must be in
+`$IntentionallyUnbundled` before that release**.
 Prepared on the branch `feat/catalog-driven-bundle` of that repository.
 
 ### Two outputs from one script
@@ -303,7 +304,7 @@ online bundle keeps embedding it is one of the open decisions listed there.
    their `/D` defines are not passed to `makensis`; `/DBUNDLE_ONLINE` is.
 2. `--offline` keeps today's behaviour and the output name gains `-offline`.
 3. `--offline-with <field,...>` embeds further pinned components (`leia_conversion`,
-   `ultraleap`) for a deployment that needs them; each must have a pin and a release.
+   `ultraleap`, `tracking_open`) for a deployment that needs them; each must have a pin and a release.
 
 `installer/windows/DisplayXRBundleInstaller.nsi`
 

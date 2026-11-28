@@ -176,6 +176,20 @@ class FirstRelease(unittest.TestCase):
         lines = text.splitlines()
         at = next(i for i, line in enumerate(lines) if '"ultraleap"' in line)
         self.assertIn('"leia_conversion"', lines[at - 1])
+        # tracking_open lands directly after the other open provider.
+        at = next(i for i, line in enumerate(lines) if '"tracking_open"' in line)
+        self.assertIn('"conversion_open"', lines[at - 1])
+
+    def test_tracking_open_first_release_adds_the_field_then_bumps_it(self):
+        self.assertEqual(avb.FIRST_RELEASE_FIELDS.get("tracking_open"), "conversion_open")
+        text, what = avb.apply(PINNED, "tracking_open", "v0.2.0")
+        self.assertEqual(what, "added")
+        self.assertEqual(text, PINNED.replace(
+            '  "conversion_open": "v0.1.1",\n',
+            '  "conversion_open": "v0.1.1",\n  "tracking_open": "v0.2.0",\n'))
+        text2, what = avb.apply(text, "tracking_open", "v0.2.1")
+        self.assertEqual(what, "bumped")
+        self.assertEqual(text2.count("tracking_open"), 1)
 
 
 if __name__ == "__main__":

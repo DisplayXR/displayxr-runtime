@@ -108,6 +108,12 @@ def extra_fixture() -> dict:
             "windows": win("DisplayXRUltraleapSetup-0.1.0.7.exe", "0.1.0", "e" * 64, ["/S"],
                            "HKLM\\Software\\DisplayXR\\Plugins\\Ultraleap\\Version"),
         },
+        "tracking_open": {
+            "recommended": "0.2.0",
+            "requires": {"runtime": ">=2.58.0"},
+            "windows": win("DisplayXROpenTrackingSetup-0.2.0.exe", "0.2.0", "9" * 64, ["/S"],
+                           "HKLM\\Software\\DisplayXR\\Plugins\\OpenTracking\\Version"),
+        },
         "shell": {
             "recommended": "2.4.2",
             "requires": {"runtime": ">=2.36.0"},
@@ -267,7 +273,7 @@ class Schema2OnlyComponents(unittest.TestCase):
     def test_they_follow_the_schema1_components_and_validate(self):
         self.assertEqual([i["id"] for i in self.v2["items"]],
                          ["runtime", "leia-sr", "browser", "open-conversion", "leia-conversion", "ultraleap",
-                          "displayxr-shell"])
+                          "open-tracking", "displayxr-shell"])
         self.assertEqual(gen_catalog.validate_v2(self.v2), [])
 
     def test_schema1_never_carries_them(self):
@@ -327,6 +333,41 @@ class Schema2OnlyComponents(unittest.TestCase):
         self.assertEqual(item["requires"][0], {"kind": "runtime", "version": ">=2.69.3"})
         self.assertEqual(item["requires"][1]["kind"], "external")
         self.assertEqual(item["assets"]["windows-x64"]["file"], "DisplayXRUltraleapSetup-0.1.0.7.exe")
+
+    def test_open_tracking_is_one_item_with_two_roles_and_a_floor(self):
+        item = self.items["open-tracking"]
+        self.assertEqual((item["class"], item["registered_id"]), ("tracking_provider", "open-tracking"))
+        self.assertEqual(item["also_provides"], [{"class": "input_provider", "registered_id": "open-tracking-hands"}])
+        self.assertEqual(item["aliases"], ["tracking_open"])  # the versions.json field: `/COMPONENTS=tracking_open`
+        self.assertNotIn("recommended", item)                 # it opens a camera: the user picks it
+        self.assertNotIn("detect", item)
+        self.assertNotIn("runtime", item)                     # a floor, never a predicted maximum
+        self.assertEqual(item["requires"], [{"kind": "runtime", "version": ">=2.58.0"}])
+        asset = item["assets"]["windows-x64"]
+        self.assertEqual(asset["file"], "DisplayXROpenTrackingSetup-0.2.0.exe")
+        self.assertEqual(asset["installer"]["args"], ["/S"])
+        self.assertEqual(asset["installed"], {"kind": "registry_sz",
+                                              "path": "HKLM\\Software\\DisplayXR\\Plugins\\OpenTracking\\Version"})
+        self.assertNotIn("uninstall", asset)  # not read from a release yet; not guessed
+
+    def test_open_tracking_floor_is_read_from_its_cmake_and_optional(self):
+        comp = next(c for c in gen_catalog.V2_ONLY_COMPONENTS if c["name"] == "tracking_open")
+        self.assertNotIn("runtime_exact", comp)
+        self.assertFalse(comp.get("floor_required"))
+        saved = {n: getattr(gen_catalog, n) for n in ("repo_file", "windows_block", "warn", "info")}
+        try:
+            gen_catalog.warn = gen_catalog.info = lambda msg: None
+            gen_catalog.windows_block = lambda comp, version, verifier, d, reg=None: None
+            gen_catalog.repo_file = lambda repo, path, ref: 'set(DXR_TRACKING_MIN_RUNTIME_VERSION "2.58.0")\n'
+            self.assertEqual(gen_catalog.build_extra_components({"tracking_open": "v0.2.0"}, lambda p: None, "."),
+                             {"tracking_open": {"recommended": "0.2.0", "requires": {"runtime": ">=2.58.0"}}})
+            # No such variable at the tag: listed, with no floor (warned, never guessed).
+            gen_catalog.repo_file = lambda repo, path, ref: 'set(DXR_RUNTIME_GIT_TAG "v2.53.0-17-ge5d7ffa57")\n'
+            self.assertEqual(gen_catalog.build_extra_components({"tracking_open": "v0.2.0"}, lambda p: None, "."),
+                             {"tracking_open": {"recommended": "0.2.0"}})
+        finally:
+            for n, f in saved.items():
+                setattr(gen_catalog, n, f)
 
     def test_shell_is_a_workspace_controller_the_user_picks(self):
         item = self.items["displayxr-shell"]
@@ -484,6 +525,21 @@ class Schema2Validation(unittest.TestCase):
         self.assertIn("unknown class 'game_profile'", text)
         self.assertIn("requires kind 'magic'", text)
         self.assertIn("is not >=X.Y.Z", text)
+
+    def test_also_provides_rules(self):
+        ok = [{"class": "input_provider", "registered_id": "leia-sr-hands"}]
+        self.v2["items"][1]["also_provides"] = ok
+        self.assertEqual(gen_catalog.validate_v2(self.v2), [])
+        for bad, want in (
+                ([], "non-empty array"),
+                ([{"class": "app", "registered_id": "x"}], "is not a registered class"),
+                ([{"class": "input_provider", "registered_id": "Bad_Id"}], "registered_id is not"),
+                ([{"class": "input_provider"}], "exactly {class, registered_id}"),
+                ([{"class": "display_processor", "registered_id": "leia-sr"}], "listed twice"),
+                (ok + ok, "listed twice")):
+            with self.subTest(bad=bad):
+                self.v2["items"][1]["also_provides"] = bad
+                self.assertIn(want, self.problems())
 
     def test_external_requirement_is_allowed(self):
         self.v2["items"][1]["requires"].append({"kind": "external", "name": "vendor-service"})
