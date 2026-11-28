@@ -105,10 +105,13 @@ is signed), so teach the signing provider the component before expecting it ther
 `InputProviders\open-tracking-hands`; opt-in because it opens a camera) gates its dispatch
 on the repository variable `DXR_VERSIONS_BUMP=true` like `ultraleap`; leave the variable
 unset on `displayxr-tracking-open` until this hub knows the `tracking_open` field. Its
-macOS `.pkg` is signed and notarized by its own `release.yml`; its Windows installer is
-not known to the signing provider yet, so Phase 3.5 has nothing to dispatch for it
-(`INST=""`) and the unsigned `.exe` is not listed in the component catalog until the
-provider learns an `open-tracking` recipe (then add it to the Step 3.5.2 / 3.5.3 maps).
+macOS `.pkg` is signed and notarized by its own `release.yml`. Its Windows installer is
+signed through Phase 3.5 like `open-conversion`: signing component `open-tracking`,
+installer `DisplayXROpenTrackingSetup-<version>.exe` (the provider's recipe rebuilds it from
+the tag and takes the converted models from the `release-models` artifact of that tag's
+`release.yml` run, so wait for that run before Phase 3.5). **The recipe is pending its first
+test run**: if the signing run fails or returns no such `.exe`, the release ships the unsigned
+CI asset, which the component catalog does not list (every listed asset is signed).
 `leia-conversion` is signed through Phase 3.5 like any installer component once the signing
 provider's `leia-conversion` recipe is merged; a provider without it returns no
 `DisplayXRLeiaConversionSetup-<version>.exe` and the release ships unsigned.
@@ -843,13 +846,14 @@ fi
 ```
 
 ### Step 3.5.2: Normalize the component name for the workflow
-The workflow expects canonical names (`runtime|leia-plugin|leia-conversion|open-conversion|mcp|gauss|modelviewer|mediaplayer|avatar|earthview`).
+The workflow expects canonical names (`runtime|leia-plugin|leia-conversion|open-conversion|open-tracking|mcp|gauss|modelviewer|mediaplayer|avatar|earthview`).
 Map the skill's aliases:
 ```bash
 case "$COMPONENT" in
   leia|leia-plugin)              COMP=leia-plugin ;;
   leia-conversion)               COMP=leia-conversion ;;
   open-conversion)               COMP=open-conversion ;;
+  open-tracking)                 COMP=open-tracking ;;   # recipe pending its first test run
   gauss|demo-gaussiansplat)      COMP=gauss ;;
   modelviewer|demo-modelviewer)  COMP=modelviewer ;;
   avatar|demo-avatar)            COMP=avatar ;;
@@ -869,6 +873,7 @@ case "$COMP" in
   leia-plugin) INST=DisplayXRLeiaSRSetup ;;
   leia-conversion) INST=DisplayXRLeiaConversionSetup ;;
   open-conversion) INST=DisplayXROpenConversionSetup ;;
+  open-tracking) INST=DisplayXROpenTrackingSetup ;;
   mcp)         INST=DisplayXRMCPSetup ;;
   gauss)       INST=DisplayXRGaussianSplatSetup ;;
   modelviewer) INST=DisplayXRModelViewerSetup ;;
