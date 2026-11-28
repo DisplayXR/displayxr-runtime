@@ -1057,6 +1057,12 @@ TEST_CASE("detect rules (#2737): edid product range, usb VID:PID, vendor-only ru
 	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod_min":16700,"confidence":"high"}])"));
 	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod":16711,"prod_max":16720,"confidence":"high"}])"));
 	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod":80000,"confidence":"high"}])"));
+	// Not an integer (#2742): 16711.9 is malformed, not truncated to 16711.
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod":16711.9,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44048.5,"prod":16711,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod_min":16700.5,"prod_max":16711,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod_min":16700,"prod_max":16711.2,"confidence":"high"}])"));
+	CHECK(match(R"([{"kind":"edid","man":44048,"prod":16711.0,"confidence":"high"}])", true));
 
 	// Manufacturer only: matches, but never as high confidence (Dell ships 2D monitors).
 	CHECK(match(R"([{"kind":"edid","man":44048,"confidence":"high"}])"));
@@ -1073,6 +1079,9 @@ TEST_CASE("detect rules (#2737): edid product range, usb VID:PID, vendor-only ru
 	CHECK(match(R"([{"kind":"usb","vid":1133,"confidence":"high"}])"));
 	CHECK_FALSE(match(R"([{"kind":"usb","vid":1133,"confidence":"high"}])", true));
 	CHECK_FALSE(match(R"([{"kind":"usb","pid":7,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"usb","vid":11012,"pid":7.5,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"usb","vid":11012.1,"pid":7,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"usb","vid":11012,"pid_min":1,"pid_max":9.9,"confidence":"high"}])"));
 
 	// An unknown kind before a matching rule does not stop evaluation.
 	const char *unknown_then_edid =

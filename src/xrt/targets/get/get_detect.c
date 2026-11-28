@@ -31,7 +31,8 @@ dxr_detect_edids(struct dxr_edid_id *out, int max)
 	}
 	SP_DEVINFO_DATA dd;
 	dd.cbSize = sizeof(dd);
-	for (DWORD i = 0; n < max && SetupDiEnumDeviceInfo(di, i, &dd); i++) {
+	bool full = false;
+	for (DWORD i = 0; !full && SetupDiEnumDeviceInfo(di, i, &dd); i++) {
 		HKEY k = SetupDiOpenDevRegKey(di, &dd, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
 		if (k == INVALID_HANDLE_VALUE) {
 			continue;
@@ -49,13 +50,19 @@ dxr_detect_edids(struct dxr_edid_id *out, int max)
 			for (int j = 0; j < n; j++) {
 				dup = dup || (out[j].man == id.man && out[j].prod == id.prod);
 			}
-			if (!dup) {
+			if (!dup && n == max) {
+				full = true; // one more distinct id than fits: say so, once (#2742)
+			} else if (!dup) {
 				out[n++] = id;
 			}
 		}
 		RegCloseKey(k);
 	}
 	SetupDiDestroyDeviceInfoList(di);
+	if (full) {
+		dxr_log("detect: more than %d distinct monitor EDIDs are present; only the first %d are used\n", max,
+		        max);
+	}
 	return n;
 }
 
@@ -94,7 +101,8 @@ dxr_detect_usb(struct dxr_usb_id *out, int max)
 	}
 	SP_DEVINFO_DATA dd;
 	dd.cbSize = sizeof(dd);
-	for (DWORD i = 0; n < max && SetupDiEnumDeviceInfo(di, i, &dd); i++) {
+	bool full = false;
+	for (DWORD i = 0; !full && SetupDiEnumDeviceInfo(di, i, &dd); i++) {
 		wchar_t ids[1024];
 		DWORD type = 0;
 		if (!SetupDiGetDeviceRegistryPropertyW(di, &dd, SPDRP_HARDWAREID, &type, (PBYTE)ids,
@@ -113,11 +121,17 @@ dxr_detect_usb(struct dxr_usb_id *out, int max)
 		for (int j = 0; j < n; j++) {
 			dup = dup || (out[j].vid == id.vid && out[j].pid == id.pid);
 		}
-		if (!dup) {
+		if (!dup && n == max) {
+			full = true; // one more distinct id than fits: say so, once (#2742)
+		} else if (!dup) {
 			out[n++] = id;
 		}
 	}
 	SetupDiDestroyDeviceInfoList(di);
+	if (full) {
+		dxr_log("detect: more than %d distinct USB VID:PIDs are present; only the first %d are used\n", max,
+		        max);
+	}
 	return n;
 }
 

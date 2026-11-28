@@ -386,9 +386,10 @@ plus `kind`, `confidence` and `note`; the generator strips any other key, so a v
 cannot add unreviewed keys to the signed catalog, and `validate_v2` rejects an item's or an
 external requirement's `detect` rule that is not already in that clean form. A malformed rule (a
 half or inverted range, a product id given both exactly and as a range, a value outside 16
-bits) matches nothing. A client treats a rule of an unknown kind as not matched and goes on to
-the next rule; the generator drops it. Item ids and aliases `edids`, `usb` and
-`display_plugins` are reserved: they are top-level keys of `dxr-get detect --json`.
+bits or not an integer) matches nothing. A client treats a rule of an unknown kind as not matched and goes on to
+the next rule; the generator drops it. Item ids and aliases `edids`, `usb`,
+`display_plugins` and `detected_items` are reserved: they are top-level keys of
+`dxr-get detect --json`.
 `edid` ranges and `usb` are #2737 additions: a `dxr-get` from before them skips a range rule
 (no `prod`) and a `usb` rule, which is why the generator still emits one exact `edid` rule per
 Leia table row rather than compacting runs into ranges.

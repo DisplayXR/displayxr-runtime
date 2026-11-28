@@ -781,6 +781,8 @@ class Schema2DetectValidation(unittest.TestCase):
     def test_reserved_ids(self):
         self.leia["aliases"] = ["leia_plugin", "display_plugins"]
         self.assertIn("'display_plugins' is reserved", self.problems())
+        self.leia["aliases"] = ["leia_plugin", "detected_items"]
+        self.assertIn("'detected_items' is reserved", self.problems())
 
 
 if __name__ == "__main__":
