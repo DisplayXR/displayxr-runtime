@@ -351,6 +351,13 @@ jobs:
       - name: Pin-bump gate unit tests
         run: python3 scripts/tests/test_downstream_pin_bump.py
 
+      - name: U_LOG_*IFL* level argument is a single operand
+        # Hermetic (reads src/). The macros paste `level` unparenthesised, so a
+        # bare `a ? WARN : INFO` defeats the global-level guard (always logs)
+        # and `n < 16 ? ...` is a hard error on newer Clang. The macro itself is
+        # left alone: u_logging.h gates the Ultraleap provider (layout track).
+        run: python3 scripts/tests/test_u_log_ifl_level_args.py
+
       - name: Runtime version derivation unit tests (#1790)
         # Hermetic (throwaway git repos + `cmake -P`): tag build = exactly the
         # tag, dev build = last release + describe, rc / bookmark tags ignored,

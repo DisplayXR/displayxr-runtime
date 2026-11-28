@@ -922,7 +922,7 @@ resolve_client_locked(struct t_input_client *c)
 		// after, so a provider whose presence toggles often stays quiet.
 		const bool first = !c->warned;
 		c->warned = true;
-		U_LOG_IFL(first ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+		U_LOG_IFL((first ? U_LOGGING_WARN : U_LOGGING_INFO), u_log_get_global_level(),
 		          "input arbiter: client %llu ('%s') roles -> left %d right %d hands %d/%d gamepad %d "
 		          "(controllers '%s', hands '%s', gamepad '%s'), generation %llu.",
 		          (unsigned long long)c->key, c->exe, left, right, ht[ARB_HT_UNOBSTRUCTED_LEFT],
