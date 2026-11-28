@@ -412,6 +412,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# Linux (the #369 fix's twin): the pick, pinned on the DS1 box's records
 	# and end to end from a temp-dir DRM sysfs fixture.
 	list(APPEND tests tests_sim_display_monitor_geometry)
+	# The process-wide Xlib lock (#2820 follow-up): exclusion, identity with
+	# the desktop-rect resolver's lock, and an X stress when DISPLAY is set.
+	list(APPEND tests tests_aux_xlib_lock)
 endif()
 if(APPLE)
 	# macOS monitor enumeration -- CG vendor byte order, the EDID <-> display
@@ -532,6 +535,10 @@ endforeach()
 # compiled straight in (portable C) so the test does not need the compositor module.
 target_sources(tests_share_link PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/xbridge/comp_xbridge_share_tap.c)
 target_include_directories(tests_share_link PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/xbridge)
+
+if(TARGET tests_aux_xlib_lock)
+	target_link_libraries(tests_aux_xlib_lock PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 target_include_directories(tests_oxr_session_window_binding PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
 

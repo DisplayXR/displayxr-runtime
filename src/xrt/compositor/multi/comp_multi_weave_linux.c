@@ -114,6 +114,7 @@
 #include "xrt/xrt_weave_dmabuf.h"
 
 #include "os/os_time.h"
+#include "os/os_xlib_lock.h"
 
 #include "util/u_misc.h"
 #include "util/u_logging.h"
@@ -2513,6 +2514,12 @@ weave_cursor_x11_pointer(int *out_x, int *out_y)
 	if (!g_weave_x11.tried) {
 		g_weave_x11.tried = true;
 		if (weave_cursor_session_is_x11()) {
+			// XOpenDisplay touches Xlib's process-global state, which no
+			// XInitThreads guards here: take the runtime's Xlib lock against
+			// the display hotplug sweep's own connections (os_xlib_lock.h).
+			// The per-submit XQueryPointer below is a core request on this
+			// private connection only, so g_weave_x11.lock is enough for it.
+			os_xlib_lock();
 			void *lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
 			void *(*open_display)(const char *) = NULL;
 			unsigned long (*default_root)(void *) = NULL;
@@ -2534,6 +2541,7 @@ weave_cursor_x11_pointer(int *out_x, int *out_y)
 					dlclose(lib);
 				}
 			}
+			os_xlib_unlock();
 		}
 		U_LOG_W("[weave cursor] pointer source: %s (ADR-046 Amendment 6)",
 		        g_weave_x11.dpy != NULL

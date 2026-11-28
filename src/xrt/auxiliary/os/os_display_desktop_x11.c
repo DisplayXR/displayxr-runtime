@@ -74,6 +74,7 @@
 #include "os_display_desktop.h"
 #include "os_display_connector_linux.h"
 #include "os_display_edid_linux.h"
+#include "os_xlib_lock.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -160,27 +161,43 @@ struct x11_fns
  * enumerating monitors) corrupted the heap in exactly that state. The private
  * connection keeps us off the host's Display; this lock keeps our own threads
  * off each other.
+ *
+ * Shared through os_xlib_lock.h with the runtime's other Xlib users (the
+ * service weave engine's pointer reader, the cursor look's Xft.dpi read, the
+ * vk_native Xlib-surface fallback and direct-scanout backend).
  */
 static pthread_mutex_t g_x11_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void
+os_xlib_lock(void)
+{
+	pthread_mutex_lock(&g_x11_lock);
+}
+
+void
+os_xlib_unlock(void)
+{
+	pthread_mutex_unlock(&g_x11_lock);
+}
 
 static bool
 x11_fns_load(struct x11_fns *f)
 {
 	memset(f, 0, sizeof(*f));
-	pthread_mutex_lock(&g_x11_lock);
+	os_xlib_lock();
 
 	// Versioned sonames: the unversioned .so lives in the -dev package, which a
 	// runtime box has no reason to have installed.
 	f->lib_x11 = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
 	if (f->lib_x11 == NULL) {
-		pthread_mutex_unlock(&g_x11_lock);
+		os_xlib_unlock();
 		return false;
 	}
 	f->lib_xrandr = dlopen("libXrandr.so.2", RTLD_LAZY | RTLD_LOCAL);
 	if (f->lib_xrandr == NULL) {
 		dlclose(f->lib_x11);
 		f->lib_x11 = NULL;
-		pthread_mutex_unlock(&g_x11_lock);
+		os_xlib_unlock();
 		return false;
 	}
 
@@ -215,7 +232,7 @@ fail:
 	dlclose(f->lib_xrandr);
 	dlclose(f->lib_x11);
 	memset(f, 0, sizeof(*f));
-	pthread_mutex_unlock(&g_x11_lock);
+	os_xlib_unlock();
 	return false;
 }
 
@@ -231,7 +248,7 @@ x11_fns_unload(struct x11_fns *f)
 	}
 	memset(f, 0, sizeof(*f));
 	if (loaded) {
-		pthread_mutex_unlock(&g_x11_lock); // taken by the x11_fns_load that succeeded
+		os_xlib_unlock(); // taken by the x11_fns_load that succeeded
 	}
 }
 

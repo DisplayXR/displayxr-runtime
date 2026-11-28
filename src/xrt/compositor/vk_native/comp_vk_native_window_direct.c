@@ -23,6 +23,8 @@
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 
+#include "os/os_xlib_lock.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -52,6 +54,19 @@ struct comp_vk_native_window_direct
 	//! Only turns false on teardown; direct scanout has no user-close event.
 	bool valid;
 };
+
+/*!
+ * XCloseDisplay under the runtime's Xlib lock (os_xlib_lock.h): it unlinks the
+ * connection from Xlib's process-global state and runs libXrandr's extension
+ * close hook, neither guarded unless the host called XInitThreads.
+ */
+static void
+direct_close_display(Display *dpy)
+{
+	os_xlib_lock();
+	XCloseDisplay(dpy);
+	os_xlib_unlock();
+}
 
 /*!
  * Find the RandR output whose CRTC origin matches the plug-in-reported panel
@@ -173,16 +188,23 @@ comp_vk_native_window_direct_create(struct vk_bundle *vk,
 		return XRT_ERROR_VULKAN;
 	}
 
+	// The open and the RandR walk touch Xlib's process-global state (the
+	// display list, libXrandr's per-extension display list), so they run under
+	// the runtime's Xlib lock, against the display hotplug sweep's own RandR
+	// reads. Released before the Vulkan calls below, which use the connection
+	// from inside the driver.
+	os_xlib_lock();
 	Display *dpy = XOpenDisplay(NULL);
+	RROutput output = dpy != NULL ? find_target_randr_output(dpy, screen_left, screen_top) : None;
+	os_xlib_unlock();
 	if (dpy == NULL) {
 		U_LOG_E("direct: XOpenDisplay(NULL) failed");
 		return XRT_ERROR_VULKAN;
 	}
 
-	RROutput output = find_target_randr_output(dpy, screen_left, screen_top);
 	if (output == None) {
 		U_LOG_E("direct: no connected RandR output to acquire");
-		XCloseDisplay(dpy);
+		direct_close_display(dpy);
 		return XRT_ERROR_VULKAN;
 	}
 
@@ -192,7 +214,7 @@ comp_vk_native_window_direct_create(struct vk_bundle *vk,
 	VkResult res = vk->vkGetRandROutputDisplayEXT(vk->physical_device, dpy, output, &vkdisplay);
 	if (res != VK_SUCCESS || vkdisplay == VK_NULL_HANDLE) {
 		U_LOG_E("direct: vkGetRandROutputDisplayEXT failed (%d)", res);
-		XCloseDisplay(dpy);
+		direct_close_display(dpy);
 		return XRT_ERROR_VULKAN;
 	}
 
@@ -200,7 +222,7 @@ comp_vk_native_window_direct_create(struct vk_bundle *vk,
 	res = vk->vkAcquireXlibDisplayEXT(vk->physical_device, dpy, vkdisplay);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("direct: vkAcquireXlibDisplayEXT failed (%d)", res);
-		XCloseDisplay(dpy);
+		direct_close_display(dpy);
 		return XRT_ERROR_VULKAN;
 	}
 
@@ -213,7 +235,7 @@ comp_vk_native_window_direct_create(struct vk_bundle *vk,
 		U_LOG_E("direct: no display modes (%d)", res);
 		free(modes);
 		vk->vkReleaseDisplayEXT(vk->physical_device, vkdisplay);
-		XCloseDisplay(dpy);
+		direct_close_display(dpy);
 		return XRT_ERROR_VULKAN;
 	}
 	VkDisplayModeKHR mode = modes[0].displayMode;
@@ -225,7 +247,7 @@ comp_vk_native_window_direct_create(struct vk_bundle *vk,
 	uint32_t stack_index = 0;
 	if (!pick_display_plane(vk, vkdisplay, &plane_index, &stack_index)) {
 		vk->vkReleaseDisplayEXT(vk->physical_device, vkdisplay);
-		XCloseDisplay(dpy);
+		direct_close_display(dpy);
 		return XRT_ERROR_VULKAN;
 	}
 
@@ -245,7 +267,7 @@ comp_vk_native_window_direct_create(struct vk_bundle *vk,
 	if (res != VK_SUCCESS) {
 		U_LOG_E("direct: vkCreateDisplayPlaneSurfaceKHR failed (%d)", res);
 		vk->vkReleaseDisplayEXT(vk->physical_device, vkdisplay);
-		XCloseDisplay(dpy);
+		direct_close_display(dpy);
 		return XRT_ERROR_VULKAN;
 	}
 
@@ -253,7 +275,7 @@ comp_vk_native_window_direct_create(struct vk_bundle *vk,
 	if (win == NULL) {
 		vk->vkDestroySurfaceKHR(vk->instance, surface, NULL);
 		vk->vkReleaseDisplayEXT(vk->physical_device, vkdisplay);
-		XCloseDisplay(dpy);
+		direct_close_display(dpy);
 		return XRT_ERROR_ALLOCATION;
 	}
 
@@ -312,7 +334,7 @@ comp_vk_native_window_direct_destroy(struct comp_vk_native_window_direct **win_p
 		vk->vkReleaseDisplayEXT(vk->physical_device, win->display);
 	}
 	if (win->dpy != NULL) {
-		XCloseDisplay(win->dpy);
+		direct_close_display(win->dpy);
 	}
 
 	free(win);
