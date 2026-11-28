@@ -58,6 +58,7 @@
 #include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_display_zones.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "dxr_worst_case.h"  // INV-4.2: size the swapchain once at the runtime's stated worst case
 
 // displayxr-common: remap GL-convention clip-depth ([-1,1]) to Vulkan's [0,1].
 // mat4_from_xr_fov (== the Windows ProjectionFromXrFov) emits GL depth; without
@@ -2242,6 +2243,8 @@ struct AppXrSession {
 
     XrViewConfigurationType viewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     std::vector<XrViewConfigurationView> configViews;
+    // XR_DXR_display_info enabled on the instance (gates the v28 worst-case query).
+    bool hasDisplayInfo = false;
 
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool sessionRunning = false;
@@ -2379,6 +2382,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         // fixed 2-view SBS at whatever dimensions xrEnumerateViewConfigurationViews
         // reports at init, and does not adapt to later mode changes.
         enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+        xr.hasDisplayInfo = true;
         LOG_INFO("XR_DXR_display_info: AVAILABLE (enabled for panel position + dims)");
     }
     // XR_DXR_view_rig (#396 W7): the app chains XrDisplayRigDXR on every
@@ -2797,9 +2801,28 @@ static bool CreateSwapchain(AppXrSession& xr) {
 
     const auto& view = xr.configViews[0];
 
-    // Legacy: use recommendedImageRectWidth * 2 (stereo SBS) since no modes are enumerated
+    // The non-zones fallback path's atlas. Sized ONCE at the worst case the
+    // runtime states (INV-4.2, ADR-066 Amendment 2), so a live 3D-mode switch
+    // or a move to another screen retiles into this same swapchain. A runtime
+    // that states none (display_info < v28) keeps the historical
+    // recommendedImageRectWidth * 2 (stereo SBS) envelope.
     uint32_t scWidth = view.recommendedImageRectWidth * 2;
     uint32_t scHeight = view.recommendedImageRectHeight;
+    {
+        const uint32_t fallbackW = scWidth, fallbackH = scHeight;
+        XrDisplayRenderingWorstCaseDXR wc;
+        if (DxrApplyRenderingWorstCase(xr.instance, xr.systemId, xr.hasDisplayInfo ? 1 : 0, 0, &scWidth, &scHeight,
+                                       &wc)) {
+            LOG_INFO("Swapchain at the runtime's worst case: atlas %ux%u (view %ux%u, %u views) -> %ux%u "
+                     "(recommended x 2 alone gave %ux%u)",
+                     wc.maxAtlasWidthPixels, wc.maxAtlasHeightPixels, wc.maxViewWidthPixels,
+                     wc.maxViewHeightPixels, wc.maxViewCount, scWidth, scHeight, fallbackW, fallbackH);
+        } else {
+            LOG_WARN("Runtime states no rendering worst case (XR_DXR_display_info < v28 or no display info): "
+                     "swapchain %ux%u from recommendedImageRect x 2",
+                     scWidth, scHeight);
+        }
+    }
 
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;

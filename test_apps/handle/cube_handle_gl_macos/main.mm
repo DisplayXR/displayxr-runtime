@@ -53,6 +53,7 @@
 #include <openxr/XR_DXR_cursor_depth.h>
 #include "cursor_depth.h" // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "dxr_worst_case.h"  // INV-4.2: size the swapchain once at the stated worst case
 #include "dxr_stylus.h"      // --stylus: the shared OpenXR half (ADR-034 Amendment 8)
 
 // ============================================================================
@@ -1759,6 +1760,24 @@ static bool CreateSwapchain(AppXrSession &app)
             uint32_t mh = (uint32_t)(app.renderingModeTileRows[i] * app.renderingModeScaleY[i] * app.displayPixelHeight);
             if (mw > w) w = mw;
             if (mh > h) h = mh;
+        }
+    }
+    // INV-4.2 / ADR-066 Amendment 2: size ONCE at the worst case the runtime
+    // states (XrDisplayRenderingWorstCaseDXR covers every declared entry of
+    // every screen), so a live 3D-mode switch or a move to another screen
+    // retiles into this same swapchain. The start-up mode table above is the fallback
+    // for a runtime that states none (display_info < v28).
+    {
+        const uint32_t startW = w, startH = h;
+        XrDisplayRenderingWorstCaseDXR wc;
+        if (DxrApplyRenderingWorstCase(app.instance, app.systemId, app.hasDisplayInfoExt ? 1 : 0, 0, &w, &h, &wc)) {
+            LOG_INFO("Swapchain at the runtime's worst case: atlas %ux%u (view %ux%u, %u views) -> %ux%u "
+                     "(the start-up mode table alone gave %ux%u)",
+                     wc.maxAtlasWidthPixels, wc.maxAtlasHeightPixels, wc.maxViewWidthPixels,
+                     wc.maxViewHeightPixels, wc.maxViewCount, w, h, startW, startH);
+        } else {
+            LOG_WARN("Runtime states no rendering worst case (XR_DXR_display_info < v28 or no display info): "
+                     "swapchain %ux%u from the start-up mode table", w, h);
         }
     }
 

@@ -19,6 +19,7 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_display_info.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "dxr_worst_case.h"  // INV-4.2: size the swapchain once at the stated worst case
 #include "dxr_stylus.h"      // --stylus: the shared OpenXR half (ADR-034 Amendment 8)
 
 #include <cmath>
@@ -758,6 +759,8 @@ struct AppXrSession {
     SwapchainInfo swapchain;
     XrViewConfigurationType viewConfigType;
     std::vector<XrViewConfigurationView> configViews;
+    // XR_DXR_display_info enabled on the instance (gates the v28 worst-case query).
+    bool hasDisplayInfoExt = false;
     XrSessionState sessionState;
     bool sessionRunning;
     bool exitRequested;
@@ -815,6 +818,7 @@ static bool InitializeOpenXR(AppXrSession &app)
     std::vector<const char*> enabledExts = {XR_KHR_METAL_ENABLE_EXTENSION_NAME};
     if (hasDisplayInfoExt)
         enabledExts.push_back("XR_DXR_display_info");
+    app.hasDisplayInfoExt = hasDisplayInfoExt;
     if (g_hasMxInkExt)
         enabledExts.push_back(XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME);
     if (g_stylusMode)
@@ -1030,6 +1034,24 @@ static bool CreateSwapchain(AppXrSession &app)
             uint32_t mh = (uint32_t)(app.renderingModeTileRows[i] * app.renderingModeScaleY[i] * app.displayPixelHeight);
             if (mw > w) w = mw;
             if (mh > h) h = mh;
+        }
+    }
+    // INV-4.2 / ADR-066 Amendment 2: size ONCE at the worst case the runtime
+    // states (XrDisplayRenderingWorstCaseDXR covers every declared entry of
+    // every screen), so a live 3D-mode switch or a move to another screen
+    // retiles into this same swapchain. The start-up mode table above is the fallback
+    // for a runtime that states none (display_info < v28).
+    {
+        const uint32_t startW = w, startH = h;
+        XrDisplayRenderingWorstCaseDXR wc;
+        if (DxrApplyRenderingWorstCase(app.instance, app.systemId, app.hasDisplayInfoExt ? 1 : 0, 0, &w, &h, &wc)) {
+            LOG_INFO("Swapchain at the runtime's worst case: atlas %ux%u (view %ux%u, %u views) -> %ux%u "
+                     "(the start-up mode table alone gave %ux%u)",
+                     wc.maxAtlasWidthPixels, wc.maxAtlasHeightPixels, wc.maxViewWidthPixels,
+                     wc.maxViewHeightPixels, wc.maxViewCount, w, h, startW, startH);
+        } else {
+            LOG_WARN("Runtime states no rendering worst case (XR_DXR_display_info < v28 or no display info): "
+                     "swapchain %ux%u from the start-up mode table", w, h);
         }
     }
 
@@ -1305,9 +1327,21 @@ int main(int argc, char **argv)
             ? app.renderingModeTileColumns[app.currentModeIndex] : (modeViewCount >= 2 ? 2 : 1);
         uint32_t tileRows = (app.currentModeIndex < app.renderingModeCount)
             ? app.renderingModeTileRows[app.currentModeIndex] : ((modeViewCount + tileColumns - 1) / tileColumns);
+        // One tile = the ACTIVE mode's view: panel x viewScale (the hosted
+        // window is the runtime's native-res window). The swapchain is sized
+        // at the runtime's worst case (INV-4.2), which can be larger than this
+        // mode's atlas, so a tile is NOT swapchain / columns; it is clamped to
+        // that as the overflow guard. No display info: the old swapchain split.
+        uint32_t eyeW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
+        uint32_t eyeH = tileRows > 0 ? app.swapchain.height / tileRows : app.swapchain.height;
+        if (app.currentModeIndex < app.renderingModeCount && app.displayPixelWidth > 0 &&
+            app.displayPixelHeight > 0) {
+            const uint32_t mw = (uint32_t)(app.renderingModeScaleX[app.currentModeIndex] * app.displayPixelWidth);
+            const uint32_t mh = (uint32_t)(app.renderingModeScaleY[app.currentModeIndex] * app.displayPixelHeight);
+            if (mw > 0 && mw < eyeW) eyeW = mw;
+            if (mh > 0 && mh < eyeH) eyeH = mh;
+        }
         if (frameState.shouldRender && modeViewCount >= 1) {
-            uint32_t eyeW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
-            uint32_t eyeH = tileRows > 0 ? app.swapchain.height / tileRows : app.swapchain.height;
 
             std::vector<EyeRenderParams> eyeParams(modeViewCount);
             for (uint32_t i = 0; i < modeViewCount; i++) {
@@ -1333,8 +1367,6 @@ int main(int argc, char **argv)
         for (uint32_t i = 0; i < modeViewCount; i++) {
             uint32_t tileX = i % tileColumns;
             uint32_t tileY = i / tileColumns;
-            uint32_t eyeW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
-            uint32_t eyeH = tileRows > 0 ? app.swapchain.height / tileRows : app.swapchain.height;
             projViews[i].pose = views[i].pose;
             projViews[i].fov = views[i].fov;
             projViews[i].subImage.swapchain = app.swapchain.swapchain;

@@ -97,6 +97,7 @@
 // (test_apps/common/dxr_view_config.h). Unconditional — it only needs
 // <openxr/openxr.h>.
 #include "dxr_view_config.h"
+#include "dxr_worst_case.h" // INV-4.2: size the swapchain once at the stated worst case
 
 #include <atomic>
 #include <cmath>
@@ -1341,6 +1342,33 @@ create_swapchains()
 		const RenderingModeInfo &m = active_mode();
 		atlas_w = view_config.recommendedImageRectWidth * m.tile_columns;
 		atlas_h = view_config.recommendedImageRectHeight * m.tile_rows;
+	}
+	// INV-4.2 / ADR-066 Amendment 2: size ONCE at the worst case the runtime
+	// states (XrDisplayRenderingWorstCaseDXR covers every declared entry of
+	// every screen, so a live 3D-mode switch retiles into this same
+	// swapchain). It is stated for the CURRENT orientation, so it is combined
+	// (per-dimension max) with the both-orientations table bound above, which
+	// stays the fallback for a runtime that states none (display_info < v28).
+	{
+		const uint32_t table_w = atlas_w, table_h = atlas_h;
+		XrDisplayRenderingWorstCaseDXR wc;
+		if (DxrApplyRenderingWorstCase(g_instance, g_system_id, g_has_display_info ? 1 : 0, 0, &atlas_w, &atlas_h,
+		                               &wc)) {
+			if (table_w > atlas_w) {
+				atlas_w = table_w; // the other orientation's bound
+			}
+			if (table_h > atlas_h) {
+				atlas_h = table_h;
+			}
+			LOGI("Swapchain at the runtime's worst case: atlas %ux%u (view %ux%u, %u views) -> %ux%u "
+			     "(the start-up table, both orientations, alone gave %ux%u)",
+			     wc.maxAtlasWidthPixels, wc.maxAtlasHeightPixels, wc.maxViewWidthPixels, wc.maxViewHeightPixels,
+			     wc.maxViewCount, atlas_w, atlas_h, table_w, table_h);
+		} else {
+			LOGW("Runtime states no rendering worst case (XR_DXR_display_info < v28 or no display info): "
+			     "swapchain %ux%u from the start-up table",
+			     atlas_w, atlas_h);
+		}
 	}
 	if (atlas_w == 0 || atlas_h == 0) {
 		LOGE("Atlas sizing failed (%ux%u); aborting swapchain create", atlas_w, atlas_h);
