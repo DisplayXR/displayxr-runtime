@@ -1645,37 +1645,14 @@ static bool GetGLGraphicsRequirements(AppXrSession &app)
     return true;
 }
 
-static bool CreateSession(AppXrSession &app)
+//! (Re)read the runtime's rendering-mode table into the renderingMode* arrays
+//! and the active index. Called after xrCreateSession and again on
+//! XrEventDataRenderingModeChangedDXR and XrEventDataRenderingModeTableChangedDXR
+//! (XR_DXR_display_info v27, ADR-066 C1): a live 3D-mode change re-describes
+//! slot 1 (view count, tiles, scale, hardwareDisplay3D) under an unchanged
+//! index, and the frame loop reads its tiling from these arrays (#2852).
+static void EnumerateRenderingModes(AppXrSession &app)
 {
-    LOG_INFO("Creating OpenXR session with macOS GL binding + cocoa_window_binding...");
-
-    // Get CGL context from our NSOpenGLContext
-    CGLContextObj cglCtx = (CGLContextObj)[g_glContext CGLContextObj];
-
-    XrGraphicsBindingOpenGLMacOSDXR glBinding = {};
-    glBinding.type = XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_DXR;
-    glBinding.cglContext = (void *)cglCtx;
-    glBinding.cglPixelFormat = nullptr;
-
-    // Chain the cocoa window binding — pass our NSView to the runtime
-    XrCocoaWindowBindingCreateInfoDXR cocoaBinding = {};
-    cocoaBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR;
-    cocoaBinding.next = nullptr;
-    cocoaBinding.viewHandle = (__bridge void *)g_glView;
-
-    if (app.hasCocoaWindowBinding) {
-        glBinding.next = &cocoaBinding;
-        LOG_INFO("Chaining XR_DXR_cocoa_window_binding with NSView %p", cocoaBinding.viewHandle);
-    }
-
-    XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
-    sessionInfo.next = &glBinding;
-    sessionInfo.systemId = app.systemId;
-
-    XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
-    LOG_INFO("Session created%s", app.hasCocoaWindowBinding ? " (with external window)" : "");
-
-    // Enumerate available rendering modes and store names
     app.renderingModeCount = 0;
     if (app.pfnEnumerateDisplayRenderingModesEXT && app.session != XR_NULL_HANDLE) {
         uint32_t modeCount = 0;
@@ -1714,6 +1691,40 @@ static bool CreateSession(AppXrSession &app)
             }
         }
     }
+}
+
+static bool CreateSession(AppXrSession &app)
+{
+    LOG_INFO("Creating OpenXR session with macOS GL binding + cocoa_window_binding...");
+
+    // Get CGL context from our NSOpenGLContext
+    CGLContextObj cglCtx = (CGLContextObj)[g_glContext CGLContextObj];
+
+    XrGraphicsBindingOpenGLMacOSDXR glBinding = {};
+    glBinding.type = XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_DXR;
+    glBinding.cglContext = (void *)cglCtx;
+    glBinding.cglPixelFormat = nullptr;
+
+    // Chain the cocoa window binding — pass our NSView to the runtime
+    XrCocoaWindowBindingCreateInfoDXR cocoaBinding = {};
+    cocoaBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR;
+    cocoaBinding.next = nullptr;
+    cocoaBinding.viewHandle = (__bridge void *)g_glView;
+
+    if (app.hasCocoaWindowBinding) {
+        glBinding.next = &cocoaBinding;
+        LOG_INFO("Chaining XR_DXR_cocoa_window_binding with NSView %p", cocoaBinding.viewHandle);
+    }
+
+    XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
+    sessionInfo.next = &glBinding;
+    sessionInfo.systemId = app.systemId;
+
+    XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
+    LOG_INFO("Session created%s", app.hasCocoaWindowBinding ? " (with external window)" : "");
+
+    // Enumerate available rendering modes (re-read on a live table change)
+    EnumerateRenderingModes(app);
 
     app.sessionState = XR_SESSION_STATE_UNKNOWN;
     app.sessionRunning = false;
@@ -2093,9 +2104,21 @@ static void PollEvents(AppXrSession &app)
         }
         case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
             auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
+            // Re-read the table first (it can change with the mode); the
+            // event's index stays authoritative.
+            EnumerateRenderingModes(app);
             LOG_INFO("Rendering mode changed: %u -> %u",
                 modeEvent->previousModeIndex, modeEvent->currentModeIndex);
             app.currentModeIndex = modeEvent->currentModeIndex;
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR: {
+            // v27: the table changed under an unchanged active index (a live
+            // 3D-mode change, ADR-066 C1). Re-read it and retile (#2852).
+            auto* tableEvent = (XrEventDataRenderingModeTableChangedDXR*)&event;
+            EnumerateRenderingModes(app);
+            app.currentModeIndex = tableEvent->activeModeIndex;
+            LOG_INFO("Rendering mode table changed (active %u)", tableEvent->activeModeIndex);
             break;
         }
         case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {

@@ -888,27 +888,14 @@ static bool GetMetalGraphicsRequirements(AppXrSession &app)
     return true;
 }
 
-static bool CreateSession(AppXrSession &app, MetalRenderer &r)
+//! (Re)read the runtime's rendering-mode table into the renderingMode* arrays
+//! and the active index. Called after xrCreateSession and again on
+//! XrEventDataRenderingModeChangedDXR and XrEventDataRenderingModeTableChangedDXR
+//! (XR_DXR_display_info v27, ADR-066 C1): a live 3D-mode change re-describes
+//! slot 1 (view count, tiles, scale, hardwareDisplay3D) under an unchanged
+//! index, and the frame loop reads its tiling from these arrays (#2852).
+static void EnumerateRenderingModes(AppXrSession &app)
 {
-    XrGraphicsBindingMetalKHR binding = {XR_TYPE_GRAPHICS_BINDING_METAL_KHR};
-    binding.commandQueue = (__bridge void *)r.commandQueue;
-
-    XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
-    sessionInfo.next = &binding;
-    sessionInfo.systemId = app.systemId;
-
-    XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
-    LOG_INFO("OpenXR session created with Metal binding");
-
-    app.sessionState = XR_SESSION_STATE_UNKNOWN;
-    app.sessionRunning = false;
-    app.exitRequested = false;
-
-    // Get rendering mode enumeration function pointer
-    xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesDXR",
-        (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
-
-    // Enumerate rendering modes for tile layout info
     if (app.pfnEnumerateDisplayRenderingModesEXT) {
         uint32_t modeCount = 0;
         XrResult enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, 0, &modeCount, nullptr);
@@ -936,6 +923,30 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
             }
         }
     }
+}
+
+static bool CreateSession(AppXrSession &app, MetalRenderer &r)
+{
+    XrGraphicsBindingMetalKHR binding = {XR_TYPE_GRAPHICS_BINDING_METAL_KHR};
+    binding.commandQueue = (__bridge void *)r.commandQueue;
+
+    XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
+    sessionInfo.next = &binding;
+    sessionInfo.systemId = app.systemId;
+
+    XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
+    LOG_INFO("OpenXR session created with Metal binding");
+
+    app.sessionState = XR_SESSION_STATE_UNKNOWN;
+    app.sessionRunning = false;
+    app.exitRequested = false;
+
+    // Get rendering mode enumeration function pointer
+    xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesDXR",
+        (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
+
+    // Enumerate available rendering modes (re-read on a live table change)
+    EnumerateRenderingModes(app);
 
     return true;
 }
@@ -1106,8 +1117,20 @@ static void PollEvents(AppXrSession &app)
         }
         case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
             auto *rmc = (XrEventDataRenderingModeChangedDXR *)&event;
+            // Re-read the table first (it can change with the mode); the
+            // event's index stays authoritative.
+            EnumerateRenderingModes(app);
             app.currentModeIndex = rmc->currentModeIndex;
             LOG_INFO("Rendering mode changed: %u -> %u", rmc->previousModeIndex, rmc->currentModeIndex);
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR: {
+            // v27: the table changed under an unchanged active index (a live
+            // 3D-mode change, ADR-066 C1). Re-read it and retile (#2852).
+            auto* tableEvent = (XrEventDataRenderingModeTableChangedDXR*)&event;
+            EnumerateRenderingModes(app);
+            app.currentModeIndex = tableEvent->activeModeIndex;
+            LOG_INFO("Rendering mode table changed (active %u)", tableEvent->activeModeIndex);
             break;
         }
         case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
