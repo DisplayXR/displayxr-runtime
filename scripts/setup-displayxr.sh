@@ -15,6 +15,7 @@
 #   ./scripts/setup-displayxr.sh --with browser      # also DisplayXR Browser (opt-in; Windows-only today)
 #   ./scripts/setup-displayxr.sh --with leia-conversion  # also the Leia conversion provider (opt-in; no macOS build)
 #   ./scripts/setup-displayxr.sh --with ultraleap    # also the Ultraleap hands provider (opt-in; no macOS build)
+#   ./scripts/setup-displayxr.sh --with open-tracking  # also the open camera tracking provider (opt-in; uses the camera)
 #   ./scripts/setup-displayxr.sh --with-demos        # also install each demo's prebuilt release
 #   ./scripts/setup-displayxr.sh --with-demo-sources # also clone each demo's source into demos/
 #   ./scripts/setup-displayxr.sh --dry-run           # print plan, install nothing
@@ -48,6 +49,7 @@ WITH_MCP=0
 WITH_BROWSER=0
 WITH_LEIA_CONVERSION=0
 WITH_ULTRALEAP=0
+WITH_OPEN_TRACKING=0
 WITH_DEMOS=0
 WITH_DEMO_SOURCES=0
 DRY_RUN=0
@@ -74,6 +76,11 @@ Usage: $0 [flags]
   --with ultraleap  Also install the Ultraleap hands input provider. It needs
                     the Ultraleap tracking software and a camera. No macOS
                     build, so this warn+skips here.
+  --with open-tracking
+                    Also install the open camera tracking provider: head, eye
+                    and hand tracking from the built-in camera, with open
+                    models. Opt-in because it uses the camera. Warn+skips until
+                    versions.json pins its first release.
   --with-demos      Also install each demo's prebuilt release asset
                     (no build needed — same install path as the runtime).
                     Demos without a release asset for this OS are skipped.
@@ -102,8 +109,9 @@ while [ $# -gt 0 ]; do
                 browser) WITH_BROWSER=1 ;;
                 leia-conversion) WITH_LEIA_CONVERSION=1 ;;
                 ultraleap) WITH_ULTRALEAP=1 ;;
-                "") err "--with requires an argument (one of: mcp, browser, leia-conversion, ultraleap)"; exit 2 ;;
-                *)  err "Unknown --with target: $1 (supported: mcp, browser, leia-conversion, ultraleap)"; exit 2 ;;
+                open-tracking) WITH_OPEN_TRACKING=1 ;;
+                "") err "--with requires an argument (one of: mcp, browser, leia-conversion, ultraleap, open-tracking)"; exit 2 ;;
+                *)  err "Unknown --with target: $1 (supported: mcp, browser, leia-conversion, ultraleap, open-tracking)"; exit 2 ;;
             esac
             ;;
         --with-demos)        WITH_DEMOS=1 ;;
@@ -225,6 +233,7 @@ COMPONENTS=(runtime)
 [ "$WITH_BROWSER" -eq 1 ] && COMPONENTS+=(browser)
 [ "$WITH_LEIA_CONVERSION" -eq 1 ] && COMPONENTS+=(leia_conversion)
 [ "$WITH_ULTRALEAP" -eq 1 ] && COMPONENTS+=(ultraleap)
+[ "$WITH_OPEN_TRACKING" -eq 1 ] && COMPONENTS+=(tracking_open)
 
 install_component() {
     local name="$1"

@@ -140,18 +140,42 @@ COMPONENT_INSTALL_MARKER_MACOS_ultraleap=""
 COMPONENT_INSTALL_MARKER_WINDOWS_ultraleap="HKLM\\Software\\DisplayXR\\Plugins\\Ultraleap"
 COMPONENT_INSTALL_MARKER_LINUX_ultraleap=""
 
+# --- tracking_open ---
+# Open camera tracking provider (displayxr-tracking-open): ONE binary,
+# DisplayXR-OpenTracking.{dll,dylib}, registered in TWO roles: the viewer-
+# tracking provider TrackingProviders\open-tracking and the hands input provider
+# InputProviders\open-tracking-hands (both ProbeOrder 100). Webcam + open models.
+#
+# OPT-IN (`--with open-tracking`), never part of the default install: it opens
+# a camera. NOT RELEASED YET as far as versions.json is concerned: the field
+# `tracking_open` is added by the first release whose versions-bump dispatch
+# reaches the runtime (versions-json-autobump.md, "A component with no release
+# yet"); until then `--with open-tracking` warns and skips. Its v0.1.x releases
+# carry the macOS .pkg only and dispatched no bump; the Windows installer
+# (silent /S, marker HKLM\Software\DisplayXR\Plugins\OpenTracking) comes with
+# the first release that does. No Linux package yet.
+# The macOS marker is the tracking role's manifest the .pkg lays down (its
+# release workflow's payload check names the same path).
+COMPONENT_REPO_tracking_open="DisplayXR/displayxr-tracking-open"
+COMPONENT_PKG_MACOS_tracking_open="DisplayXR-OpenTracking-*.pkg"
+COMPONENT_EXE_WINDOWS_tracking_open="DisplayXROpenTrackingSetup-*.exe"
+COMPONENT_DEB_LINUX_tracking_open=""
+COMPONENT_INSTALL_MARKER_MACOS_tracking_open="/Library/Application Support/DisplayXR/DisplayProcessors/100-open-tracking-tracking-provider.json"
+COMPONENT_INSTALL_MARKER_WINDOWS_tracking_open="HKLM\\Software\\DisplayXR\\Plugins\\OpenTracking"
+COMPONENT_INSTALL_MARKER_LINUX_tracking_open=""
+
 # Opt-in components (`--with <name>`): never installed by default. Space-
 # separated "<flag-name>:<component>" pairs; `setup-displayxr.bat` keeps its
 # own copy. A component whose versions.json pin is absent (not released yet)
 # is warned about and skipped, never an error.
-OPTIN_COMPONENTS="mcp:mcp_tools browser:browser leia-conversion:leia_conversion ultraleap:ultraleap"
+OPTIN_COMPONENTS="mcp:mcp_tools browser:browser leia-conversion:leia_conversion ultraleap:ultraleap open-tracking:tracking_open"
 
 # Components that may legitimately have NO pin in versions.json: they have a
 # repo and all their plumbing, but no release yet. Asking for one is a warning
 # and a skip. Remove a name here once its field is in versions.json, so a
 # missing pin becomes an error again (keep in step with FIRST_RELEASE_FIELDS in
 # scripts/apply_versions_bump.py; scripts/tests/test_component_tables.py checks).
-COMPONENTS_AWAITING_FIRST_RELEASE="ultraleap"
+COMPONENTS_AWAITING_FIRST_RELEASE="ultraleap tracking_open"
 
 # --- mcp_tools ---
 # displayxr-mcp ships a Windows installer (NSIS) and a macOS .pkg

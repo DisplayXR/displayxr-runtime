@@ -473,7 +473,7 @@ installer or by the bundle has none: it shows in `list` and `outdated`, not in
 `list --installed`, and `uninstall` answers 42 for it. The generator emits an `uninstall`
 rule for the Leia plug-in and the browser (`V2_ITEMS` in `scripts/gen_catalog.py`), with the
 values their installers write, below. It emits none for the runtime, and none yet for the
-schema-2-only providers (open conversion, Leia conversion, Ultraleap): a receipt for one of
+schema-2-only providers (open conversion, Leia conversion, Ultraleap, open tracking): a receipt for one of
 those carries no uninstall command, and `uninstall` answers 43 for it.
 
 | Item | `uninstall.path` | `args` |

@@ -90,8 +90,8 @@ gated on `Runtime` succeeding. It:
 repos. Each sibling repo's release workflow ends with a dispatch
 step (snippets below). The handler reads the dispatched `{field,
 tag, source_repo}`, runs the same ABI gate when `field ==
-leia_plugin` (and the matching one for `leia_conversion` and `ultraleap`,
-below), writes the pin with `scripts/apply_versions_bump.py` and commits it.
+leia_plugin` (and the matching one for `leia_conversion`, `ultraleap` and
+`tracking_open`, below), writes the pin with `scripts/apply_versions_bump.py` and commits it.
 
 The handler also supports `workflow_dispatch` so a human can bump
 any field by hand from the Actions tab — useful if a sibling repo's
@@ -441,6 +441,31 @@ on every runtime release. What enforces the pairing is elsewhere: the catalog it
 carries `runtime.min == runtime.max`, and the provider's installer exits 3 on any
 other runtime.
 
+## The `tracking_open` field
+
+The open camera tracking provider, `DisplayXR/displayxr-tracking-open`: **one**
+binary (`DisplayXR-OpenTracking.{dll,dylib}`) registered in **two** roles, the
+viewer-tracking provider `TrackingProviders\open-tracking` and the hands input
+provider `InputProviders\open-tracking-hands`. Its releases v0.1.0 and v0.1.1
+carry the macOS `.pkg` only and dispatched no bump, so `versions.json` has **no
+`tracking_open` field yet**: the first release that dispatches one adds it (it is
+in `FIRST_RELEASE_FIELDS`, next to `conversion_open`).
+
+| | |
+|---|---|
+| Orchestrator | opt-in, `--with open-tracking`: it opens a camera, so it is never part of a default install. macOS installs the `.pkg`; Windows the NSIS installer (`/S`, marker `HKLM\Software\DisplayXR\Plugins\OpenTracking`); no Linux package yet |
+| Catalog | schema 2 only: item `open-tracking`, class `tracking_provider`, with `also_provides` naming the input role |
+| Bump gate | **both** ABI majors it negotiates, viewer tracking (`xrt_tracking_plugin.h`) and input (`xrt_input_plugin.h`), read from the provider's **vendored** `include/xrt/` at the released tag, not from its `DXR_RUNTIME_GIT_TAG`: the repository compiles against that generated copy, so the copy is what the binary negotiates, and the CMake literal is metadata (`COMPONENT_VENDORED_HEADERS` in `check_plugin_abi.py`). Either major differing fails the run red, as for the other providers |
+| Downstream pin | `downstream-pins.json` `layout` track (its hands role fills raw `struct xrt_device`, ADR-063) |
+
+The release workflow dispatches the same payload as every provider
+(`{"field": "tracking_open", "tag": "<tag>", "source_repo":
+"DisplayXR/displayxr-tracking-open"}`, event type `versions-bump`, token minted from
+the org's publish-bot App secrets `DISPLAYXR_APP_ID` / `DISPLAYXR_APP_PRIVATE_KEY`
+for `displayxr-runtime`), gated on the repository variable `DXR_VERSIONS_BUMP ==
+'true'` as the Ultraleap provider's is, so a release made before the hub knows the
+field dispatches nothing.
+
 ### A component with no release yet
 
 A pin must name a tag that exists. Three consumers break on one that does not:
@@ -477,9 +502,11 @@ After the first release, delete the name from `FIRST_RELEASE_FIELDS` and from bo
 That second failure is on `main` and on every PR from the moment the bump lands,
 so the cleanup is the next change after a first release, not a later one.
 
-`ultraleap` is the one component in this state today. `leia_conversion` was, until
-its first release (v0.1.0) added the field; it is `ultraleap`'s preferred neighbour
-in `FIRST_RELEASE_FIELDS`, so the two provider pins sit together.
+`ultraleap` and `tracking_open` are the components in this state today.
+`leia_conversion` was, until its first release (v0.1.0) added the field; it is
+`ultraleap`'s preferred neighbour in `FIRST_RELEASE_FIELDS`, so the two provider pins
+sit together, and `tracking_open` goes after `conversion_open`, the other open
+provider.
 
 The mirror to `displayxr-installer` needs nothing special: the bump's own mirror
 step copies the file byte for byte, new key included.
@@ -598,9 +625,9 @@ known-good matrix that's been continuously curated by this flow.
 | ABI mismatch on runtime self-bump | Bump skipped, issue opened on leia repo | Rebuild leia + tag, *then* re-run `workflow_dispatch` on `versions-bump.yml` with `field=runtime, tag=<this runtime tag>` |
 | ABI gate could not run (rc 2: network after retries, missing tag/file, unparsable header) | Job fails red with `::error::`; no bump, no issue | Fix the cause, then re-run the failed job (runtime self-bump) or the `versions-bump.yml` run (leia bump) |
 | A `versions.json` field is edited by hand and merged as an ordinary PR | `versions-mirror.yml` mirrors it to `displayxr-installer` within ~1 min of the merge | None needed. Before that workflow existed this silently blocked every bundle release (`assert-versions-in-sync`) until the next component bump |
-| First release of `ultraleap` (as `leia_conversion`'s was): the field is not in `versions.json` | The bump **adds** it (`ADDED` in the log) and mirrors it | Before that release, list the field in `displayxr-installer`'s `$IntentionallyUnbundled`; after it, drop the name from `FIRST_RELEASE_FIELDS` and `COMPONENTS_AWAITING_FIRST_RELEASE` |
+| First release of `ultraleap` or `tracking_open` (as `leia_conversion`'s was): the field is not in `versions.json` | The bump **adds** it (`ADDED` in the log) and mirrors it | Before that release, list the field in `displayxr-installer`'s `$IntentionallyUnbundled`; after it, drop the name from `FIRST_RELEASE_FIELDS` and `COMPONENTS_AWAITING_FIRST_RELEASE` |
 | Any other field that is not in `versions.json` is dispatched | Run fails: `versions.json has no field '<field>'` | Add the field in a PR (with its `components.sh` rows), or fix the sender's payload |
-| ABI mismatch on a `leia_conversion` / `ultraleap` bump | Run fails red; no bump, no issue | Rebuild the provider against the current runtime headers, tag a new release |
+| ABI mismatch on a `leia_conversion` / `ultraleap` / `tracking_open` bump (for `tracking_open`, either of its two ABIs) | Run fails red; no bump, no issue | Rebuild the provider against the current runtime headers, tag a new release |
 | Sibling repo forgets the dispatch step | `versions.json` doesn't update | Manual `workflow_dispatch` on `versions-bump.yml` with the field + tag, then fix the sibling repo's release workflow |
 | `displayxr-publish-bot` token expires | All bumps fail with auth error | Rotate the GitHub App's private key per `.secrets/NOTE.md` |
 | Bundle build fails downloading a component asset (`gh release download … exit 1`) | `components.sh` declares a platform glob the pinned release doesn't carry (see "Asset-table timing" above) | Cut a component release whose CI produces the asset (`/dxr-release <component> <ver>`); the auto-bump re-pins, the bundle finds it. Or, as a stopgap, blank the glob in `components.sh` to restore warn-and-skip. |

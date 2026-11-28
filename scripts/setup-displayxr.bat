@@ -16,6 +16,7 @@ REM   scripts\setup-displayxr.bat --with mcp           :: also DisplayXR MCP Too
 REM   scripts\setup-displayxr.bat --with browser       :: also DisplayXR Browser (opt-in)
 REM   scripts\setup-displayxr.bat --with leia-conversion :: also the Leia conversion provider (opt-in)
 REM   scripts\setup-displayxr.bat --with ultraleap     :: also the Ultraleap hands provider (opt-in)
+REM   scripts\setup-displayxr.bat --with open-tracking :: also the open camera tracking provider (opt-in)
 REM   scripts\setup-displayxr.bat --with-demos         :: also install each demo's prebuilt release
 REM   scripts\setup-displayxr.bat --with-demo-sources  :: also clone each demo's source into demos\
 REM   scripts\setup-displayxr.bat --dry-run            :: print plan, install nothing
@@ -71,9 +72,19 @@ set "COMPONENT_REPO_ultraleap=DisplayXR/displayxr-ultraleap"
 set "COMPONENT_EXE_ultraleap=DisplayXRUltraleapSetup-*.exe"
 set "COMPONENT_MARKER_ultraleap=HKLM\Software\DisplayXR\Plugins\Ultraleap"
 
+REM Open camera tracking provider: one DLL registered as the viewer-tracking provider
+REM TrackingProviders\open-tracking and the hands input provider
+REM InputProviders\open-tracking-hands. Opt-in only (--with open-tracking): it opens a
+REM camera. NOT RELEASED YET for versions.json: the tracking_open field is added by the
+REM first release that dispatches a bump (its first Windows installer); until then the
+REM flag warns and skips.
+set "COMPONENT_REPO_tracking_open=DisplayXR/displayxr-tracking-open"
+set "COMPONENT_EXE_tracking_open=DisplayXROpenTrackingSetup-*.exe"
+set "COMPONENT_MARKER_tracking_open=HKLM\Software\DisplayXR\Plugins\OpenTracking"
+
 REM Components that may have NO pin in versions.json yet (no release). Mirrors
 REM COMPONENTS_AWAITING_FIRST_RELEASE in scripts\lib\components.sh; keep in sync.
-set "COMPONENTS_AWAITING_FIRST_RELEASE=ultraleap"
+set "COMPONENTS_AWAITING_FIRST_RELEASE=ultraleap tracking_open"
 
 set "COMPONENT_REPO_mcp_tools=DisplayXR/displayxr-mcp"
 set "COMPONENT_EXE_mcp_tools=DisplayXRMCPSetup-*.exe"
@@ -125,6 +136,7 @@ set "WITH_MCP=0"
 set "WITH_BROWSER=0"
 set "WITH_LEIA_CONVERSION=0"
 set "WITH_ULTRALEAP=0"
+set "WITH_OPEN_TRACKING=0"
 set "WITH_DEMOS=0"
 set "WITH_DEMO_SOURCES=0"
 set "DRY_RUN=0"
@@ -147,12 +159,13 @@ exit /b 2
 
 :arg_with
 shift
-if "%~1"=="" echo ERROR: --with requires an argument (one of: mcp, browser, leia-conversion, ultraleap) 1>&2 & exit /b 2
+if "%~1"=="" echo ERROR: --with requires an argument (one of: mcp, browser, leia-conversion, ultraleap, open-tracking) 1>&2 & exit /b 2
 if /i "%~1"=="mcp" set "WITH_MCP=1" & shift & goto :argloop
 if /i "%~1"=="browser" set "WITH_BROWSER=1" & shift & goto :argloop
 if /i "%~1"=="leia-conversion" set "WITH_LEIA_CONVERSION=1" & shift & goto :argloop
 if /i "%~1"=="ultraleap" set "WITH_ULTRALEAP=1" & shift & goto :argloop
-echo ERROR: Unknown --with target: %~1 (supported: mcp, browser, leia-conversion, ultraleap) 1>&2
+if /i "%~1"=="open-tracking" set "WITH_OPEN_TRACKING=1" & shift & goto :argloop
+echo ERROR: Unknown --with target: %~1 (supported: mcp, browser, leia-conversion, ultraleap, open-tracking) 1>&2
 exit /b 2
 
 :argdone
@@ -206,9 +219,10 @@ call :read_pin conversion_open CONVOPEN_TAG
 call :read_pin mcp_tools MCP_TAG
 call :read_pin browser BROWSER_TAG
 call :read_pin leia_conversion LEIACONV_TAG
-REM Not released yet: an absent pin is expected, so this one is read only when
+REM Not released yet: an absent pin is expected, so these are read only when
 REM asked for, and :read_pin_optional never raises the exit code.
 if "%WITH_ULTRALEAP%"=="1" call :read_pin_optional ultraleap ULTRALEAP_TAG
+if "%WITH_OPEN_TRACKING%"=="1" call :read_pin_optional tracking_open OPENTRACKING_TAG
 
 REM --- Staging dir ---
 set "STAGING=%TEMP%\dxr-setup-%RANDOM%%RANDOM%"
@@ -223,6 +237,7 @@ if "%WITH_MCP%"=="1" call :install_component mcp_tools "%MCP_TAG%"
 if "%WITH_BROWSER%"=="1" call :install_component browser "%BROWSER_TAG%"
 if "%WITH_LEIA_CONVERSION%"=="1" call :install_component leia_conversion "%LEIACONV_TAG%"
 if "%WITH_ULTRALEAP%"=="1" call :install_component ultraleap "%ULTRALEAP_TAG%"
+if "%WITH_OPEN_TRACKING%"=="1" call :install_component tracking_open "%OPENTRACKING_TAG%"
 
 REM --- --with-demos: install each demo's prebuilt release asset ---
 REM After the core components so demo installers that require the runtime
@@ -284,6 +299,10 @@ echo                     Also install the Leia 2D-to-3D conversion provider.
 echo                     ^(Opt-in. Needs the Leia conversion runtime, installed separately.^)
 echo   --with ultraleap  Also install the Ultraleap hands input provider.
 echo                     ^(Opt-in. Needs the Ultraleap tracking software.^)
+echo   --with open-tracking
+echo                     Also install the open camera tracking provider: head,
+echo                     eye and hand tracking from a webcam, with open models.
+echo                     ^(Opt-in: it uses the camera.^)
 echo   --with-demos      Also install each demo's prebuilt release installer
 echo                     ^(no build needed; demos with no Windows asset skip^).
 echo   --with-demo-sources
@@ -303,7 +322,7 @@ echo write to HKLM and Program Files.
 exit /b 0
 
 :usage
-echo Usage: scripts\setup-displayxr.bat [--with mcp^|browser^|leia-conversion^|ultraleap] [--with-demos] [--with-demo-sources] [--dry-run] [--uninstall] [-h^|--help]
+echo Usage: scripts\setup-displayxr.bat [--with mcp^|browser^|leia-conversion^|ultraleap^|open-tracking] [--with-demos] [--with-demo-sources] [--dry-run] [--uninstall] [-h^|--help]
 exit /b 0
 
 REM Read a pinned tag from versions.json into the named env var.
@@ -349,7 +368,7 @@ call set "_IC_MARKER=%%COMPONENT_MARKER_%_IC_NAME%%%"
 
 if "%_IC_TAG%"=="" (
     echo WARN: skipping %_IC_NAME% — no pin in versions.json 1>&2
-    echo       ^(ultraleap has none until its first release.^) 1>&2
+    echo       ^(ultraleap and tracking_open have none until their first release.^) 1>&2
     exit /b 0
 )
 

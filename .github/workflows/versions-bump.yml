@@ -6,7 +6,7 @@ name: Bump versions.json
 #
 #   {
 #     "field":       "shell" | "leia_plugin" | "conversion_open" | "leia_conversion" |
-#                    "ultraleap" | "mcp_tools" | "browser" | "<name>_demo",
+#                    "ultraleap" | "tracking_open" | "mcp_tools" | "browser" | "<name>_demo",
 #     "tag":         "v1.2.3"   (the browser field also still accepts the
 #                                retiring "preview-0.1.16" shape)
 #     "source_repo": "DisplayXR/displayxr-<repo>"
@@ -17,13 +17,15 @@ name: Bump versions.json
 #   2. For leia_plugin only: runs scripts/check_plugin_abi.py first. If
 #      the sibling's ABI doesn't match the runtime's, the bump is skipped
 #      and a tracking issue is opened in displayxr-leia-plugin asking for
-#      a rebuild. For leia_conversion and ultraleap: the same check against
-#      the ABI those providers negotiate (conversion / input); a mismatch
-#      fails this run red and bumps nothing. Other fields skip the ABI gate.
+#      a rebuild. For leia_conversion, ultraleap and tracking_open: the same
+#      check against the ABI(s) those providers negotiate (conversion / input /
+#      viewer-tracking AND input, the last read from the provider's vendored
+#      headers at the tag); a mismatch fails this run red and bumps nothing.
+#      Other fields skip the ABI gate.
 #   3. Writes the new tag into versions.json (scripts/apply_versions_bump.py).
 #      A field that is not in the file is refused, except a component that
-#      has no release yet (FIRST_RELEASE_FIELDS in that script; ultraleap
-#      today): its first release's dispatch ADDS the field. See versions-json-autobump.md,
+#      has no release yet (FIRST_RELEASE_FIELDS in that script; ultraleap and
+#      tracking_open today): its first release's dispatch ADDS the field. See versions-json-autobump.md,
 #      "A component with no release yet".
 #   4. Direct-commits to main via the displayxr-publish-bot GitHub App.
 #
@@ -195,15 +197,16 @@ jobs:
           exit 0
 
       # Providers that ship from their own repo and negotiate a plug-in ABI other
-      # than the display one (ADR-053 conversion, ADR-034 input). Same question
+      # than the display one (ADR-053 conversion, ADR-034 input, ADR-054 N6
+      # viewer tracking; tracking_open negotiates two and both must match). Same question
       # as the leia_plugin gate, asked of that ABI. Any non-zero result fails
       # this run and bumps nothing: rc 1 is a real mismatch (the loader would
       # reject the provider), rc 2 means the check could not run. No issue is
       # opened: the publish bot's token is not scoped to these repos, and
       # widening it to a repo the App is not installed on would break every bump.
-      - name: ABI assertion (leia_conversion, ultraleap)
+      - name: ABI assertion (leia_conversion, ultraleap, tracking_open)
         id: provider_abi
-        if: steps.inputs.outputs.field == 'leia_conversion' || steps.inputs.outputs.field == 'ultraleap'
+        if: steps.inputs.outputs.field == 'leia_conversion' || steps.inputs.outputs.field == 'ultraleap' || steps.inputs.outputs.field == 'tracking_open'
         env:
           FIELD: ${{ steps.inputs.outputs.field }}
           TAG:   ${{ steps.inputs.outputs.tag }}

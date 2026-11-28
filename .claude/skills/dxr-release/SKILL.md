@@ -34,7 +34,7 @@ Spec: [`docs/specs/runtime/versions-json-autobump.md`](../../docs/specs/runtime/
 ```
 /dxr-release <component> <version-spec>
 
-  <component>     shell | leia-plugin (leia) | leia-conversion | open-conversion | ultraleap | mcp | browser | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview) | unity
+  <component>     shell | leia-plugin (leia) | leia-conversion | open-conversion | ultraleap | open-tracking | mcp | browser | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview) | unity
   <version-spec>  vX.Y.Z  |  patch  |  minor  |  major        (browser too, from v1.0.0 — see "Browser is special")
 ```
 
@@ -62,6 +62,7 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 | `leia-conversion` | `DisplayXR/displayxr-leia-conversion` | `leia_conversion` | `release.yml` | same repo |
 | `open-conversion` | `DisplayXR/displayxr-conversion-open` | `conversion_open` | `release.yml` | same repo |
 | `ultraleap` | `DisplayXR/displayxr-ultraleap` | `ultraleap` | `release.yml` | same repo |
+| `open-tracking` | `DisplayXR/displayxr-tracking-open` | `tracking_open` | `release.yml` | same repo |
 | `mcp` | `DisplayXR/displayxr-mcp` | `mcp_tools` | `build.yml` | same repo |
 | `gauss` / `demo-gaussiansplat` | `DisplayXR/displayxr-demo-gaussiansplat` | `gauss_demo` | `build-windows.yml` | same repo |
 | `modelviewer` / `demo-modelviewer` | `DisplayXR/displayxr-demo-modelviewer` | `modelviewer_demo` | `build-windows.yml` | same repo |
@@ -72,9 +73,11 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 
 **`leia-conversion` has been released** (v0.1.0, 2026-11-23): `leia_conversion` is an
 ordinary pinned field and Phase 4 reports `BUMPED` for it. **`ultraleap` has no release
-yet.** The first two points below apply to `ultraleap` until it has one; the third holds
-for both providers on every release:
-- **`versions.json` has no `ultraleap` field.** That is deliberate: a pin naming a tag that
+yet, and neither has `open-tracking` as far as `versions.json` is concerned** (its v0.1.x
+releases carry only the macOS `.pkg` and dispatched no bump). The first two points below
+apply to each of them until its first dispatching release; the third holds for every
+provider on every release:
+- **`versions.json` has no `ultraleap` / `tracking_open` field.** That is deliberate: a pin naming a tag that
   does not exist breaks `setup-displayxr` and `displayxr-installer`'s coverage check. The
   first release's `versions-bump` dispatch **adds** the field
   (`scripts/apply_versions_bump.py`, `FIRST_RELEASE_FIELDS`), so Phase 4 reports `ADDED`,
@@ -87,8 +90,9 @@ for both providers on every release:
   `$IntentionallyUnbundled` (`scripts/check_bundle_coverage.ps1`). Otherwise the mirrored
   `versions.json` fails that repo's `build-bundle.yml` on the new key.
 - **The bump is ABI-gated, and a mismatch is a red run with no issue opened**: the
-  conversion ABI for `leia-conversion`, the input ABI for `ultraleap`
-  (`check_plugin_abi.py --component`). For `ultraleap` the run also warns when the
+  conversion ABI for `leia-conversion`, the input ABI for `ultraleap`, and BOTH the
+  viewer-tracking and the input ABI for `open-tracking` (one binary, two registered roles;
+  read from its vendored `include/xrt/` at the tag) (`check_plugin_abi.py --component`). For `ultraleap` the run also warns when the
   provider's runtime pin is not the runtime `versions.json` pins: that build installs only
   on the runtime it was built at (ADR-063).
 
@@ -97,6 +101,14 @@ the dispatch on the repository variable `DXR_VERSIONS_BUMP=true`. `ultraleap` is
 to the signing provider yet, so Phase 3.5 has nothing to dispatch for it (`INST=""`): an
 unsigned provider release is **not listed in the component catalog** (every listed asset
 is signed), so teach the signing provider the component before expecting it there.
+`open-tracking` (one DLL registered as `TrackingProviders\open-tracking` and
+`InputProviders\open-tracking-hands`; opt-in because it opens a camera) gates its dispatch
+on the repository variable `DXR_VERSIONS_BUMP=true` like `ultraleap`; leave the variable
+unset on `displayxr-tracking-open` until this hub knows the `tracking_open` field. Its
+macOS `.pkg` is signed and notarized by its own `release.yml`; its Windows installer is
+not known to the signing provider yet, so Phase 3.5 has nothing to dispatch for it
+(`INST=""`) and the unsigned `.exe` is not listed in the component catalog until the
+provider learns an `open-tracking` recipe (then add it to the Step 3.5.2 / 3.5.3 maps).
 `leia-conversion` is signed through Phase 3.5 like any installer component once the signing
 provider's `leia-conversion` recipe is merged; a provider without it returns no
 `DisplayXRLeiaConversionSetup-<version>.exe` and the release ships unsigned.
@@ -275,6 +287,7 @@ case "$COMPONENT" in
   leia-conversion)               REPO=DisplayXR/displayxr-leia-conversion;    FIELD=leia_conversion; WORKFLOW=release.yml;             REL_REPO=DisplayXR/displayxr-leia-conversion ;;
   open-conversion)               REPO=DisplayXR/displayxr-conversion-open;    FIELD=conversion_open; WORKFLOW=release.yml;             REL_REPO=DisplayXR/displayxr-conversion-open ;;
   ultraleap)                     REPO=DisplayXR/displayxr-ultraleap;          FIELD=ultraleap;   WORKFLOW=release.yml;                 REL_REPO=DisplayXR/displayxr-ultraleap ;;
+  open-tracking)                 REPO=DisplayXR/displayxr-tracking-open;      FIELD=tracking_open; WORKFLOW=release.yml;               REL_REPO=DisplayXR/displayxr-tracking-open ;;
   mcp)                           REPO=DisplayXR/displayxr-mcp;                FIELD=mcp_tools;   WORKFLOW=build.yml;                   REL_REPO=DisplayXR/displayxr-mcp ;;
   gauss|demo-gaussiansplat)      REPO=DisplayXR/displayxr-demo-gaussiansplat; FIELD=gauss_demo; WORKFLOW=build-windows.yml;           REL_REPO=DisplayXR/displayxr-demo-gaussiansplat ;;
   modelviewer|demo-modelviewer)  REPO=DisplayXR/displayxr-demo-modelviewer;   FIELD=modelviewer_demo; WORKFLOW=build-windows.yml;      REL_REPO=DisplayXR/displayxr-demo-modelviewer ;;
@@ -284,7 +297,7 @@ case "$COMPONENT" in
   unity)                         REPO=DisplayXR/displayxr-unity;              FIELD="";               WORKFLOW=build-native.yml;      REL_REPO=DisplayXR/displayxr-unity ;;
   runtime)                       echo "Use /release (in-repo) for the runtime."; exit 1 ;;
   installer)                     echo "Use /installer-release for the bundle.";  exit 1 ;;
-  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, leia-conversion, open-conversion, ultraleap, mcp, browser, gauss, modelviewer, mediaplayer, avatar, earthview, unity."; exit 1 ;;
+  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, leia-conversion, open-conversion, ultraleap, open-tracking, mcp, browser, gauss, modelviewer, mediaplayer, avatar, earthview, unity."; exit 1 ;;
 esac
 # FIELD="" (unity) → no versions.json entry; skip the Phase 4 versions-bump watch.
 # Tag shape is `vX.Y.Z` for EVERY component, browser included (browser-pvt#120 retired

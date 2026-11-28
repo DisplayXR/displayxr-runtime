@@ -239,7 +239,7 @@ every component class, on several platforms.
 | `aliases` | no | other names a client accepts for this item. The first-party items carry their schema-1 component name here (`leia-sr` ← `leia_plugin`), so `ensure-for leia_plugin` keeps resolving |
 | `class` | yes | `runtime`, `display_processor`, `input_provider`, `conversion_provider`, `tracking_provider`, `workspace_controller`, `companion`, `model_builder`, `app`, `sdk`. A client skips an item whose class it does not know. `model_builder` (conversion-provider-discovery.md §5.6.6) is the signed tool `conv models fetch` runs to build a research-only model on the user's machine; it registers under `ModelBuilders\<id>` and is always a `research` item |
 | `registered_id` | for the seven registered classes | the id the component registers under in its class root (`DisplayProcessors\<id>`, `InputProviders\<id>`, `ConversionProviders\<id>`, `TrackingProviders\<id>`, `WorkspaceControllers\<id>`, `ModelBuilders\<id>`; POSIX: the manifest `id`). It is what `displayxr-cli <class> list` shows, and how a client joins a catalog item to an installed component |
-| `also_provides` | no | `[{ "class", "registered_id" }]` for a plug-in that carries components of more than one class (ADR-054 §5) |
+| `also_provides` | no | `[{ "class", "registered_id" }]` for a plug-in that carries components of more than one class (ADR-054 §5): the item's other registered roles, installed and removed by the same asset. Each is a registered class with an id; the item's own (`class`, `registered_id`) is not repeated and no role is listed twice (`validate_v2`). A client joins an installed component to the item by any of its roles. First use: the open tracking provider (`open-tracking` + `open-tracking-hands`) |
 | `name` | yes | display name |
 | `summary` | no | one line, plain text, at most 200 characters |
 | `publisher` | yes | a key of `publishers` |
@@ -738,6 +738,7 @@ only when its Authenticode signature is valid with a listed signer.
 | `conversion_open` | `open-conversion` | `conversion_provider` | `recommended: true`, the converter a setup UI pre-ticks (ADR-064 §7) | no floor is declared by that repository, so none is written |
 | `leia_conversion` | `leia-conversion` | `conversion_provider` | an external prerequisite (the NeurD runtime), declared and detected only | floor = `DXR_CONV_MIN_RUNTIME_VERSION` in its `CMakeLists.txt` at the released tag |
 | `ultraleap` | `ultraleap` | `input_provider` | an **exact** runtime range and an external prerequisite (the Ultraleap tracking software) | `runtime.min == runtime.max` = `DXR_RUNTIME_GIT_TAG` in its `CMakeLists.txt` at the released tag |
+| `tracking_open` | `open-tracking` | `tracking_provider`, `also_provides` `input_provider` `open-tracking-hands` | one asset, two registered roles. Not `recommended` and no `detect`: it opens a camera, so the user picks it | floor = `DXR_TRACKING_MIN_RUNTIME_VERSION` in its `CMakeLists.txt` at the released tag; **no** `runtime.max` (below) |
 | `shell` | `displayxr-shell` | `workspace_controller` | nothing schema 1 lacks words for; it was simply never one of the three frozen names. Not `recommended` and no `detect`: a setup UI lists it **unticked** and `install --default` never installs it | floor = `MIN_RUNTIME_VERSION` in its installer at the released tag, located through `downstream-pins.json` `consumer_floors` (`declared_floor`), the literal the drift audit checks |
 
 Rules that follow from "never guessed":
@@ -762,6 +763,13 @@ Rules that follow from "never guessed":
   (versions-json-autobump.md, "A component with no release yet").
 - If the Ultraleap provider's runtime pin cannot be read at its tag, the item is **not
   listed at all**: without the range it would read as "works on any runtime".
+- The open tracking provider's hands role also fills raw `struct xrt_device` (ADR-063), but
+  its item carries a **floor only**: `runtime.max` is for a known break, and "a header the
+  hands role shares changed" is detected on the runtime side by its `downstream-pins.json`
+  `layout` track, which opens a repin PR (a rebuild request) instead of predicting a break.
+  Until a release sets `DXR_TRACKING_MIN_RUNTIME_VERSION` the item is listed with **no** floor
+  (warned; its v0.1.x releases do not set it). It is one item, not two, because one installer
+  lays down and removes both registrations: two items would each claim the other's files.
 - The NeurD prerequisite carries no `info_url` and no installer `asset`: no public download
   of NeurD exists yet. When a public signed build exists the entry gains an asset.
 - Its floor and its one detect rule are the **Windows** facts: 0.4.6 (the provider's

@@ -28,11 +28,15 @@ Usage:
     check_plugin_abi.py --leia-tag v1.0.7 --runtime-tag v2.70.0
     check_plugin_abi.py --component leia_conversion --tag v0.1.0
     check_plugin_abi.py --component ultraleap --tag v0.1.0
+    check_plugin_abi.py --component tracking_open --tag v0.2.0
 
 `--component` runs the same check for a provider that ships from its own repo
 and is gated on another plug-in ABI (COMPONENT_GATES: the conversion ABI for
-the Leia conversion provider, the input ABI for the Ultraleap provider). It
-also prints `runtime_pin=vX.Y.Z`, the runtime tag that release was built at.
+the Leia conversion provider, the input ABI for the Ultraleap provider, and
+BOTH the viewer-tracking and the input ABI for the open tracking provider,
+whose one binary registers in both classes). It also prints
+`runtime_pin=vX.Y.Z`, the runtime tag that release was built at, when the
+release names one.
 
 Designed to be called from .github/workflows/versions-bump.yml and from
 build-windows.yml's runtime self-bump step. No external deps beyond
@@ -55,17 +59,20 @@ LEIA_REPO = "DisplayXR/displayxr-leia-plugin"
 PLUGIN_HEADER_PATH = "src/xrt/include/xrt/xrt_plugin.h"
 INPUT_PLUGIN_HEADER_PATH = "src/xrt/include/xrt/xrt_input_plugin.h"
 CONVERSION_PLUGIN_HEADER_PATH = "src/xrt/include/xrt/xrt_conversion_plugin.h"
+TRACKING_PLUGIN_HEADER_PATH = "src/xrt/include/xrt/xrt_tracking_plugin.h"
 
 # Every plug-in ABI the runtime exposes: header -> the macro family whose
-# `<PREFIX>_CURRENT` is that ABI's major. Three independent majors, one per
+# `<PREFIX>_CURRENT` is that ABI's major. Four independent majors, one per
 # plug-in type (display processor ADR-019, input provider ADR-034, conversion
-# provider ADR-053); a loader rejects a different major before any dispatch.
+# provider ADR-053, viewer-tracking provider ADR-054 N6); a loader rejects a
+# different major before any dispatch.
 # One table so the release gate (this script) and the downstream repin gate
 # (downstream_pin_bump.py) read the same macros and can never disagree.
 ABI_HEADERS: dict[str, str] = {
     PLUGIN_HEADER_PATH: "XRT_PLUGIN_API_VERSION",
     INPUT_PLUGIN_HEADER_PATH: "XRT_INPUT_PLUGIN_API_VERSION",
     CONVERSION_PLUGIN_HEADER_PATH: "XRT_CONVERSION_PLUGIN_API_VERSION",
+    TRACKING_PLUGIN_HEADER_PATH: "XRT_TRACKING_PLUGIN_API_VERSION",
 }
 
 
@@ -154,12 +161,27 @@ def tree_abis(tree_root: Path) -> dict[str, int | None]:
     return out
 
 
-# Providers gated by `--component`: versions.json field -> (repo, the ABI header
-# whose major the provider negotiates). Each pins the runtime it was built at
-# with the same `set(DXR_RUNTIME_GIT_TAG "vX.Y.Z"` literal as the Leia plug-in.
-COMPONENT_GATES: dict[str, tuple[str, str]] = {
-    "leia_conversion": ("DisplayXR/displayxr-leia-conversion", CONVERSION_PLUGIN_HEADER_PATH),
-    "ultraleap": ("DisplayXR/displayxr-ultraleap", INPUT_PLUGIN_HEADER_PATH),
+# Providers gated by `--component`: versions.json field -> (repo, the ABI
+# headers whose majors the provider negotiates; every one must match). Each pins
+# the runtime it was built at with the same `set(DXR_RUNTIME_GIT_TAG "vX.Y.Z"`
+# literal as the Leia plug-in.
+COMPONENT_GATES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "leia_conversion": ("DisplayXR/displayxr-leia-conversion", (CONVERSION_PLUGIN_HEADER_PATH,)),
+    "ultraleap": ("DisplayXR/displayxr-ultraleap", (INPUT_PLUGIN_HEADER_PATH,)),
+    # One binary, two registered roles: TrackingProviders\open-tracking and
+    # InputProviders\open-tracking-hands. Both loaders gate it, so both ABIs do.
+    "tracking_open": ("DisplayXR/displayxr-tracking-open",
+                      (TRACKING_PLUGIN_HEADER_PATH, INPUT_PLUGIN_HEADER_PATH)),
+}
+
+# Providers that do not fetch the runtime at DXR_RUNTIME_GIT_TAG but compile
+# against a VENDORED copy of its headers (generated, vendor-neutral, committed):
+# field -> the directory in the provider's repo holding them. Their ABI majors
+# are read from that copy at the released tag, which is exactly what the binary
+# negotiates; their DXR_RUNTIME_GIT_TAG is metadata (and may be a `git describe`
+# string, not a release tag), so it is reported when it parses and never needed.
+COMPONENT_VENDORED_HEADERS: dict[str, str] = {
+    "tracking_open": "include/xrt",
 }
 
 
@@ -209,35 +231,63 @@ def abi_from_tag(runtime_tag: str, header: str) -> int:
     return _resolve_api_version_current(_fetch(url), ABI_HEADERS[header])
 
 
+def vendored_abi_from_tag(repo: str, tag: str, vendored_dir: str, header: str) -> int:
+    """The ABI major in a provider's vendored copy of `header` at its release tag."""
+    url = f"{GITHUB_RAW}/{repo}/{tag}/{vendored_dir}/{Path(header).name}"
+    return _resolve_api_version_current(_fetch(url), ABI_HEADERS[header])
+
+
 def check_component(component: str, tag: str, runtime_tree: str, runtime_tag: str | None) -> int:
-    """The --leia-tag check for a COMPONENT_GATES provider. Same exit codes."""
-    repo, header = COMPONENT_GATES[component]
-    macro = ABI_HEADERS[header] + "_CURRENT"
+    """The --leia-tag check for a COMPONENT_GATES provider. Same exit codes.
+    A provider with several ABIs passes only if every one matches."""
+    repo, headers = COMPONENT_GATES[component]
+    vendored = COMPONENT_VENDORED_HEADERS.get(component)
+    rows = []  # (macro, runtime_abi, plugin_abi)
     try:
         if runtime_tag:
-            runtime_abi = abi_from_tag(runtime_tag, header)
             runtime_label = f"runtime {runtime_tag}"
         else:
-            runtime_abi = abi_from_tree(Path(runtime_tree), header)
             runtime_label = f"runtime tree @ {runtime_tree}"
-        pin = component_runtime_pin(repo, tag)
-        plugin_abi = abi_from_tag(pin, header)
+        pin = None
+        if vendored:
+            try:
+                pin = component_runtime_pin(repo, tag)
+            except RuntimeError:
+                pin = None  # metadata only for a vendored-header provider
+        else:
+            pin = component_runtime_pin(repo, tag)
+        for header in headers:
+            macro = ABI_HEADERS[header] + "_CURRENT"
+            if runtime_tag:
+                runtime_abi = abi_from_tag(runtime_tag, header)
+            else:
+                runtime_abi = abi_from_tree(Path(runtime_tree), header)
+            if vendored:
+                plugin_abi = vendored_abi_from_tag(repo, tag, vendored, header)
+            else:
+                plugin_abi = abi_from_tag(pin, header)
+            rows.append((macro, runtime_abi, plugin_abi))
     except Exception as e:  # noqa: BLE001 - surface to caller as fatal
         print(f"ABI check FAILED to run: {e}", file=sys.stderr)
         return 2
 
-    print(f"{runtime_label}: {macro} = {runtime_abi}")
-    print(f"{component} {tag} ({repo}) built against runtime {pin}: {macro} = {plugin_abi}")
-    print(f"runtime_pin={pin}")
-    if runtime_abi != plugin_abi:
+    source = (f"vendored headers {vendored}/ at {tag}" if vendored else f"built against runtime {pin}")
+    for macro, runtime_abi, plugin_abi in rows:
+        print(f"{runtime_label}: {macro} = {runtime_abi}")
+        print(f"{component} {tag} ({repo}) {source}: {macro} = {plugin_abi}")
+    if pin:
+        print(f"runtime_pin={pin}")
+    bad = [(m, r, p) for m, r, p in rows if r != p]
+    for macro, runtime_abi, plugin_abi in bad:
         print(
             f"\nMISMATCH: the runtime's {macro} is {runtime_abi}; {component} {tag} negotiates "
             f"{plugin_abi} and would be rejected at load. Rebuild {repo} against the current "
             f"runtime headers and tag a new release.",
             file=sys.stderr,
         )
+    if bad:
         return 1
-    print(f"\nOK: {macro} = {runtime_abi} on both sides.")
+    print("\nOK: " + ", ".join(f"{m} = {r}" for m, r, _ in rows) + " on both sides.")
     return 0
 
 

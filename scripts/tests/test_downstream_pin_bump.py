@@ -140,6 +140,7 @@ class ManifestTests(unittest.TestCase):
 
 CONV_H = "src/xrt/include/xrt/xrt_conversion_plugin.h"
 INPUT_H = "src/xrt/include/xrt/xrt_input_plugin.h"
+TRACKING_H = "src/xrt/include/xrt/xrt_tracking_plugin.h"
 
 
 def conv_header(major: int) -> str:
@@ -159,8 +160,8 @@ class PluginAbiTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):  # the display prefix must not match inside the conversion one
             dpb._resolve_api_version_current(conv_header(1))
 
-    def test_abi_table_covers_the_three_plugin_types_and_the_tree_resolves(self):
-        self.assertEqual(set(dpb.ABI_HEADERS), {dpb.PLUGIN_HEADER_PATH, INPUT_H, CONV_H})
+    def test_abi_table_covers_the_four_plugin_types_and_the_tree_resolves(self):
+        self.assertEqual(set(dpb.ABI_HEADERS), {dpb.PLUGIN_HEADER_PATH, INPUT_H, CONV_H, TRACKING_H})
         for h, prefix in dpb.ABI_HEADERS.items():
             with self.subTest(header=h):
                 text = (REPO_ROOT / h).read_text(encoding="utf-8")
