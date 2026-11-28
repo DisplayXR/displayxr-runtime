@@ -150,12 +150,21 @@ public static class ComponentRows
     /// Dashboard runs). The installer puts its own plug-ins there and nothing else does: a plug-in
     /// with its own installer has its own folder, and a build registered from another tree is
     /// outside it. Compared as text (either slash, any case) so it does not depend on the host OS.
+    /// The macOS .pkg and the Linux packages keep the CLI in <c>&lt;root&gt;/bin</c> and the plug-ins
+    /// beside that folder: <c>&lt;root&gt;/lib/displayxr/plugins</c> (macOS) or <c>&lt;root&gt;/plugins</c>
+    /// (Linux, <c>/usr/lib/displayxr</c>); a CLI directory named <c>bin</c> also matches those.
     /// </summary>
     public static bool ShippedByRuntime(string? binaryPath, string? runtimeDir)
     {
         if (string.IsNullOrWhiteSpace(binaryPath) || string.IsNullOrWhiteSpace(runtimeDir)) return false;
         string dir = runtimeDir.Replace('\\', '/').TrimEnd('/');
-        return dir.Length > 0 && binaryPath.Replace('\\', '/').StartsWith(dir + "/plugins/", StringComparison.OrdinalIgnoreCase);
+        if (dir.Length == 0) return false;
+        string bin = binaryPath.Replace('\\', '/');
+        bool Under(string folder) => bin.StartsWith(folder + "/", StringComparison.OrdinalIgnoreCase);
+        if (Under(dir + "/plugins")) return true;
+        if (!dir.EndsWith("/bin", StringComparison.OrdinalIgnoreCase)) return false;
+        string root = dir[..^4];
+        return root.Length > 0 && (Under(root + "/plugins") || Under(root + "/lib/displayxr/plugins"));
     }
 
     /// <summary>The catalog class whose items live in a Components section; null for a section the catalog has no class for.</summary>

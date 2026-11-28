@@ -525,10 +525,51 @@ artifact for both packages). On Linux the CLI is resolved next to the binary, th
 `/usr/lib/displayxr/bin`, `~/.local/share/displayxr/bin`, `/usr/bin`. The Windows-only
 parts (the job object, raising the first instance) are no-ops there.
 
+## macOS
+
+The runtime `.pkg` (`installer/macos/build_installer.sh`) ships it as
+**`/Applications/DisplayXR Dashboard.app`**, inside the runtime component (so the meta-installer
+bundle, which re-wraps only `runtime.pkg`, carries it too). Built by
+`installer/macos/create_dashboard_app.sh`:
+
+```bash
+dotnet publish src/dashboard/DisplayXR.Dashboard/DisplayXR.Dashboard.csproj -c Release -r osx-arm64 \
+  --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=false \
+  -p:PublishTrimmed=false -p:EnableCompressionInSingleFile=true -o "<app>/Contents/MacOS"
+```
+
+- **osx-arm64 only**, like the runtime `.pkg` (built on Apple-silicon runners against Homebrew's
+  arm64 Vulkan / MoltenVK). Self-contained: no .NET on the Mac.
+- **Single file, natives beside it** (unlike Windows / Linux): `Contents/MacOS` holds the
+  executable and the Skia / HarfBuzz / AvaloniaNative dylibs (thinned to arm64, `@rpath` ids), all
+  Mach-O. Extracted natives (`~/.net`) would carry no Developer ID signature and fail library
+  validation, and a plain directory publish puts ~200 managed `.dll` files in `Contents/MacOS`,
+  which `codesign` treats as unsigned code. ~48 MB.
+- **Signing** is the runtime's: `sign-tree` signs the bundle with the payload (ad-hoc on PR / main
+  builds; Developer ID + hardened runtime on canonical `v*` tags, and the `.pkg` is notarized and
+  stapled). Under the hardened runtime CoreCLR needs `com.apple.security.cs.allow-jit`
+  (`installer/macos/entitlements/dotnet-app.entitlements`); without it the app dies at start
+  ("Failed to create CoreCLR, HRESULT: 0x80070008").
+- `Info.plist`: `com.displayxr.dashboard`, `LSMinimumSystemVersion` 13.0 (the `.pkg`'s floor), the
+  icon from `scripts/linux/dashboard/displayxr-dashboard.png`. Launched from Finder / Launchpad as the
+  user, so it is never elevated.
+- **The CLI**: the bundle carries none. The Dashboard runs
+  `/Library/Application Support/DisplayXR/bin/displayxr-cli`, the copy beside the service (the only
+  one the service admits as a status reader, #960), then the postinstall's `/usr/local/bin` link.
+- **What differs on macOS**: the catalog has no install engine yet, so Components lists what is
+  installed and shows "Installs come from the Download page for now"; there is no ActiveRuntime
+  switcher (`runtime` is a Windows verb; the `.pkg` registers the runtime); the Windows-only levers
+  (`DXR_D3D_*`, `DXR_HUB`, …) are listed under Troubleshooting > Advanced at their defaults; the job
+  object and "raise the first instance" are no-ops (Launch Services brings an open app to the front).
+- The uninstaller (`/Library/Application Support/DisplayXR/uninstall.sh`) removes the app.
+- CI: `build-macos.yml` `BuildInstaller` runs the tests on macOS, builds the `.pkg` with
+  `DXR_REQUIRE_DASHBOARD=1`, and checks the app is in the payload, its `Info.plist`, its signature
+  (and `allow-jit` on signed builds) and that `--version` runs.
+
 ## Run and debug
 
-- The CLI is resolved next to the exe, then `C:\Program Files\DisplayXR\Runtime` (Linux:
-  see above); `DXR_DASHBOARD_CLI=<path>` overrides it (development).
+- The CLI is resolved next to the exe, then `C:\Program Files\DisplayXR\Runtime` (Linux,
+  macOS: see above); `DXR_DASHBOARD_CLI=<path>` overrides it (development).
 - **Run the CLI that sits beside the running service.** The service admits a DIAG client
   (the status feed) only from its own directory (#960); any other `displayxr-cli` is
   admitted as APP and refused the status read. The CLI then says so on stderr and shows
@@ -552,7 +593,7 @@ parts (the job object, raising the first instance) are no-ops there.
   `unset` for that display driver. A `workspace-list.json` beside the fixture simulates the
   `workspace list|set|launch` verbs in memory, and a `dp-machine-override.txt` (one plug-in
   id) simulates a machine-wide `PreferredPlugin` that a global `dp reset` clears.
-- Log: `%LOCALAPPDATA%\DisplayXR\dashboard.log` — lifecycle, child starts / exits, and
+- Log: `%LOCALAPPDATA%\DisplayXR\dashboard.log` (macOS: `~/Library/Application Support/DisplayXR/dashboard.log`) — lifecycle, child starts / exits, and
   every exception (unhandled AppDomain / TaskScheduler / Dispatcher handlers log and keep
   going). Troubleshooting > Advanced shows its path and the session's error count.
 - From an elevated shell, launch it through Explorer to drop elevation:

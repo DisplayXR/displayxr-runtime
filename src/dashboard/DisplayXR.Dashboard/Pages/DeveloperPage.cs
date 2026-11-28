@@ -330,8 +330,13 @@ public sealed class DeveloperPage : Page
         {
             string dir = Path.GetDirectoryName(DashboardLog.Path)!;
             Directory.CreateDirectory(dir);
-            string opener = OperatingSystem.IsWindows() ? "explorer.exe" : "xdg-open";
-            try { Process.Start(new ProcessStartInfo(opener, $"\"{dir}\"") { UseShellExecute = false })?.Dispose(); }
+            string opener = OperatingSystem.IsWindows() ? "explorer.exe" : OperatingSystem.IsMacOS() ? "open" : "xdg-open";
+            try
+            {
+                var psi = new ProcessStartInfo(opener) { UseShellExecute = false };
+                psi.ArgumentList.Add(dir); // one argument, whatever the path holds (macOS: "Application Support")
+                Process.Start(psi)?.Dispose();
+            }
             catch (Exception ex) { DashboardLog.Warn($"open log folder ({opener}): {ex.Message}"); }
         }, "outline", "sm");
         return U.Card(U.VStack(14, U.CardTitle("This dashboard", null, open), kv));

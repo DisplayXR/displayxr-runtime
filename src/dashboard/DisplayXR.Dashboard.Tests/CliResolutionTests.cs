@@ -81,4 +81,22 @@ public class CliResolutionTests
         Assert.Equal("/usr/lib/displayxr/bin/displayxr-cli", CliProcessSource.Resolve(false, "/tmp/missing", "/usr/lib/displayxr/bin", "/home/u",
             Only("/usr/lib/displayxr/bin/displayxr-cli")));
     }
+
+    [Fact]
+    public void MacOS_AppBundle_FindsTheInstalledRuntimeBin()
+    {
+        // The .app in /Applications has no CLI beside it: the .pkg's runtime bin comes next, the
+        // service's own directory (the one it admits a status reader from), then the /usr/local/bin link.
+        const string beside = "/Applications/DisplayXR Dashboard.app/Contents/MacOS/";
+        const string pkg = "/Library/Application Support/DisplayXR/bin/displayxr-cli";
+        Assert.Equal(pkg, CliProcessSource.Resolve(false, null, beside, "/Users/u",
+            Only(pkg, "/usr/local/bin/displayxr-cli"), macos: true));
+        Assert.Equal("/usr/local/bin/displayxr-cli", CliProcessSource.Resolve(false, null, beside, "/Users/u",
+            Only("/usr/local/bin/displayxr-cli"), macos: true));
+        // A dev build beside its own CLI keeps the sibling; Linux locations are not macOS ones.
+        Assert.Equal("/dev/_package/bin/displayxr-cli", CliProcessSource.Resolve(false, null, "/dev/_package/bin", "/Users/u",
+            Only("/dev/_package/bin/displayxr-cli", pkg), macos: true));
+        Assert.Equal(beside + "displayxr-cli", CliProcessSource.Resolve(false, null, beside, "/Users/u",
+            Only("/usr/lib/displayxr/bin/displayxr-cli"), macos: true));
+    }
 }

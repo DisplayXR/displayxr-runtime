@@ -500,7 +500,9 @@ if [ "$SERVICE_MODE" = "ON" ] && [ -n "$TRACKHOST_BIN" ]; then
 fi
 
 # displayxr-cli ships in the .pkg too: on macOS it is the only installed way to
-# run selftest / status and to calibrate a camera (the Dashboard is Windows-only).
+# run selftest / status and to calibrate a camera, and the DisplayXR Dashboard
+# (/Applications/DisplayXR Dashboard.app, added by installer/macos/build_installer.sh)
+# runs this installed copy, the one beside the service.
 # It links the same bundled Vulkan loader + cJSON as the service, and runs the
 # runtime headless in-process, so it needs the same rpath. Service or not.
 CLI_BIN="$BUILD_DIR/src/xrt/targets/cli/displayxr-cli"

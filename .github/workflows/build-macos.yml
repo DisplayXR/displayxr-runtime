@@ -145,6 +145,18 @@ jobs:
           BREW_PREFIX=$(brew --prefix)
           echo "VULKAN_SDK=$BREW_PREFIX" >> $GITHUB_ENV
 
+      # The DisplayXR Dashboard (src/dashboard, .NET 10): the .pkg ships it as
+      # /Applications/DisplayXR Dashboard.app (installer/macos/create_dashboard_app.sh).
+      - name: Set up .NET 10 (DisplayXR Dashboard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Dashboard tests (macOS)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet test src/dashboard/DisplayXR.Dashboard.sln -c Release --nologo
+
       # ── Developer ID signing + notarization (#280) ─────────────────────
       # Signs ONLY canonical-repo v* tag builds, and only when the org-level
       # secrets exist. Everything else (PRs, forks, main pushes, tag builds
@@ -211,6 +223,7 @@ jobs:
       - name: Build runtime + test app + installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
+          DXR_REQUIRE_DASHBOARD: "1"
           DXR_MACOS_SIGN_FALLBACK: adhoc
           DXR_MACOS_SIGN_STATUS_FILE: ${{ runner.temp }}/dxr-macos-sign-status
         run: env -u DXR_MACOS_INSTALLER_IDENTITY ./scripts/build_macos.sh --installer
@@ -312,12 +325,47 @@ jobs:
               MISSING=1
             fi
           fi
+          # The DisplayXR Dashboard app bundle, in the runtime component, to
+          # /Applications: its executable and natives, Info.plist and icon.
+          for f in 'Applications/DisplayXR Dashboard.app/Contents/Info.plist' \
+                   'Applications/DisplayXR Dashboard.app/Contents/MacOS/displayxr-dashboard$' \
+                   'Applications/DisplayXR Dashboard.app/Contents/MacOS/libSkiaSharp.dylib' \
+                   'Applications/DisplayXR Dashboard.app/Contents/MacOS/libAvaloniaNative.dylib' \
+                   'Applications/DisplayXR Dashboard.app/Contents/Resources/displayxr-dashboard.icns'; do
+            if ! grep -q "$f" "$EXPAND_DIR/files"; then
+              echo "::error::'$f' missing from .pkg payload — the DisplayXR Dashboard would not be installed."
+              MISSING=1
+            fi
+          done
+          # Extract the app, check its bundle + signature, and run it headless:
+          # --version exits before any window, and proves the JIT starts under
+          # whatever signature the build gave it (hardened + allow-jit on a
+          # Developer ID build).
+          (cd "$EXPAND_DIR" && gunzip -c "$PAYLOAD" | cpio -i -d --quiet '*Applications/DisplayXR Dashboard.app*' 2>/dev/null) || true
+          DASH="$EXPAND_DIR/Applications/DisplayXR Dashboard.app"
+          if [ -d "$DASH" ]; then
+            plutil -extract CFBundleIdentifier raw "$DASH/Contents/Info.plist" | grep -qx com.displayxr.dashboard \
+              || { echo "::error::DisplayXR Dashboard.app: wrong CFBundleIdentifier"; MISSING=1; }
+            plutil -extract LSMinimumSystemVersion raw "$DASH/Contents/Info.plist" | grep -qx 13.0 \
+              || { echo "::error::DisplayXR Dashboard.app: LSMinimumSystemVersion is not the .pkg's 13.0"; MISSING=1; }
+            codesign --verify --deep --strict "$DASH" || { echo "::error::DisplayXR Dashboard.app signature does not verify"; MISSING=1; }
+            if [ "$SIGNED" = "true" ] && ! codesign -d --entitlements - --xml "$DASH" 2>/dev/null | grep -q 'com.apple.security.cs.allow-jit'; then
+              echo "::error::DisplayXR Dashboard.app lacks com.apple.security.cs.allow-jit — .NET cannot start under the hardened runtime."
+              MISSING=1
+            fi
+            DASH_VER="$("$DASH/Contents/MacOS/displayxr-dashboard" --version 2>&1 || true)"
+            echo "$DASH_VER"
+            [[ "$DASH_VER" == "displayxr-dashboard "* ]] || { echo "::error::displayxr-dashboard --version failed"; MISSING=1; }
+          else
+            echo "::error::could not extract DisplayXR Dashboard.app from the payload."
+            MISSING=1
+          fi
           if [ "$MISSING" -ne 0 ]; then
             echo "Payload listing:"
             cat "$EXPAND_DIR/files"
             exit 1
           fi
-          echo "PASS: .pkg payload contains plug-in + manifest + service + LaunchAgent + cli; tracking-host camera-ready."
+          echo "PASS: .pkg payload contains plug-in + manifest + service + LaunchAgent + cli + Dashboard.app; tracking-host camera-ready."
 
       - name: Sign, notarize and staple the .pkg (#280)
         if: needs.DetectChanges.outputs.docs_only != 'true' && steps.keychain.outputs.sign == 'true'

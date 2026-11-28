@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	DisplayXR Dashboard.app (src/dashboard, Avalonia / .NET 10), signed with
+	the hardened runtime on Developer ID builds.
+
+	allow-jit: CoreCLR compiles managed code at run time into MAP_JIT memory.
+	Without it the hardened runtime refuses the mapping and the app dies before
+	its first line ("Failed to create CoreCLR, HRESULT: 0x80070008"; measured
+	with a hardened-runtime signature).
+
+	No library-validation exception: the app dlopen()s only its own Skia /
+	HarfBuzz / AvaloniaNative dylibs from Contents/MacOS, which sign-tree signs
+	with the same Developer ID, so their Team ID matches. (The ad-hoc tree of
+	an unsigned build has no hardened runtime, so validation does not apply.)
+	-->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+</dict>
+</plist>

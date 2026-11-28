@@ -337,6 +337,25 @@ else
     echo "Warning: DisplayXRDesktopCapture.app not in artifact; transparent sessions on a weaving DP will have no desktop backdrop."
 fi
 
+# --- DisplayXR Dashboard.app (ADR-051) into /Applications ---
+# The runtime's dashboard, as on Windows (Start menu) and Linux (.deb menu
+# entry). Part of the RUNTIME component, not a choice of its own: the macOS
+# meta-installer bundle (displayxr-installer build-bundle.sh) re-wraps only
+# runtime.pkg, and the Dashboard is useless without this runtime anyway (it
+# runs $INSTALL_PREFIX/bin/displayxr-cli, the CLI beside the service, #960).
+# create_dashboard_app.sh publishes it (or takes DXR_DASHBOARD_APP); without a
+# .NET SDK the .pkg ships without it (WARN), unless DXR_REQUIRE_DASHBOARD=1 (CI).
+# sign_tree below gives it its final signature (entitlements/map: JIT).
+DASH_APP="$("$SCRIPT_DIR/create_dashboard_app.sh" "$WORK_DIR/payload-runtime/Applications" "$VERSION")"
+if [ -n "$DASH_APP" ] && [ -d "$DASH_APP" ]; then
+    # The payload's /Applications entry carries the system folder's own mode
+    # (drwxrwxr-x), so the payload never disagrees with the folder it lands in.
+    chmod 0775 "$WORK_DIR/payload-runtime/Applications"
+    echo "Staged $(basename "$DASH_APP") into the runtime payload (/Applications)."
+else
+    rmdir "$WORK_DIR/payload-runtime/Applications" 2>/dev/null || true
+fi
+
 # --- 1b. Final code signature on the runtime payload (#280) ---
 # MUST stay the last thing that touches the payload's Mach-Os: every
 # install_name_tool above invalidated a signature (the ad-hoc re-signs only
