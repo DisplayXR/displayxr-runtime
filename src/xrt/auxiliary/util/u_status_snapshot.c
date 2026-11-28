@@ -232,6 +232,30 @@ u_status_mode_3d_mark_active(struct xrt_status_mode_3d *m3)
 	}
 }
 
+bool
+u_status_mode_3d_driver_differs(const struct xrt_status_screen *sc)
+{
+	if (sc == NULL || !sc->roles.runtime_default || !sc->mode_3d.valid) {
+		return false;
+	}
+	const char *table = sc->mode_3d.driver;
+	const char *weaver = sc->claim.plugin_id;
+	return table[0] != '\0' && weaver[0] != '\0' && strcmp(table, weaver) != 0;
+}
+
+bool
+u_status_mode_3d_note_driver(struct xrt_status_screen *sc)
+{
+	if (!u_status_mode_3d_driver_differs(sc)) {
+		return false;
+	}
+	struct xrt_status_mode_3d *m3 = &sc->mode_3d;
+	(void)snprintf(m3->reason, sizeof(m3->reason),
+	               "its 3D modes are those of the head display driver '%.31s'; '%.31s' only weaves it", m3->driver,
+	               sc->claim.plugin_id);
+	return true;
+}
+
 cJSON *
 u_status_mode_3d_to_cjson(const struct xrt_status_mode_3d *m3)
 {
@@ -254,6 +278,11 @@ u_status_mode_3d_to_cjson(const struct xrt_status_mode_3d *m3)
 		cJSON_AddStringToObject(mo, "reason", m3->reason);
 	} else {
 		cJSON_AddNullToObject(mo, "reason");
+	}
+	if (m3->driver[0] != '\0') {
+		cJSON_AddStringToObject(mo, "driver", m3->driver);
+	} else {
+		cJSON_AddNullToObject(mo, "driver");
 	}
 	cJSON *ch = cJSON_AddArrayToObject(mo, "choices");
 	for (uint32_t i = 0; m3->valid && i < m3->choice_count && i < XRT_STATUS_MAX_MODE_3D_CHOICES; i++) {

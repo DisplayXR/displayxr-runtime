@@ -163,6 +163,39 @@ public class Mode3DTests
     }
 
     [Fact]
+    public void PrimaryDisplay_GivenAnotherDriver_KeepsTheRow_WithTheHeadDriversModeAndTheNote()
+    {
+        // `dp use sim-display --screen <primary>` on a Leia head: the primary is woven by sim-display, its 3D
+        // modes stay the head display driver's one mode. No picker, but the row explains why.
+        const string Reason = "its 3D modes are those of the head display driver 'leia-sr'; 'sim-display' only weaves it";
+        var snap = TestData.Parse("""
+            { "schema": 1, "screens": [ { "id": "0x1", "key": "DEL-DM022344CZ0001",
+              "roles": { "os_main": true, "runtime_default": true, "vendor_primary": true },
+              "claim": { "plugin_id": "sim-display", "forced": true },
+              "mode_3d": { "active": "leiasr", "setting": null, "source": "runtime_default",
+                           "reason": "its 3D modes are those of the head display driver 'leia-sr'; 'sim-display' only weaves it",
+                           "driver": "leia-sr",
+                           "choices": [ { "name": "leiasr", "label": "LeiaSR", "views": 2, "tracked": true, "applies": "now" } ] } } ] }
+            """);
+        var s = snap.Screens[0];
+        var m = s.Mode3D!;
+        Assert.Equal("leia-sr", m.Driver);
+        Assert.False(StatusText.Mode3DPickerShown(s)); // one mode: nothing to choose
+        Assert.True(StatusText.Mode3DOtherDriver(s));
+        Assert.True(StatusText.Mode3DRowShown(s));
+        Assert.Equal("LeiaSR", StatusText.Mode3DStoredText(m)); // the mode drawn now
+        Assert.Equal(new[] { "Its 3D modes are those of the head display driver 'leia-sr'; 'sim-display' only weaves it." },
+                     StatusText.Mode3DNotes(m));
+        Assert.Equal(Reason, m.Reason);
+        Assert.False(StatusText.Mode3DCanReset(m)); // nothing stored
+
+        // The head's own driver weaving it, a secondary display, or an older feed without `driver`: no row.
+        Assert.False(StatusText.Mode3DOtherDriver(s with { Claim = s.Claim with { PluginId = "leia-sr" } }));
+        Assert.False(StatusText.Mode3DOtherDriver(s with { Roles = s.Roles with { RuntimeDefault = false } }));
+        Assert.False(StatusText.Mode3DRowShown(s with { Mode3D = m with { Driver = null } }));
+    }
+
+    [Fact]
     public void LiveMode_WithANote_ShowsIt_WhenItIsTheModeDrawn()
     {
         var m = Screen("SIM-000C-L").Mode3D!;

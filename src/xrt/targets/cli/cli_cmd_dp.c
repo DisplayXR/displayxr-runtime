@@ -927,7 +927,23 @@ mode_print_row(const struct xrt_status_screen *sc)
 	P("    slot 0: 2D (full screen, not configurable)\n");
 	P("    slot 1 (3D mode): %s  [source: %s%s%s%s]\n", m->active, u_status_mode_3d_source_str(m->source),
 	  m->setting[0] != '\0' ? ", setting '" : "", m->setting, m->setting[0] != '\0' ? "'" : "");
-	if (m->reason[0] != '\0') {
+	if (u_status_mode_3d_driver_differs(sc)) {
+		// The system-default screen woven by a driver chosen for it (dp use
+		// --screen): its 3D modes stay the head device's at every time.
+		P("    3D modes from: %s (the head display driver); woven by: %s\n", m->driver, sc->claim.plugin_id);
+		P("    note: %s. A choice for this screen alone changes only which driver weaves it (from the next "
+		  "session); for '%s''s own 3D modes choose it for every screen: displayxr-cli dp use %s\n",
+		  m->reason, sc->claim.plugin_id, sc->claim.plugin_id);
+		bool listed = m->setting[0] == '\0';
+		for (uint32_t k = 0; k < m->choice_count && !listed; k++) {
+			listed = strcmp(m->choices[k].name, m->setting) == 0;
+		}
+		if (!listed) {
+			P("    note: the stored choice '%s' is not one of these modes and is not used - clear it with: "
+			  "displayxr-cli dp mode reset --screen %s%s\n",
+			  m->setting, sc->key, m->source == XRT_STATUS_MODE_3D_SOURCE_MACHINE ? " --machine" : "");
+		}
+	} else if (m->reason[0] != '\0') {
 		// A stored choice that is not honoured (not offered, cannot apply).
 		P("    note: %s - clear it with: displayxr-cli dp mode reset --screen %s%s\n", m->reason, sc->key,
 		  m->source == XRT_STATUS_MODE_3D_SOURCE_MACHINE ? " --machine" : "");
@@ -1034,6 +1050,10 @@ cmd_mode_set(const char *name, const char *screen, bool machine)
 			P(" %s", sc->mode_3d.choices[k].name);
 		}
 		P(" — nothing written.\n");
+		if (u_status_mode_3d_driver_differs(sc)) {
+			P("Note: %s. For '%s''s own 3D modes choose it for every screen: displayxr-cli dp use %s\n",
+			  sc->mode_3d.reason, sc->claim.plugin_id, sc->claim.plugin_id);
+		}
 		free(snap);
 		return 1;
 	}

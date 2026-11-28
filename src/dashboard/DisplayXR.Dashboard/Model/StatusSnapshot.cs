@@ -175,6 +175,13 @@ public sealed record Mode3D(string? Active, string? Setting, string Source, IRea
     /// <summary>Why there are no choices (the feed's top-level <c>reason</c>); null otherwise.</summary>
     public string? Reason { get; init; }
 
+    /// <summary>
+    /// The display driver whose 3D modes <see cref="Choices"/> are (the feed's <c>driver</c>); null when not said.
+    /// On the system-default display it is the head display driver's, also when the display was given another
+    /// driver of its own: that driver only weaves it.
+    /// </summary>
+    public string? Driver { get; init; }
+
     public Mode3DChoice? Find(string? name) => name is null ? null : Choices.FirstOrDefault(c => c.Name == name);
 }
 
@@ -347,7 +354,10 @@ public static class StatusSnapshotParser
                                           c.Bool("passthrough"), c.Str("applies", "now"), c.StrOrNull("reason")))
             .ToArray();
         return new Mode3D(o.StrOrNull("active"), o.StrOrNull("setting"), o.Str("source", "runtime_default"), choices)
-        { Reason = o.StrOrNull("reason") is { Length: > 0 } why ? why : null };
+        {
+            Reason = o.StrOrNull("reason") is { Length: > 0 } why ? why : null,
+            Driver = o.StrOrNull("driver") is { Length: > 0 } drv ? drv : null,
+        };
     }
 
     private static PixelRect ReadRect(JsonElement? e) =>

@@ -123,7 +123,12 @@ claimed the monitor at **any** confidence (sim-display's `FALLBACK` claim
 included); otherwise it is ignored with one WARN and the monitor resolves as
 above. The entry is marked `forced` with its source. On the system-default
 screen it also moves the primary DP (`primary_override`, scalars follow); the
-head device stays the active plug-in's. The service re-reads the preference on
+head device stays the active plug-in's, and so do its rendering modes: the
+screen's 3D-mode table (`status --json` `screens[i].mode_3d`, ADR-066 C1.3)
+stays the head device's at every time, now, at the next session and after a
+service restart, and says so (`mode_3d.driver` names the head's plug-in, the
+top-level `reason` that the chosen plug-in only weaves the screen). Only a
+global `dp use <id>` changes it. The service re-reads the preference on
 every re-probe (§4.2) and recreates a changed **secondary** screen's segment
 DPs; the primary DP never swaps live, so the primary screen's choice applies at
 the next session / service start. The screen key is the EDID form

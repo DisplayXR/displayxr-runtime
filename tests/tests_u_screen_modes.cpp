@@ -668,7 +668,7 @@ TEST_CASE("screen modes: a stored choice on a screen with no table stays visible
 	std::printf("no-table mode_3d JSON: %s\n", txt);
 	CHECK(std::string(txt) ==
 	      "{\"active\":null,\"setting\":\"anaglyph\",\"source\":\"user\",\"reason\":\"this "
-	      "display's driver declares no 3D modes now\",\"choices\":[]}");
+	      "display's driver declares no 3D modes now\",\"driver\":null,\"choices\":[]}");
 	cJSON_free(txt);
 	cJSON_Delete(j);
 

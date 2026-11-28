@@ -1253,6 +1253,110 @@ TEST_CASE("status: per-screen viewer_tracking object (ADR-066 Part B)", "[status
 	CHECK(cJSON_IsNull(cJSON_GetObjectItem(vb, "provider")));
 }
 
+namespace {
+
+//! The head device's table as the vendor plug-in declares it: one 3D entry.
+void
+leia_head_mode_3d(xrt_status_mode_3d &m)
+{
+	std::memset(&m, 0, sizeof(m));
+	m.valid = true;
+	SET(m.active, "leiasr");
+	SET(m.driver, "leia-sr");
+	m.source = XRT_STATUS_MODE_3D_SOURCE_RUNTIME_DEFAULT;
+	m.choice_count = 1;
+	SET(m.choices[0].name, "leiasr");
+	SET(m.choices[0].label, "LeiaSR");
+	m.choices[0].views = 2;
+	m.choices[0].tracked = true;
+	m.choices[0].applies = XRT_STATUS_MODE_3D_APPLIES_NOW;
+}
+
+//! `dp use sim-display --screen <primary>`: the primary is claimed (woven) by sim-display, forced.
+void
+force_primary_to_sim(xrt_status_snapshot &s)
+{
+	xrt_status_screen &sc = s.screens[0];
+	SET(sc.claim.plugin_id, "sim-display");
+	sc.claim.confidence = XRT_DISPLAY_CLAIM_FALLBACK;
+	sc.claim.forced = true;
+	SET(sc.claim.preferred_plugin, "sim-display");
+	sc.claim.preferred_source = XRT_STATUS_PREF_SOURCE_USER;
+	sc.claim.apply = XRT_STATUS_APPLY_NEXT_SESSION;
+}
+
+} // namespace
+
+TEST_CASE("status: the primary screen's 3D modes say whose they are when another driver weaves it",
+          "[status][mode_3d][driver]")
+{
+	auto s = healthy();
+	leia_head_mode_3d(s->screens[0].mode_3d);
+	leia_head_mode_3d(s->screens[1].mode_3d);
+
+	SECTION("the head's own screen: no note, `driver` names the table's plug-in")
+	{
+		CHECK_FALSE(u_status_mode_3d_driver_differs(&s->screens[0]));
+		CHECK_FALSE(u_status_mode_3d_note_driver(&s->screens[0]));
+		CHECK(s->screens[0].mode_3d.reason[0] == '\0');
+		cJSON *j = u_status_mode_3d_to_cjson(&s->screens[0].mode_3d);
+		CHECK(std::string(cJSON_GetStringValue(cJSON_GetObjectItem(j, "driver"))) == "leia-sr");
+		CHECK(cJSON_IsNull(cJSON_GetObjectItem(j, "reason")));
+		cJSON_Delete(j);
+	}
+	SECTION("dp use sim-display --screen <primary>: the table stays the head's, and says so")
+	{
+		force_primary_to_sim(*s);
+		CHECK(u_status_mode_3d_driver_differs(&s->screens[0]));
+		REQUIRE(u_status_mode_3d_note_driver(&s->screens[0]));
+		const xrt_status_mode_3d &m = s->screens[0].mode_3d;
+		CHECK(std::string(m.reason) ==
+		      "its 3D modes are those of the head display driver 'leia-sr'; 'sim-display' only weaves it");
+		// The table itself is untouched: what the head device maps slot 1 to.
+		CHECK(std::string(m.active) == "leiasr");
+		CHECK(m.choice_count == 1);
+		cJSON *j = u_status_mode_3d_to_cjson(&m);
+		CHECK(std::string(cJSON_GetStringValue(cJSON_GetObjectItem(j, "driver"))) == "leia-sr");
+		CHECK(std::string(cJSON_GetStringValue(cJSON_GetObjectItem(j, "reason"))) == m.reason);
+		cJSON_Delete(j);
+	}
+	SECTION("the note replaces a stored-choice reason: the split is why the name is missing")
+	{
+		force_primary_to_sim(*s);
+		SET(s->screens[0].mode_3d.setting, "anaglyph");
+		SET(s->screens[0].mode_3d.reason,
+		    "the chosen 3D mode 'anaglyph' is not offered by this display's driver; the default is used");
+		REQUIRE(u_status_mode_3d_note_driver(&s->screens[0]));
+		CHECK(std::string(s->screens[0].mode_3d.reason).rfind("its 3D modes are those of", 0) == 0);
+		CHECK(std::string(s->screens[0].mode_3d.setting) == "anaglyph");
+	}
+	SECTION("only the system-default screen: a secondary screen's table is its own plug-in's")
+	{
+		SET(s->screens[1].claim.plugin_id, "sim-display");
+		CHECK_FALSE(u_status_mode_3d_driver_differs(&s->screens[1]));
+		CHECK_FALSE(u_status_mode_3d_note_driver(&s->screens[1]));
+	}
+	SECTION("nothing to say without a table, or without a known driver")
+	{
+		force_primary_to_sim(*s);
+		s->screens[0].mode_3d.driver[0] = '\0'; // an older service's row
+		CHECK_FALSE(u_status_mode_3d_driver_differs(&s->screens[0]));
+		cJSON *j = u_status_mode_3d_to_cjson(&s->screens[0].mode_3d);
+		CHECK(cJSON_IsNull(cJSON_GetObjectItem(j, "driver")));
+		cJSON_Delete(j);
+		SET(s->screens[0].mode_3d.driver, "leia-sr");
+		s->screens[0].mode_3d.valid = false;
+		CHECK_FALSE(u_status_mode_3d_driver_differs(&s->screens[0]));
+	}
+	SECTION("long plug-in ids are cut, never overflow")
+	{
+		SET(s->screens[0].claim.plugin_id, "a-very-long-display-driver-id-31c");
+		SET(s->screens[0].mode_3d.driver, "another-very-long-driver-id-31ch");
+		REQUIRE(u_status_mode_3d_note_driver(&s->screens[0]));
+		CHECK(std::strlen(s->screens[0].mode_3d.reason) < sizeof(s->screens[0].mode_3d.reason));
+	}
+}
+
 #if defined(DXR_TEST_HAVE_TARGET_LISTS) && !defined(_WIN32)
 #include "target_status_snapshot.h"
 #include "util/u_setting.h"
@@ -1401,5 +1505,61 @@ TEST_CASE("status: the active 3D mode's row reads `now` with no reason", "[statu
 	u_status_mode_3d_mark_active(&m);
 	CHECK(std::string(m.choices[3].reason) == "4 views: stereo apps show 2D");
 	CHECK(m.choices[1].reason[0] == '\0');
+}
+TEST_CASE("status: a stored choice on a primary woven by another driver keeps the head's table, with the note",
+          "[status][mode_3d][driver]")
+{
+	char tmpl[] = "/tmp/dxr_m3d_drv_XXXXXX";
+	REQUIRE(mkdtemp(tmpl) != nullptr);
+	const char *old_cfg = getenv("XDG_CONFIG_HOME");
+	const std::string saved = old_cfg != nullptr ? old_cfg : "";
+	setenv("XDG_CONFIG_HOME", tmpl, 1);
+
+	auto s = healthy();
+	const std::string key = s->screens[0].key;
+	leia_head_mode_3d(s->screens[0].mode_3d);
+	force_primary_to_sim(*s);
+
+	SECTION("nothing stored: the note alone")
+	{
+		target_status_snapshot_fill_mode_3d_setting(s.get());
+		const xrt_status_mode_3d &m = s->screens[0].mode_3d;
+		CHECK(m.setting[0] == '\0');
+		CHECK(std::string(m.active) == "leiasr");
+		CHECK(std::string(m.reason).rfind("its 3D modes are those of the head display driver 'leia-sr'", 0) ==
+		      0);
+		std::printf("primary-woven-by-sim mode_3d JSON: %s\n", mode_3d_json(m).c_str());
+	}
+	SECTION("a sim-display name stored for the screen: kept, not drawn, and the note says why")
+	{
+		REQUIRE(u_setting_user_set_mode_3d_for_screen(key.c_str(), "anaglyph"));
+		s->source = XRT_STATUS_SOURCE_HEADLESS;
+		target_status_snapshot_fill_mode_3d_setting(s.get());
+		const xrt_status_mode_3d &m = s->screens[0].mode_3d;
+		CHECK(std::string(m.setting) == "anaglyph");
+		CHECK(m.source == XRT_STATUS_MODE_3D_SOURCE_USER);
+		CHECK(std::string(m.active) == "leiasr"); // never shown as drawn
+		CHECK(std::string(m.reason).rfind("its 3D modes are those of", 0) == 0);
+	}
+	SECTION("the head's own entry stored: honoured, the note stays")
+	{
+		REQUIRE(u_setting_user_set_mode_3d_for_screen(key.c_str(), "leiasr"));
+		target_status_snapshot_fill_mode_3d_setting(s.get());
+		const xrt_status_mode_3d &m = s->screens[0].mode_3d;
+		CHECK(std::string(m.setting) == "leiasr");
+		CHECK(std::string(m.active) == "leiasr");
+		CHECK(std::string(m.reason).rfind("its 3D modes are those of", 0) == 0);
+	}
+
+	(void)u_setting_user_clear_mode_3d_per_screen();
+	const std::string f = std::string(tmpl) + "/displayxr/settings.json";
+	std::remove(f.c_str());
+	rmdir((std::string(tmpl) + "/displayxr").c_str());
+	rmdir(tmpl);
+	if (old_cfg != nullptr) {
+		setenv("XDG_CONFIG_HOME", saved.c_str(), 1);
+	} else {
+		unsetenv("XDG_CONFIG_HOME");
+	}
 }
 #endif

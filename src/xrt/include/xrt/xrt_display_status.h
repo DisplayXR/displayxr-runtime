@@ -515,7 +515,14 @@ struct xrt_status_mode_3d
 	//! Why the stored choice is not honoured ("" = it is, or none is stored): a
 	//! name the driver's table does not list, a `not_supported` entry, or a
 	//! screen whose driver declares no 3D modes now (JSON top-level `reason`).
-	char reason[96];
+	//! On the system-default screen it also says when the table is not the
+	//! weaving driver's (u_status_mode_3d_note_driver), and that note wins.
+	char reason[128];
+	//! The display driver (plug-in id) whose declared list @ref choices is ("" =
+	//! unknown: JSON null). On the system-default screen it is the head device's
+	//! plug-in, also when a per-screen preference gave the screen another
+	//! weaving driver (`claim.plugin_id`): the head device keeps its modes.
+	char driver[32];
 };
 
 //! One DP bound to a screen (phase 2).

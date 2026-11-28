@@ -581,8 +581,19 @@ public static class StatusText
     public static bool Mode3DStoredOnly(Screen s) =>
         s.Key is not null && s.Mode3D is { Choices.Count: 0, Setting: { Length: > 0 } };
 
-    /// <summary>Whether a display card shows the 3D mode row at all (the picker, or a stored choice alone).</summary>
-    public static bool Mode3DRowShown(Screen s) => Mode3DPickerShown(s) || Mode3DStoredOnly(s);
+    /// <summary>
+    /// The system-default display, given a display driver of its own (<c>dp use &lt;id&gt; --screen</c>), whose 3D
+    /// modes stay the head display driver's (<see cref="Mode3D.Driver"/>): that choice changes only which driver
+    /// weaves it. The row stays, with the runtime's note, so the missing picker is explained.
+    /// </summary>
+    public static bool Mode3DOtherDriver(Screen s) =>
+        s.Key is not null && s.Roles.RuntimeDefault &&
+        s.Mode3D is { Driver: { Length: > 0 } table, Reason: { Length: > 0 }, Choices.Count: > 0 } &&
+        s.Claim.PluginId is { Length: > 0 } weaver &&
+        !string.Equals(table, weaver, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether a display card shows the 3D mode row at all (the picker, a stored choice alone, or the driver note).</summary>
+    public static bool Mode3DRowShown(Screen s) => Mode3DPickerShown(s) || Mode3DStoredOnly(s) || Mode3DOtherDriver(s);
 
     /// <summary>
     /// The entries the picker lists, in the driver's order and by the driver's labels. A mode this display
@@ -640,8 +651,12 @@ public static class StatusText
         _ => null,
     };
 
-    /// <summary>The stored choice, as shown when there is no picker: the driver's label when known, else the stored name.</summary>
-    public static string Mode3DStoredText(Mode3D m) => m.Find(m.Setting)?.Label ?? m.Setting ?? "";
+    /// <summary>
+    /// What the row shows when there is no picker: the stored choice (the driver's label when known, else the
+    /// stored name), else the mode drawn now (the display given another driver of its own, see <see cref="Mode3DOtherDriver"/>).
+    /// </summary>
+    public static string Mode3DStoredText(Mode3D m) =>
+        m.Find(m.Setting)?.Label ?? m.Setting ?? m.Find(m.Active)?.Label ?? m.Active ?? "";
 
     /// <summary>
     /// The lines under the row: a stored choice that waits for the next app start; the note of the mode

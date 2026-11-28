@@ -682,6 +682,20 @@ fill_screens(const struct xrt_screen_list *list,
 static int
 head_screen_row(const struct xrt_status_snapshot *out);
 
+/*!
+ * The head device's table is the active plug-in's: a per-screen preference on
+ * the system-default screen moves only its weaving DP (display dashboard
+ * phase 7), so name the table's driver for u_status_mode_3d_note_driver.
+ */
+static void
+mark_head_driver(struct xrt_status_mode_3d *m3)
+{
+	const struct xrt_plugin_iface *active = target_plugin_get_active();
+	if (m3 != NULL && m3->valid && active != NULL && active->id != NULL) {
+		(void)snprintf(m3->driver, sizeof(m3->driver), "%s", active->id);
+	}
+}
+
 void
 target_status_snapshot_build_headless(struct xrt_instance *xi,
                                       struct xrt_system_devices *xsysd,
@@ -726,6 +740,7 @@ target_status_snapshot_build_headless(struct xrt_instance *xi,
 		struct xrt_device *head = xsysd != NULL ? xsysd->static_roles.head : NULL;
 		if (hr >= 0 && head != NULL) {
 			u_device_rendering_modes_fill_status(head, &out->screens[hr].mode_3d);
+			mark_head_driver(&out->screens[hr].mode_3d);
 		}
 		// ADR-047 Amendment 10: every other screen's own 3D mode.
 		target_screen_modes_fill_status(&list, &reg, head, out);
@@ -771,6 +786,77 @@ head_screen_row(const struct xrt_status_snapshot *out)
 	return out->screen_count > 0 ? 0 : -1;
 }
 
+//! One row of target_status_snapshot_fill_mode_3d_setting: its stored choice.
+static void
+fill_row_mode_3d_setting(const struct xrt_status_snapshot *out, struct xrt_status_screen *sc)
+{
+	if (sc->key[0] == '\0') {
+		return;
+	}
+	char name[64];
+	enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+	if (u_setting_get_mode_3d_for_screen(sc->key, name, sizeof(name), &src) == NULL) {
+		// Nothing stored: what chose the slot is the driver's or the runtime's
+		// default, as the builder reported it.
+		sc->mode_3d.setting[0] = '\0';
+		if (sc->mode_3d.source == XRT_STATUS_MODE_3D_SOURCE_USER ||
+		    sc->mode_3d.source == XRT_STATUS_MODE_3D_SOURCE_MACHINE) {
+			sc->mode_3d.source = XRT_STATUS_MODE_3D_SOURCE_DRIVER_DEFAULT;
+		}
+		return;
+	}
+	(void)snprintf(sc->mode_3d.setting, sizeof(sc->mode_3d.setting), "%s", name);
+	const enum xrt_status_mode_3d_source stored_in =
+	    src == U_SETTING_SOURCE_MACHINE ? XRT_STATUS_MODE_3D_SOURCE_MACHINE : XRT_STATUS_MODE_3D_SOURCE_USER;
+	if (!sc->mode_3d.valid) {
+		// ADR-047 Amendment 10: keep a stored choice visible on a screen
+		// whose driver declares no 3D modes now (driver changed, unclaimed).
+		sc->mode_3d.active[0] = '\0';
+		sc->mode_3d.choice_count = 0;
+		sc->mode_3d.source = stored_in;
+		(void)snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
+		               "this display's driver declares no 3D modes now");
+		return;
+	}
+	const struct xrt_status_mode_3d_choice *row = NULL;
+	for (uint32_t k = 0; k < sc->mode_3d.choice_count && k < XRT_STATUS_MAX_MODE_3D_CHOICES; k++) {
+		if (strcmp(sc->mode_3d.choices[k].name, name) == 0) {
+			row = &sc->mode_3d.choices[k];
+		}
+	}
+	// The stored choice is reported where it is stored, whether or not it
+	// is honoured: `source` says which store a reset must clear.
+	sc->mode_3d.source = stored_in;
+	if (row == NULL) {
+		// A name the driver's table does not list (an entry it no longer
+		// declares, a hand-written typo): never honoured, the default is
+		// drawn. Say so, so a reader can offer the reset.
+		sc->mode_3d.reason[0] = '\0';
+		const int w = snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
+		                       "the chosen 3D mode '%s' is not offered by this display's driver; the "
+		                       "default is used",
+		                       name);
+		if (w < 0 || (size_t)w >= sizeof(sc->mode_3d.reason)) {
+			(void)snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
+			               "chosen 3D mode '%.31s' not offered by the driver; default used", name);
+		}
+		return;
+	}
+	if (row->applies == XRT_STATUS_MODE_3D_APPLIES_NOT_SUPPORTED) {
+		(void)snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
+		               "the chosen 3D mode '%.24s' cannot apply here; the default is used", name);
+		return;
+	}
+	// Headless: no live remap ran in this process; the choice is what a
+	// session would get - unless it applies only at the next start
+	// (restart_app): then `active` stays what is drawn now, and
+	// `setting` != `active` reads "chosen, waiting for a restart".
+	if (out->source == XRT_STATUS_SOURCE_HEADLESS && row->applies == XRT_STATUS_MODE_3D_APPLIES_NOW) {
+		(void)snprintf(sc->mode_3d.active, sizeof(sc->mode_3d.active), "%s", name);
+		u_status_mode_3d_mark_active(&sc->mode_3d);
+	}
+}
+
 void
 target_status_snapshot_fill_mode_3d_setting(struct xrt_status_snapshot *out)
 {
@@ -779,72 +865,11 @@ target_status_snapshot_fill_mode_3d_setting(struct xrt_status_snapshot *out)
 	}
 	for (uint32_t i = 0; i < out->screen_count && i < XRT_STATUS_MAX_SCREENS; i++) {
 		struct xrt_status_screen *sc = &out->screens[i];
-		if (sc->key[0] == '\0') {
-			continue;
-		}
-		char name[64];
-		enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
-		if (u_setting_get_mode_3d_for_screen(sc->key, name, sizeof(name), &src) == NULL) {
-			// Nothing stored: what chose the slot is the driver's or the runtime's
-			// default, as the builder reported it.
-			sc->mode_3d.setting[0] = '\0';
-			if (sc->mode_3d.source == XRT_STATUS_MODE_3D_SOURCE_USER ||
-			    sc->mode_3d.source == XRT_STATUS_MODE_3D_SOURCE_MACHINE) {
-				sc->mode_3d.source = XRT_STATUS_MODE_3D_SOURCE_DRIVER_DEFAULT;
-			}
-			continue;
-		}
-		(void)snprintf(sc->mode_3d.setting, sizeof(sc->mode_3d.setting), "%s", name);
-		const enum xrt_status_mode_3d_source stored_in = src == U_SETTING_SOURCE_MACHINE
-		                                                     ? XRT_STATUS_MODE_3D_SOURCE_MACHINE
-		                                                     : XRT_STATUS_MODE_3D_SOURCE_USER;
-		if (!sc->mode_3d.valid) {
-			// ADR-047 Amendment 10: keep a stored choice visible on a screen
-			// whose driver declares no 3D modes now (driver changed, unclaimed).
-			sc->mode_3d.active[0] = '\0';
-			sc->mode_3d.choice_count = 0;
-			sc->mode_3d.source = stored_in;
-			(void)snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
-			               "this display's driver declares no 3D modes now");
-			continue;
-		}
-		const struct xrt_status_mode_3d_choice *row = NULL;
-		for (uint32_t k = 0; k < sc->mode_3d.choice_count && k < XRT_STATUS_MAX_MODE_3D_CHOICES; k++) {
-			if (strcmp(sc->mode_3d.choices[k].name, name) == 0) {
-				row = &sc->mode_3d.choices[k];
-			}
-		}
-		// The stored choice is reported where it is stored, whether or not it
-		// is honoured: `source` says which store a reset must clear.
-		sc->mode_3d.source = stored_in;
-		if (row == NULL) {
-			// A name the driver's table does not list (an entry it no longer
-			// declares, a hand-written typo): never honoured, the default is
-			// drawn. Say so, so a reader can offer the reset.
-			sc->mode_3d.reason[0] = '\0';
-			const int w = snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
-			                       "the chosen 3D mode '%s' is not offered by this display's driver; the "
-			                       "default is used",
-			                       name);
-			if (w < 0 || (size_t)w >= sizeof(sc->mode_3d.reason)) {
-				(void)snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
-				               "chosen 3D mode '%.31s' not offered by the driver; default used", name);
-			}
-			continue;
-		}
-		if (row->applies == XRT_STATUS_MODE_3D_APPLIES_NOT_SUPPORTED) {
-			(void)snprintf(sc->mode_3d.reason, sizeof(sc->mode_3d.reason),
-			               "the chosen 3D mode '%.24s' cannot apply here; the default is used", name);
-			continue;
-		}
-		// Headless: no live remap ran in this process; the choice is what a
-		// session would get - unless it applies only at the next start
-		// (restart_app): then `active` stays what is drawn now, and
-		// `setting` != `active` reads "chosen, waiting for a restart".
-		if (out->source == XRT_STATUS_SOURCE_HEADLESS && row->applies == XRT_STATUS_MODE_3D_APPLIES_NOW) {
-			(void)snprintf(sc->mode_3d.active, sizeof(sc->mode_3d.active), "%s", name);
-			u_status_mode_3d_mark_active(&sc->mode_3d);
-		}
+		fill_row_mode_3d_setting(out, sc);
+		// A per-screen preference on the system-default screen moves only
+		// its weaving DP; its 3D-mode table stays the head device's. Say so
+		// rather than show that table as the chosen driver's.
+		(void)u_status_mode_3d_note_driver(sc);
 	}
 }
 
@@ -955,6 +980,7 @@ merge_live_dps(const struct xrt_status_live *live, struct xrt_status_snapshot *o
 	const int hr = screen_index_of(out, def);
 	if (hr >= 0 && live->mode_3d.valid) {
 		out->screens[hr].mode_3d = live->mode_3d;
+		mark_head_driver(&out->screens[hr].mode_3d);
 	}
 }
 

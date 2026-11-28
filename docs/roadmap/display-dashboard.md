@@ -637,7 +637,7 @@ the dashboard's amber state.
 | screen / process | what happens after `dp use --screen` | `apply` |
 |---|---|---|
 | a secondary screen, service path (an IPC app's window spanning onto it) | the CLI asks the service to re-probe (`system_request_display_reprobe`, DIAG); the service re-reads the stores, rebuilds the registry and hands the new screens to every client's segment manager; a screen whose plug-in changed gets its segment DP released and recreated with the new plug-in on the next frames, with the lifecycle's hysteresis (WARN `segments: screen 0x… now claimed by '<id>' (was '<old>') — segment DP recreated`) | `live` |
-| the system-default (primary) screen, service path | the registry changes at once, but the session's own DP never swaps live (plugin-discovery §4.2): the next session the service starts on it — or the service's next start — weaves with the new plug-in | `next-session` |
+| the system-default (primary) screen, service path | the registry changes at once, but the session's own DP never swaps live (plugin-discovery §4.2): the next session the service starts on it — or the service's next start — weaves with the new plug-in. Its 3D-mode table (`mode_3d`) stays the head device's at every time; `mode_3d.reason` says so (ADR-066 C1.3) | `next-session` |
 | any screen, in-process app | in-process apps do not re-probe: every new session resolves the stores at instance create | `next-session` |
 
 No reachable service (none running, or an elevated prompt on Windows): the CLI says
