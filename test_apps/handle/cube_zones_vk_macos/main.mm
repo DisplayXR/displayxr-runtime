@@ -45,6 +45,7 @@
 #include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_display_zones.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "dxr_worst_case.h"  // INV-4.2: size the swapchain once at the stated worst case
 #include "cursor_depth_zones.h" // XR_DXR_cursor_depth on display zones (runtime#1949)
 
 #include <cmath>
@@ -2910,6 +2911,24 @@ static bool CreateSwapchains(AppXrSession& xr) {
     if (scWidth == 0 || scHeight == 0) {
         scWidth = xr.configViews[0].recommendedImageRectWidth * 2;
         scHeight = xr.configViews[0].recommendedImageRectHeight;
+    }
+    // INV-4.2 / ADR-066 Amendment 2: size ONCE at the worst case the runtime
+    // states (XrDisplayRenderingWorstCaseDXR covers every declared entry of
+    // every screen), so a live 3D-mode switch or a move to another screen
+    // retiles into this same swapchain. The panel size above is the fallback
+    // for a runtime that states none (display_info < v28).
+    {
+        const uint32_t startW = scWidth, startH = scHeight;
+        XrDisplayRenderingWorstCaseDXR wc;
+        if (DxrApplyRenderingWorstCase(xr.instance, xr.systemId, xr.hasDisplayInfoExt ? 1 : 0, 0, &scWidth, &scHeight, &wc)) {
+            LOG_INFO("Swapchain at the runtime's worst case: atlas %ux%u (view %ux%u, %u views) -> %ux%u "
+                     "(the panel size alone gave %ux%u)",
+                     wc.maxAtlasWidthPixels, wc.maxAtlasHeightPixels, wc.maxViewWidthPixels,
+                     wc.maxViewHeightPixels, wc.maxViewCount, scWidth, scHeight, startW, startH);
+        } else {
+            LOG_WARN("Runtime states no rendering worst case (XR_DXR_display_info < v28 or no display info): "
+                     "swapchain %ux%u from the panel size", scWidth, scHeight);
+        }
     }
     // Cap at max
     if (scWidth > xr.configViews[0].maxImageRectWidth) scWidth = xr.configViews[0].maxImageRectWidth;
