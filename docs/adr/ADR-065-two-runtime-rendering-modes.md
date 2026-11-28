@@ -154,8 +154,16 @@ would buy switching the kind without restarting 3D apps; it would not buy a smal
 **Decision.** Decision 3 ("`sim_display` starts in 2D") is withdrawn. Project lead, 2026-11-26:
 "sim display should NOT decide for the app, the app decides which mode it starts in."
 
-- Every display driver starts in its 3D slot (index 1), as the hardware drivers always have (the
-  Leia plug-in starts in `LEIA_MODE_3D`). `sim_display` now does the same.
+- The **runtime** owns the start mode of an app that does not ask for one: slot 1 (the 3D slot),
+  for every display driver. It is applied once at system creation, right after the two-slot trim
+  (`u_device_rendering_modes_apply_start_slot`): whatever start index the driver wrote is
+  overridden (one WARN when it differs) and the driver is told through `set_property(OUTPUT_MODE)`
+  so it and its display processor draw that slot. So a vendor plug-in cannot choose an app's start
+  mode either, by design or by accident. The shipping drivers already start there (the Leia plug-in
+  in `LEIA_MODE_3D`; `sim_display` since this amendment), so for them it changes nothing.
+- Exceptions, unchanged: a device pinned by its developer override (`OUTPUT_MODE_PINNED`, i.e.
+  sim-display `FORCE_MODE`), a table with no 3D slot, a refused table, and the existing session
+  floors (a session that cannot fill slot 1 is floored to 2D at begin).
 - The **app** picks its mode: `xrRequestDisplayRenderingModeDXR` (or the user, with V / 0 / 1). A
   driver setting never chooses it for the app.
 - `START_3D` is deprecated: still declared (so stored values and old recipes do not error), no

@@ -566,6 +566,42 @@ u_device_reenforce_two_rendering_modes(struct xrt_device *xdev, const char *driv
 	return enforce(xdev, driver_name, true);
 }
 
+bool
+u_device_rendering_modes_apply_start_slot(struct xrt_device *xdev, const char *driver_name)
+{
+	if (xdev == NULL || xdev->hmd == NULL || xdev->rendering_mode_count < U_RENDERING_MODES_RUNTIME_COUNT) {
+		return false; // no 3D slot to start in
+	}
+	if (!u_rendering_mode_is_flat(&xdev->rendering_modes[0])) {
+		return false; // a refused table (ADR-065): its indices mean nothing to the runtime
+	}
+	const char *name = (driver_name != NULL && driver_name[0] != '\0') ? driver_name : xdev->str;
+	int32_t pinned = 0;
+	if (xrt_device_get_property(xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED, &pinned) == XRT_SUCCESS &&
+	    pinned != 0) {
+		U_LOG_W(
+		    "Display driver '%s': start mode pinned by its developer override (active mode %u) - the runtime's "
+		    "slot-1 start is not applied (ADR-065 Amendment 1)",
+		    name, xdev->hmd->active_rendering_mode_index);
+		return false;
+	}
+	const uint32_t was = xdev->hmd->active_rendering_mode_index;
+	if (was == U_RENDERING_MODE_3D) {
+		return false; // already where the runtime starts every app
+	}
+	U_LOG_W(
+	    "Display driver '%s' started in mode %u; the runtime starts every app in slot 1 ('%s') and the app picks "
+	    "its mode (ADR-065 Amendment 1)",
+	    name, was, xdev->rendering_modes[U_RENDERING_MODE_3D].mode_name);
+	// Write the run-time index, then tell the driver (through the remap wrapper
+	// when one is installed, so it arrives in the driver's numbering). A driver
+	// without OUTPUT_MODE still gets the index: it draws whatever it draws.
+	xdev->hmd->active_rendering_mode_index = U_RENDERING_MODE_3D;
+	(void)xrt_device_set_property(xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)U_RENDERING_MODE_3D);
+	xdev->hmd->active_rendering_mode_index = U_RENDERING_MODE_3D; // a driver may have written its own index
+	return true;
+}
+
 uint32_t
 u_device_rendering_modes_kept_driver_index(struct xrt_device *xdev)
 {

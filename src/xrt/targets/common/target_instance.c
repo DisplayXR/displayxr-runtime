@@ -1511,6 +1511,11 @@ t_instance_create_system(struct xrt_instance *xinst,
 		const struct xrt_plugin_iface *tm_plugin = target_plugin_get_active();
 		(void)u_device_enforce_two_rendering_modes(xsysd->static_roles.head,
 		                                           (tm_plugin != NULL) ? tm_plugin->id : NULL);
+		// ADR-065 Amendment 1: the runtime, not the driver, picks the start
+		// mode of an app that does not ask: slot 1. Once, here; never on the
+		// display-info refresh path below.
+		(void)u_device_rendering_modes_apply_start_slot(xsysd->static_roles.head,
+		                                                (tm_plugin != NULL) ? tm_plugin->id : NULL);
 	}
 
 	// Early out if we only want devices.

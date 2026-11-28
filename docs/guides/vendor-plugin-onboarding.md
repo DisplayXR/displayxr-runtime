@@ -335,6 +335,13 @@ Your `create_device` device declares exactly **two** rendering modes:
 what every app sees (`xrEnumerateDisplayRenderingModesDXR` returns two entries), what V
 toggles between, and what 0 / 1 select.
 
+**You do not choose the mode apps start in.** The runtime starts every app in mode 1 (your 3D
+mode) unless the app asks otherwise (`xrRequestDisplayRenderingModeDXR`): whatever
+`active_rendering_mode_index` your device sets at creation is overridden right after the
+two-slot trim, and your `set_property(OUTPUT_MODE, 1)` is called so your display processor draws
+mode 1 ([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md) Amendment 1). Implement
+`OUTPUT_MODE`, and answer `OUTPUT_MODE_PINNED` true only for a developer pin.
+
 **Declare your 3D kinds as a setting, not as more modes.** If the display supports several
 layouts or weaver variants, add an ENUM to your `describe_settings` (the way sim-display's
 `OUTPUT` selects anaglyph / sbs / squeezed / quad / interlaced / blend), read it through
