@@ -33,6 +33,24 @@ distribution.
   not at scale 1.
 - **Native-Wayland apps without the bridge.** They weave **display-scoped**:
   the phase is right only for a window at the panel's origin, or full screen.
+- **Rotated outputs** (#2844). A portrait-native panel turned to landscape
+  (`monitor = …, transform, 1` or `3`) matches its 3D panel in the presented
+  orientation. On Hyprland the transform comes from the `monitors` reply
+  (item 2 below), and the Wayland window reads it from `wl_output`, so neither
+  path guesses from sysfs. `tests_os_hyprland` covers a Deck-like 800×1280
+  output at transform 3.
+- **Gamepads** (#2845). The evdev reader works without Steam, which is the usual
+  case on Omarchy:
+  - It picks up any pad the kernel tags as a joystick: xpad, hid-playstation,
+    hid-nintendo, and 8BitDo pads in X-input mode.
+  - It maps the face buttons by Xbox position, whatever the pad prints on them.
+  - When Steam is running, it prefers Steam Input's virtual pad over the raw
+    device, so input isn't doubled.
+  - It needs read access to `/dev/input/event*`. On Arch, systemd's
+    `uaccess` rule grants that to the seated user for joysticks, so nothing is
+    added to the `input` group.
+  - The installer registers the provider (`150-gamepad-input-provider.json`),
+    and the PKGBUILD ships it in the tarball.
 
 ## What this work adds
 

@@ -104,3 +104,37 @@ TEST_CASE("os_hyprland: session detection")
 	CHECK_FALSE(os_hyprland_session_detected("Hyprlandx", nullptr));
 	CHECK_FALSE(os_hyprland_session_detected(nullptr, nullptr));
 }
+
+#if defined(__linux__)
+#include "os/os_display_connector_linux.h"
+
+// A Steam Deck (or any portrait-native panel) under Hyprland: the `monitors`
+// mode line is the scanout mode (800x1280), and the transform is the
+// wl_output one. The panel lookup hands that transform to the same mapping the
+// Mutter path uses (#2844), so the quarter turn must survive the parse.
+TEST_CASE("os_hyprland: a quarter-turned panel reaches the rotation mapping")
+{
+	const char *deck = "Monitor eDP-1 (ID 0):\n"
+	                   "\t800x1280@90.00000 at 0x0\n"
+	                   "\tscale: 1.00\n"
+	                   "\ttransform: 3\n"
+	                   "\tdisabled: false\n";
+	os_hyprland_monitor m[1];
+	REQUIRE(os_hyprland_parse_monitors_text(deck, m, 1) == 1);
+	CHECK(m[0].mode_w == 800);
+	CHECK(m[0].mode_h == 1280);
+	CHECK(m[0].transform == 3);
+	CHECK(os_display_rotation_from_mutter(m[0].transform) == OS_DISPLAY_ROTATION_270);
+	CHECK(os_display_rotation_is_quarter(os_display_rotation_from_mutter(m[0].transform)));
+
+	// Flipped-and-turned (5 = flipped 90) is still a quarter turn.
+	CHECK(os_display_rotation_is_quarter(os_display_rotation_from_mutter(5)));
+
+	// A transform Hyprland never sends is unknown, not "no rotation".
+	const char *odd = "Monitor DP-1 (ID 0):\n"
+	                  "\t2560x1600@60.00000 at 0x0\n"
+	                  "\ttransform: 9\n";
+	REQUIRE(os_hyprland_parse_monitors_text(odd, m, 1) == 1);
+	CHECK(os_display_rotation_from_mutter(m[0].transform) == OS_DISPLAY_ROTATION_UNKNOWN);
+}
+#endif

@@ -22,7 +22,7 @@ _pkgname=displayxr-runtime
 pkgver=r0
 pkgrel=1
 pkgdesc="OpenXR runtime for glasses-free 3D displays (DisplayXR), with Hyprland support"
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 url="https://github.com/DisplayXR/displayxr-runtime"
 license=('BSL-1.0')
 depends=('vulkan-icd-loader' 'libxcb' 'libx11' 'libxrandr' 'wayland' 'dbus' 'systemd-libs' 'glibc' 'gcc-libs')
@@ -55,7 +55,7 @@ build() {
 
 check() {
     cd "$_pkgname"
-    ctest --test-dir build --output-on-failure -R 'tests_hgb_payload|tests_os_hyprland|tests_kwgb_payload'
+    ctest --test-dir build --output-on-failure --no-tests=error -R 'tests_hgb_payload|tests_os_hyprland|tests_kwgb_payload|tests_gamepad_evdev_map|tests_aux_display_desktop_select'
 }
 
 package() {
