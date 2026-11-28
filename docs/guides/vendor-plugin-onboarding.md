@@ -327,11 +327,11 @@ behaviour (the runtime uses your `get_predicted_eye_positions` answer unchanged)
 slot opts in to display-time sampling. Contract:
 [eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
 
-### Two rendering modes, and your 3D kinds as a setting (ADR-065)
+### Two rendering-mode slots, and your 3D modes (ADR-065, ADR-066)
 
-Your `create_device` device declares exactly **two** rendering modes:
+Your `create_device` device declares at least **two** rendering modes:
 `rendering_modes[0]` = 2D (1 view, `hardware_display_3d = false`, 1 × 1 tiles) and
-`rendering_modes[1]` = your 3D mode, with `mode_index` equal to the array position. That is
+`rendering_modes[1]` = your 3D mode, with `mode_index` equal to the array position. Two slots are
 what every app sees (`xrEnumerateDisplayRenderingModesDXR` returns two entries), what V
 toggles between, and what 0 / 1 select.
 
@@ -342,19 +342,22 @@ two-slot trim, and your `set_property(OUTPUT_MODE, 1)` is called so your display
 mode 1 ([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md) Amendment 1). Implement
 `OUTPUT_MODE`, and answer `OUTPUT_MODE_PINNED` true only for a developer pin.
 
-**Declare your 3D kinds as a setting, not as more modes.** If the display supports several
-layouts or weaver variants, add an ENUM to your `describe_settings` (the way sim-display's
-`OUTPUT` selects anaglyph / sbs / squeezed / quad / interlaced / blend), read it through
-`get_setting` when you create the device, and fill mode 1 from it. It applies the next time
-the runtime starts — view counts and the worst-case atlas stay fixed for an instance, as
-OpenXR requires, and no app swapchain is ever rebuilt (ADR-010). A variant that changes no
-geometry (a weaver option) can apply live through your own setting without being a kind at
-all. A kind with more than two views is an *inspection* kind: stereo apps cannot fill it and
-fall back to 2D.
+**Several 3D modes: declare them all, apps still see two.** If the display supports several
+layouts or weaver variants the user should be able to pick between, declare each as its own 3D
+entry after mode 0, up to `XRT_MAX_RENDERING_MODES` ([ADR-066](../adr/ADR-066-live-display-driver-settings-envelope-sizing.md)
+C1). The declared list is the sizing envelope; apps still see two slots, and slot 1 is the entry
+the screen's **3D mode** names (`displayxr-cli dp mode set <name> --screen <key>`, or the
+Dashboard's picker), applied live (ADR-066 C1.9). With no stored choice,
+slot 1 is the entry your `get_property(CONFIGURED_3D_MODE)` answers from your current settings
+(sim-display's `OUTPUT`). Which entry slot 1 maps to reaches you through `set_property(OUTPUT_MODE)`
+in your own numbering; mark an entry that needs a restart with `XRT_RENDERING_MODE_FLAG_START_UP_ONLY`
+and put it last. A weaver variant that changes no geometry belongs in the list too when the user
+should pick it per screen: the Leia plug-in's "LeiaSR multi-viewer" entry is one (ADR-066
+Amendment 1). A setting that is not a mode (a tuning value) stays a setting. A kind with more
+than two views is an *inspection* kind: stereo apps cannot fill it and fall back to 2D.
 
-An older plug-in that declares more modes keeps working: the runtime trims the table to
-mode 0 plus one 3D mode (the one active at creation, else the first) and logs a WARN naming
-your plug-in. See [ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md) and
+A plug-in that declares two modes keeps working exactly as under
+[ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md). See
 [`xrt_plugin_iface.md` § create_device](../reference/xrt_plugin_iface.md#create_device).
 
 ### Per-mode tracking capability (`mode_flags`, ABI v3 / #441)

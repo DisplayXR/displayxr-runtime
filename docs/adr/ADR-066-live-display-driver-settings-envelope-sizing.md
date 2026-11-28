@@ -9,7 +9,9 @@ related: [ADR-010, ADR-020, ADR-022, ADR-028, ADR-030, ADR-041, ADR-047, ADR-051
 
 **Status:** Accepted (2026-11-23); C1 (per-screen 3D modes, applied live) and Part B (per-screen
 viewer tracking) implemented 2026-11-24, after runtime v2.70.5 (the QA build) was tagged; C2
-(swapchain recreation) is open.
+(swapchain recreation) is open. [Amendment 1](#amendment-1-2026-11-25-leiasr-multi-viewer-is-a-declared-3d-entry) (2026-11-25) reverses C1.5's
+"multi-viewer stays a driver setting": the vendor plug-in declares "LeiaSR multi-viewer" as a
+second 3D entry where the installed SR runtime can weave it.
 
 **What it changes in other ADRs:**
 
@@ -369,15 +371,18 @@ all claimed screens' drivers (ADR-047 Amendment 10 decision 1, which has the wor
 `u_tiling_compute_system_atlas` already takes its maximum over whatever array it is given; it is
 handed the full list again instead of the two presented slots.
 
-**The vendor plug-in (decided).** The vendor plug-in declares two modes. Its multi-viewer weaving
-used to be a third mode identical to mode 1 except for the weaver option. It is now the
-`MULTI_VIEWER` setting (`system|on|off`), read once per device creation, with a
-`get_setting_status` answer (displayxr-leia-plugin `src/drv_leia/leia_multi_viewer.h`, #446, #575).
-**It stays a driver setting and does not become a declared entry again.** It changes no geometry,
-its `system` value follows a vendor system setting that a fixed entry cannot express, and it applies
-to whichever 3D entry is in slot 1. Making it apply live is the driver's own settings hook (C2.3),
-which is a vendor follow-up, not this ADR. Until then the Dashboard's "next time a 3D app starts"
-note is accurate for it. For the vendor plug-in, then, nothing in C1 changes.
+**The vendor plug-in.** ~~**It stays a driver setting and does not become a declared entry
+again.**~~ *Reversed by [Amendment 1](#amendment-1-2026-11-25-leiasr-multi-viewer-is-a-declared-3d-entry): where the installed SR runtime
+can weave for several viewers, the plug-in declares "LeiaSR multi-viewer" as a second 3D entry, and
+`MULTI_VIEWER` stays as an alias that names the default entry.* (Original text:) The vendor plug-in
+declares two modes. Its multi-viewer weaving used to be a third mode identical to mode 1 except for
+the weaver option. It is now the `MULTI_VIEWER` setting (`system|on|off`), read once per device
+creation, with a `get_setting_status` answer (displayxr-leia-plugin
+`src/drv_leia/leia_multi_viewer.h`, #446, #575). It changes no geometry, its `system` value follows
+a vendor system setting that a fixed entry cannot express, and it applies to whichever 3D entry is
+in slot 1. Making it apply live is the driver's own settings hook (C2.3), which is a vendor
+follow-up, not this ADR. Until then the Dashboard's "next time a 3D app starts" note is accurate for
+it. For the vendor plug-in, then, nothing in C1 changes.
 
 **C1.6 The signal: a new event, `XrEventDataRenderingModeTableChangedDXR`.** This ADR's first draft
 re-used `XrEventDataRenderingModeChangedDXR` with an unchanged index. The cross-box review showed
@@ -512,7 +517,9 @@ generation counter as C1.9 step 2. Service-created swapchains are recreated thro
 create and destroy calls.
 
 C2.3 **A driver settings re-read hook**, for the third case above and for a driver's own non-mode
-settings applied live (the vendor plug-in's `MULTI_VIEWER`, C1.5): a new appended slot,
+settings applied live (the vendor plug-in's `MULTI_VIEWER` was the first example, C1.5; where the
+plug-in declares the multi-viewer entry it now applies live through `CONFIGURED_3D_MODE`,
+[Amendment 1](#amendment-1-2026-11-25-leiasr-multi-viewer-is-a-declared-3d-entry)): a new appended slot,
 `settings_changed(inst, const char *key)` (ADR-020, `XRT_PLUGIN_IFACE_HAS_SETTINGS_CHANGED`). After
 it, the runtime re-reads the driver's list. A driver without the slot keeps today's rule: such a
 setting applies at the next start (ADR-054 Amendment 3's `RESTART_REQUIRED` status). 3D-mode
@@ -598,8 +605,10 @@ options:
 - **Envelope from settings metadata** (a mode descriptor on each ENUM value of `describe_settings`).
   Rejected for the same reason, and because the frozen `xrt_component_setting_desc` cannot carry it
   (ADR-054 Amendment 3 kept it frozen).
-- **Multi-viewer weaving as a declared entry again** (a live switch for free). Rejected (C1.5): it is
-  a weaver policy with a `system` value, not a view layout.
+- ~~**Multi-viewer weaving as a declared entry again** (a live switch for free). Rejected (C1.5): it is
+  a weaver policy with a `system` value, not a view layout.~~ *Adopted by
+  [Amendment 1](#amendment-1-2026-11-25-leiasr-multi-viewer-is-a-declared-3d-entry): the per-screen picker needs a declared entry to offer the
+  choice at all, and "LeiaSR" keeps the `system` behaviour.*
 - **Sparse or tiled virtual swapchains** (reserve the worst case's address space, commit pages on
   demand). Rejected. Support is uneven across platforms: D3D11 tiled resources are an optional tier,
   Metal sparse textures are limited, GL has only a vendor extension. Swapchains also cross processes
@@ -819,3 +828,72 @@ event and the worst-case statement.**
    straddling, or do the demos stay one-set apps? (Stage 1b.)
 9. **Unity's C# surface for the new event**: a separate C# event (`RenderingModeTableChanged`), or
    nothing beyond the native refresh?
+
+## Amendment 1 (2026-11-25): "LeiaSR multi-viewer" is a declared 3D entry
+
+**Decision.** C1.5's "the vendor plug-in declares two modes; multi-viewer stays a driver setting
+and does not become a declared entry again" is reversed, and so is the matching rejected
+alternative. Project lead, 2026-11-25: the Leia plug-in declares "LeiaSR multi-viewer" as a second
+3D entry when the installed SR runtime supports multi-viewer weaving. Implemented in
+[displayxr-leia-plugin#602](https://github.com/DisplayXR/displayxr-leia-plugin/pull/602).
+
+- **The declared list (Windows only).** When the installed SR runtime reports the multi-viewer
+  weave capability, the plug-in declares three entries: `2D`, `LeiaSR` and `LeiaSR multi-viewer`
+  (CLI choice names `leiasr` and `leiasr_multi_viewer`). The two 3D entries have the same views,
+  view scale, tiles, lens and tracking flags, and neither carries `START_UP_ONLY`, so the runtime
+  switches between them live (C1.9). They differ only by the weaver option. Otherwise (an SR runtime
+  without the capability, and the Linux, macOS and Android arms) the plug-in declares exactly the two
+  modes it declared before. Apps see two slots either way (C1.2).
+- **`MULTI_VIEWER` stays, as an alias.** `on` makes "LeiaSR multi-viewer" the default 3D entry of a
+  screen with no stored choice (`CONFIGURED_3D_MODE`, read again on each call, so the runtime applies
+  a change live); `off` and `system` keep "LeiaSR" the default. A stored per-screen choice wins, as
+  for any driver (C1.2).
+- **What each entry weaves.** "LeiaSR" follows the SR system setting (`system`), or forces the
+  override off with `MULTI_VIEWER=off`. "LeiaSR multi-viewer" sets the weaver's multi-viewer override
+  on: it weaves every tracked viewer, up to four, and ignores the viewer cap of the SR system
+  setting. The override is per weaver, an app's choice rather than the system configuration, so it
+  does not change the system setting for other apps.
+- **Graphics APIs.** Only D3D11 and Vulkan apps get multi-viewer weaving. The SR D3D12 and OpenGL
+  weavers weave for one viewer: they refuse the override with one WARN per weaver and keep weaving
+  the primary viewer. The SR capability is runtime-wide, so the entry is offered whatever API an app
+  uses.
+
+**Why C1.5's objection no longer holds.**
+
+1. **The picker needs an entry.** The per-screen 3D mode (C1.2, C1.3) chooses among declared
+   entries. A choice that exists only as a driver setting never appears in `dp mode list` or the
+   Dashboard's 3D-mode picker. With one 3D entry, the picker never appeared on a Leia screen.
+2. **The switch is safe live.** The SR call that sets the override only stores it on the weaver,
+   and the plug-in makes it right before a weave, on change only, so slot 1 can be remapped under a
+   running app with no weaver recreate.
+3. **The two entries are distinct.** C1.5 objected that a fixed entry cannot express `system`.
+   Switching back to "LeiaSR" sends `FOLLOW_CONFIG`, which removes the override, so "LeiaSR" keeps
+   the system-setting behaviour and "LeiaSR multi-viewer" is always on. That is why `MULTI_VIEWER=on`
+   with "LeiaSR" chosen for a screen means "follow the system setting", not on: in a three-entry list
+   `on` only names the default entry.
+
+**Unchanged.** Sizing (C1.5): both 3D entries have the same geometry, so the envelope does not
+grow. The plug-in's two-mode path, its Linux, macOS and Android arms, and every other driver.
+
+**Two notes on the runtime contract, found while implementing #602.** Neither is a bug in the
+shipping paths; both are written down so the next driver with several 3D entries does not trip on
+them.
+
+1. **`set_output_entry` reaches per-screen segment DPs only.** The runtime calls a DP's
+   `set_output_entry` slot (ADR-047 Amendment 10) only on a DP made by a `create_dp_*_for_screen`
+   factory for a **non-primary** segment. The head screen's DP is never told its entry through that
+   slot: the head screen's entry reaches the plug-in through the head device's
+   `set_property(OUTPUT_MODE)`, in the driver's own numbering (through the remap wrapper). A plug-in
+   with several 3D entries must therefore handle both: a DP that was told its entry uses it, and a DP
+   never told follows the head device's entry (what #602 does). The per-API DP headers say
+   "on a segment DP made by a `create_dp_<api>_for_screen` factory"; read that as "never on the head
+   screen's DP".
+2. **A stored per-screen choice is not pushed at instance creation.** At system creation the trim
+   maps slot 1 to the stored choice, but it does not call `set_property(OUTPUT_MODE)`. The start-slot
+   step of [ADR-065 Amendment 1](ADR-065-two-runtime-rendering-modes.md#amendment-1-2026-11-26-the-driver-never-decides-an-apps-start-mode)
+   (`u_device_rendering_modes_apply_start_slot`) does not either: the trim already translates any 3D
+   start index to slot 1, so that step finds nothing to move. The driver first hears which entry slot
+   1 maps to at the session's first `OUTPUT_MODE` (session begin in-process, the service's mode path
+   for an IPC client) or on a live remap (C1.9). Nothing is woven before that, so nothing is drawn
+   wrong today. Until then the driver must not assume that slot 1 is its own configured default:
+   any state it keeps per entry starts from that default and is corrected by the first `OUTPUT_MODE`.
