@@ -155,6 +155,58 @@ struct conv_pack_auth
 	char credential[128]; //!< credential-store name ("" when kind is NONE)
 };
 
+/*
+ * Locally built models (discovery spec §5.6, ADR-057 amendment 2026-11-27):
+ * a model whose `local_build` names a `tool` and `sources` can be built by the
+ * runtime itself, on the user's explicit request (`conv models fetch`), by a
+ * signed builder. The pack keeps these blocks in conv_pack::builds[] (a pack
+ * has at most a few buildable models), indexed from the model.
+ */
+#define CONV_STORE_MAX_BUILDS 8   //!< buildable models per pack
+#define CONV_STORE_MAX_SOURCES 2  //!< `local_build.sources[]` per model
+#define CONV_STORE_MAX_BUILD_OS 4 //!< `local_build.needs.os[]` entries
+
+//! A source's licence (§5.6.1): what `--accept-license` names and the text the user reads.
+struct conv_pack_source_license
+{
+	char id[48];                          //!< what --accept-license must equal; [A-Za-z0-9._-]
+	char name[128];                       //!< shown to the user
+	char link[256];                       //!< the upstream licence at the pinned revision
+	char text[128];                       //!< file name beside the pack manifest (no directory part)
+	char text_sha256[CONV_STORE_SHA_HEX]; //!< of that file; what an acceptance record names
+};
+
+//! One `local_build.sources[]` entry: an upstream file the store downloads for the builder.
+struct conv_pack_source
+{
+	char role[32]; //!< the builder's --source <role>=...
+	char url[CONV_STORE_PATH_MAX];
+	char revision[64]; //!< informational (the url names it)
+	char sha256[CONV_STORE_SHA_HEX];
+	uint64_t size;
+	struct conv_pack_auth auth; //!< §5.5 rules; kind NONE = public
+	struct conv_pack_source_license license;
+};
+
+//! A model's runtime-buildable `local_build` block (§5.6.1).
+struct conv_pack_build
+{
+	uint32_t model; //!< index into conv_pack::models
+	char script_version[32];
+	char recipe[48];  //!< build recipe id; models that share it are built in one run
+	char variant[48]; //!< the builder's --variant that produces this model's files
+	char tool_id[64]; //!< registered id: ModelBuilders\<id> / <id>.json
+	char tool_catalog_id[64];
+	char tool_min_version[32];
+	char tool_signer[32]; //!< "first-party" (the only value today)
+	uint32_t source_count;
+	struct conv_pack_source sources[CONV_STORE_MAX_SOURCES];
+	uint64_t needs_ram_mb;                //!< the build's peak physical memory
+	uint64_t needs_disk_mb;               //!< sources + work files + output, on the store's volume
+	uint32_t os_count;                    //!< 0 = any OS
+	char os[CONV_STORE_MAX_BUILD_OS][32]; //!< "windows>=10.0.19041", "linux", "macos"
+};
+
 struct conv_pack_model
 {
 	char name[64];
@@ -176,6 +228,10 @@ struct conv_pack_model
 	 *  blob is then `build-locally`, not a network failure; a `url` /
 	 *  `blobBaseUrl` still serves as a mirror when one answers. "" = none. */
 	char local_build[128];
+	/*! §5.6: the runtime can build it (its `local_build` carries recipe, variant,
+	 *  tool and sources); conv_pack::builds[build] holds the block. */
+	bool buildable;
+	uint32_t build; //!< index into conv_pack::builds (valid when buildable)
 	uint32_t variant_count;
 	struct conv_pack_variant variants[CONV_STORE_MAX_VARIANTS];
 };
@@ -198,6 +254,8 @@ struct conv_pack
 	struct conv_pack_model models[CONV_STORE_MAX_MODELS];
 	uint32_t default_count;
 	struct conv_pack_default defaults[CONV_STORE_MAX_DEFAULTS];
+	uint32_t build_count;
+	struct conv_pack_build builds[CONV_STORE_MAX_BUILDS]; //!< §5.6 buildable models' blocks
 };
 
 /*!
@@ -249,6 +307,31 @@ conv_pack_load_url(const char *url_or_path, struct conv_pack *out, char *err, si
 const struct conv_pack_model *
 conv_pack_find_model(const struct conv_pack *p, const char *name);
 
+//! The §5.6 build block of @p m (NULL when it is not runtime-buildable).
+const struct conv_pack_build *
+conv_pack_model_build(const struct conv_pack *p, const struct conv_pack_model *m);
+
+/*!
+ * The path of a source licence's text file: `license.text` beside the pack
+ * manifest (§5.6.1). False when the pack was not loaded from a local file.
+ */
+bool
+conv_pack_license_text_path(const struct conv_pack *p,
+                            const struct conv_pack_source_license *l,
+                            char *out,
+                            size_t out_size);
+
+/*!
+ * Hash the licence text file and compare it with `text_sha256`. False (with
+ * @p err) when it is missing, unreadable or another text: no row may then
+ * offer the build (§5.6.1).
+ */
+bool
+conv_pack_license_text_verify(const struct conv_pack *p,
+                              const struct conv_pack_source_license *l,
+                              char *err,
+                              size_t err_size);
+
 
 /*
  *
@@ -260,6 +343,13 @@ struct conv_model_store;
 
 /*! Download progress of one blob, from the worker / calling thread. */
 typedef void (*conv_store_progress_fn)(void *user, const char *sha256, uint64_t done, uint64_t total);
+
+/*!
+ * §5.6.3 / §5.6.4: has this process's user accepted licence @p licence_id
+ * with text hash @p text_sha256? The store asks before it hands out a model
+ * whose `local_build.sources` carry a licence; NULL = never accepted.
+ */
+typedef bool (*conv_store_licence_fn)(void *user, const char *licence_id, const char *text_sha256);
 
 struct conv_model_store_config
 {
@@ -276,6 +366,9 @@ struct conv_model_store_config
 	 *  load (ADR-057 amendment 2026-11-22). DXR_CONV_STORE_FULL_VERIFY=1 in the
 	 *  hosting process turns it on too. */
 	bool full_verify;
+	//! §5.6.3 hand-out rule; NULL = a model with sourced licences is never handed out.
+	conv_store_licence_fn licence_accepted;
+	void *licence_user;
 };
 
 //! Defaults: allow_downloads = true, everything else zero.
@@ -295,6 +388,10 @@ conv_model_store_root(const struct conv_model_store *s);
 //! Replace the policy (allow_downloads / allow_research_only); clears ABSENT(policy) marks.
 void
 conv_model_store_set_policy(struct conv_model_store *s, bool allow_downloads, bool allow_research_only);
+
+//! Replace the licence checker (§5.6.3); clears ABSENT(policy) marks.
+void
+conv_model_store_set_licence_check(struct conv_model_store *s, conv_store_licence_fn fn, void *user);
 
 //! Register a pack (copied). Same pack id again replaces it.
 bool
@@ -501,6 +598,14 @@ conv_store_host_configure(const char *const *pack_paths,
                           uint32_t pack_count,
                           bool allow_downloads,
                           bool allow_research_only);
+
+/*!
+ * The licence checker of the process store (§5.6.3 hand-out); kept across
+ * conv_store_host_configure() calls. The hosts set it to the per-user
+ * acceptance record reader (target_conv_licence_accepted).
+ */
+void
+conv_store_host_set_licence_check(conv_store_licence_fn fn, void *user);
 
 //! The process store (NULL before conv_store_host_configure()).
 struct conv_model_store *

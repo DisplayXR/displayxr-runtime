@@ -7,6 +7,7 @@
  */
 
 #include "conv_model_store.h"
+#include "conv_model_store_internal.h"
 
 #include "os/os_threading.h"
 #include "os/os_time.h"
@@ -573,6 +574,252 @@ conv_pack_find_model(const struct conv_pack *p, const char *name)
 	return NULL;
 }
 
+static bool
+has_scheme(const char *u);
+
+const struct conv_pack_build *
+conv_pack_model_build(const struct conv_pack *p, const struct conv_pack_model *m)
+{
+	if (p == NULL || m == NULL || !m->buildable || m->build >= p->build_count) {
+		return NULL;
+	}
+	return &p->builds[m->build];
+}
+
+//! [A-Za-z0-9._-], 1..n-1 bytes, not "." / "..": usable as a registry value / file-name part.
+static bool
+id_token_valid(const char *s, size_t max)
+{
+	const size_t n = s != NULL ? strlen(s) : 0;
+	if (n == 0 || n >= max || strcmp(s, ".") == 0 || strcmp(s, "..") == 0) {
+		return false;
+	}
+	for (size_t i = 0; i < n; i++) {
+		const char c = s[i];
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+		      c == '_' || c == '-')) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+url_scheme_ok(const char *u)
+{
+	return strncmp(u, "https://", 8) == 0 || strncmp(u, "http://", 7) == 0 || strncmp(u, "file://", 7) == 0;
+}
+
+/*!
+ * §5.6.1: a `local_build` with a `tool` must also carry recipe, variant,
+ * deterministic = true and sources (each with a licence); anything less is a
+ * malformed pack, refused as a whole (fail closed: a half-described build is
+ * never offered).
+ */
+static bool
+parse_build(const cJSON *lb, struct conv_pack *out, struct conv_pack_model *pm, char *err, size_t err_size)
+{
+	const cJSON *tool = cJSON_GetObjectItemCaseSensitive(lb, "tool");
+	if (tool == NULL) {
+		return true; // §5.3's script-only local build: unchanged
+	}
+	if (out->build_count >= CONV_STORE_MAX_BUILDS) {
+		(void)snprintf(err, err_size, "model '%s': more than %d buildable models in one pack", pm->name,
+		               CONV_STORE_MAX_BUILDS);
+		return false;
+	}
+	struct conv_pack_build *b = &out->builds[out->build_count];
+	memset(b, 0, sizeof(*b));
+	b->model = out->model_count;
+	jstr(lb, "script_version", b->script_version, sizeof(b->script_version));
+	jstr(lb, "recipe", b->recipe, sizeof(b->recipe));
+	jstr(lb, "variant", b->variant, sizeof(b->variant));
+	if (!cJSON_IsObject(tool)) {
+		(void)snprintf(err, err_size, "model '%s': local_build.tool is not an object", pm->name);
+		return false;
+	}
+	jstr(tool, "id", b->tool_id, sizeof(b->tool_id));
+	jstr(tool, "catalog_id", b->tool_catalog_id, sizeof(b->tool_catalog_id));
+	jstr(tool, "min_version", b->tool_min_version, sizeof(b->tool_min_version));
+	jstr(tool, "signer", b->tool_signer, sizeof(b->tool_signer));
+	if (!jbool(lb, "deterministic", false)) {
+		(void)snprintf(err, err_size, "model '%s': a buildable local_build must be deterministic", pm->name);
+		return false;
+	}
+	if (!id_token_valid(b->recipe, sizeof(b->recipe)) || !id_token_valid(b->variant, sizeof(b->variant))) {
+		(void)snprintf(err, err_size, "model '%s': local_build needs a recipe and a variant ([A-Za-z0-9._-])",
+		               pm->name);
+		return false;
+	}
+	if (!id_token_valid(b->tool_id, sizeof(b->tool_id)) || b->tool_min_version[0] == '\0') {
+		(void)snprintf(err, err_size, "model '%s': local_build.tool needs an id and a min_version", pm->name);
+		return false;
+	}
+	if (b->tool_signer[0] == '\0') {
+		cpy(b->tool_signer, sizeof(b->tool_signer), "first-party");
+	}
+	if (strcmp(b->tool_signer, "first-party") != 0) {
+		(void)snprintf(err, err_size, "model '%s': local_build.tool.signer '%s' is not 'first-party'", pm->name,
+		               b->tool_signer);
+		return false;
+	}
+	if (pm->url[0] != '\0') {
+		// §5.6.1: a buildable model has no download path for its files.
+		(void)snprintf(err, err_size, "model '%s': a buildable model must not carry a 'url'", pm->name);
+		return false;
+	}
+	const cJSON *sources = cJSON_GetObjectItemCaseSensitive(lb, "sources");
+	if (!cJSON_IsArray(sources) || cJSON_GetArraySize(sources) == 0) {
+		(void)snprintf(err, err_size, "model '%s': local_build.tool needs sources[]", pm->name);
+		return false;
+	}
+	if (cJSON_GetArraySize(sources) > CONV_STORE_MAX_SOURCES) {
+		(void)snprintf(err, err_size, "model '%s': more than %d local_build.sources", pm->name,
+		               CONV_STORE_MAX_SOURCES);
+		return false;
+	}
+	const cJSON *src = NULL;
+	cJSON_ArrayForEach(src, sources)
+	{
+		struct conv_pack_source *sc = &b->sources[b->source_count];
+		jstr(src, "role", sc->role, sizeof(sc->role));
+		jstr(src, "url", sc->url, sizeof(sc->url));
+		jstr(src, "revision", sc->revision, sizeof(sc->revision));
+		jstr(src, "sha256", sc->sha256, sizeof(sc->sha256));
+		lower_inplace(sc->sha256);
+		const cJSON *size = cJSON_GetObjectItemCaseSensitive(src, "size");
+		if (!id_token_valid(sc->role, sizeof(sc->role)) || !url_scheme_ok(sc->url) || !is_sha_hex(sc->sha256) ||
+		    !cJSON_IsNumber(size) || size->valuedouble <= 0) {
+			(void)snprintf(err, err_size,
+			               "model '%s': a source needs a role, an https/http/file url, a sha256 and a size",
+			               pm->name);
+			return false;
+		}
+		sc->size = (uint64_t)size->valuedouble;
+		for (uint32_t k = 0; k < b->source_count; k++) {
+			if (strcmp(b->sources[k].role, sc->role) == 0) {
+				(void)snprintf(err, err_size, "model '%s': duplicate source role '%s'", pm->name,
+				               sc->role);
+				return false;
+			}
+		}
+		const cJSON *auth = cJSON_GetObjectItemCaseSensitive(src, "auth");
+		if (auth != NULL && !cJSON_IsNull(auth)) {
+			char kind[32] = {0};
+			jstr(auth, "kind", kind, sizeof(kind));
+			jstr(auth, "credential", sc->auth.credential, sizeof(sc->auth.credential));
+			if (!cJSON_IsObject(auth) || !conv_pack_auth_kind_parse(kind, &sc->auth.kind) ||
+			    !u_credential_name_valid(sc->auth.credential) || strncmp(sc->url, "https://", 8) != 0) {
+				(void)snprintf(
+				    err, err_size,
+				    "model '%s': source '%s' auth needs a kind, a credential and an https url",
+				    pm->name, sc->role);
+				return false;
+			}
+		}
+		const cJSON *lic = cJSON_GetObjectItemCaseSensitive(src, "license");
+		struct conv_pack_source_license *l = &sc->license;
+		if (cJSON_IsObject(lic)) {
+			jstr(lic, "id", l->id, sizeof(l->id));
+			jstr(lic, "name", l->name, sizeof(l->name));
+			jstr(lic, "link", l->link, sizeof(l->link));
+			jstr(lic, "text", l->text, sizeof(l->text));
+			jstr(lic, "text_sha256", l->text_sha256, sizeof(l->text_sha256));
+			lower_inplace(l->text_sha256);
+		}
+		// The text is a file NAME beside the manifest: never a path out of it.
+		const bool text_ok = l->text[0] != '\0' && strchr(l->text, '/') == NULL &&
+		                     strchr(l->text, '\\') == NULL && strcmp(l->text, "..") != 0 &&
+		                     strcmp(l->text, ".") != 0;
+		if (!id_token_valid(l->id, sizeof(l->id)) || !text_ok || !is_sha_hex(l->text_sha256)) {
+			(void)snprintf(
+			    err, err_size,
+			    "model '%s': source '%s' needs a license with an id, a text file name beside the "
+			    "pack and its text_sha256",
+			    pm->name, sc->role);
+			return false;
+		}
+		b->source_count++;
+	}
+	const cJSON *needs = cJSON_GetObjectItemCaseSensitive(lb, "needs");
+	if (cJSON_IsObject(needs)) {
+		const cJSON *ram = cJSON_GetObjectItemCaseSensitive(needs, "ram_mb");
+		const cJSON *disk = cJSON_GetObjectItemCaseSensitive(needs, "disk_mb");
+		b->needs_ram_mb = cJSON_IsNumber(ram) && ram->valuedouble > 0 ? (uint64_t)ram->valuedouble : 0;
+		b->needs_disk_mb = cJSON_IsNumber(disk) && disk->valuedouble > 0 ? (uint64_t)disk->valuedouble : 0;
+		const cJSON *os = cJSON_GetObjectItemCaseSensitive(needs, "os");
+		const cJSON *o = NULL;
+		cJSON_ArrayForEach(o, os)
+		{
+			if (b->os_count < CONV_STORE_MAX_BUILD_OS && cJSON_IsString(o) && o->valuestring != NULL) {
+				cpy(b->os[b->os_count++], sizeof(b->os[0]), o->valuestring);
+			}
+		}
+	}
+	pm->buildable = true;
+	pm->build = out->build_count++;
+	return true;
+}
+
+bool
+conv_pack_license_text_path(const struct conv_pack *p,
+                            const struct conv_pack_source_license *l,
+                            char *out,
+                            size_t out_size)
+{
+	if (out_size > 0) {
+		out[0] = '\0';
+	}
+	if (p == NULL || l == NULL || l->text[0] == '\0' || p->base_dir[0] == '\0' || has_scheme(p->base_dir)) {
+		return false;
+	}
+	join(out, out_size, p->base_dir, l->text);
+	return true;
+}
+
+bool
+conv_pack_license_text_verify(const struct conv_pack *p,
+                              const struct conv_pack_source_license *l,
+                              char *err,
+                              size_t err_size)
+{
+	char path[CONV_STORE_PATH_MAX];
+	if (!conv_pack_license_text_path(p, l, path, sizeof(path))) {
+		(void)snprintf(err, err_size, "licence '%s': its text is not beside a local pack manifest",
+		               l != NULL ? l->id : "");
+		return false;
+	}
+	FILE *f = fs_open(path, "rb");
+	if (f == NULL) {
+		(void)snprintf(err, err_size, "licence '%s': cannot read %s", l->id, path);
+		return false;
+	}
+	struct u_sha256 h;
+	u_sha256_init(&h);
+	uint8_t buf[16384];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+		u_sha256_update(&h, buf, n);
+	}
+	const bool rd = !ferror(f);
+	fclose(f);
+	uint8_t d[32];
+	u_sha256_final(&h, d);
+	char hex[CONV_STORE_SHA_HEX];
+	for (int i = 0; i < 32; i++) {
+		(void)snprintf(hex + i * 2, 3, "%02x", d[i]);
+	}
+	if (!rd || strcmp(hex, l->text_sha256) != 0) {
+		(void)snprintf(err, err_size, "licence '%s': %s is not the text the pack names (sha256 %.12s…)", l->id,
+		               path, hex);
+		return false;
+	}
+	if (err_size > 0) {
+		err[0] = '\0';
+	}
+	return true;
+}
+
 bool
 conv_pack_parse(const char *json, const char *base_dir, struct conv_pack *out, char *err, size_t err_size)
 {
@@ -745,6 +992,9 @@ conv_pack_parse(const char *json, const char *base_dir, struct conv_pack *out, c
 		}
 		if (pm->url[0] != '\0' && pm->url_sha256[0] == '\0') {
 			(void)snprintf(err, err_size, "model '%s': 'url' given but no file has role 'model'", pm->name);
+			goto done;
+		}
+		if (cJSON_IsObject(lb) && !parse_build(lb, out, pm, err, err_size)) {
 			goto done;
 		}
 		out->model_count++;
@@ -926,6 +1176,8 @@ struct conv_model_store
 	 *  rule): cfg.full_verify or DXR_CONV_STORE_FULL_VERIFY=1. */
 	bool full_verify;
 	uint64_t hash_count; //!< full hashes of a store file (tests: "no hash on load")
+	conv_store_cancel_fn cancel_fn; //!< §5.6.3: a running build's cancel check (NULL = none)
+	void *cancel_user;
 
 	uint32_t pack_count;
 	struct conv_pack *packs; //!< [CONV_STORE_MAX_PACKS]
@@ -1120,14 +1372,22 @@ struct xfer
 	uint64_t total;
 	uint64_t last_ns;
 	uint64_t last_done;
+	conv_store_progress_fn fn; //!< overrides cfg.on_progress when set (a build's source download)
+	void *fn_user;
 };
 
 static bool
 cancelled(struct conv_model_store *s)
 {
 	os_mutex_lock(&s->mtx);
-	const bool c = s->stop;
+	bool c = s->stop;
+	conv_store_cancel_fn fn = s->cancel_fn;
+	void *user = s->cancel_user;
 	os_mutex_unlock(&s->mtx);
+	// §5.6.3: a build's cancel file / signal also stops its source download.
+	if (!c && fn != NULL) {
+		c = fn(user);
+	}
 	return c;
 }
 
@@ -1138,6 +1398,14 @@ xfer_progress(struct xfer *x, uint64_t done, bool last)
 		os_mutex_lock(&x->s->mtx);
 		x->b->done = done;
 		os_mutex_unlock(&x->s->mtx);
+	}
+	if (x->fn != NULL) {
+		const uint64_t t = now_ns();
+		if (last || t - x->last_ns >= 250000000ull) { // at most 4 per second
+			x->last_ns = t;
+			x->fn(x->fn_user, x->sha, done, x->total);
+		}
+		return;
 	}
 	if (x->s->cfg.on_progress == NULL) {
 		return;
@@ -1811,7 +2079,7 @@ conv_pack_load_url(const char *url_or_path, struct conv_pack *out, char *err, si
 	k.limit = max;
 	k.mem = malloc((size_t)max + 1);
 	u_sha256_init(&k.h);
-	struct xfer x = {s, NULL, "manifest", max, 0, 0};
+	struct xfer x = {s, NULL, "manifest", max, 0, 0, NULL, NULL};
 	const enum conv_store_blob_result r =
 	    k.mem != NULL ? fetch_url(s, url_or_path, NULL, &k, &x) : CONV_STORE_BLOB_IO;
 	conv_model_store_destroy(&s);
@@ -1999,7 +2267,7 @@ blob_protocol(struct conv_model_store *s,
 		return CONV_STORE_BLOB_IO;
 	}
 	u_sha256_init(&k.h);
-	struct xfer x = {s, b, sha, size, 0, 0};
+	struct xfer x = {s, b, sha, size, 0, 0, NULL, NULL};
 	xfer_progress(&x, 0, false);
 	enum conv_store_blob_result r = fetch_url(s, url, auth, &k, &x);
 	const bool closed = fclose(k.f) == 0;
@@ -2237,6 +2505,23 @@ conv_model_store_set_policy(struct conv_model_store *s, bool allow_downloads, bo
 	os_mutex_unlock(&s->mtx);
 }
 
+void
+conv_model_store_set_licence_check(struct conv_model_store *s, conv_store_licence_fn fn, void *user)
+{
+	if (s == NULL) {
+		return;
+	}
+	os_mutex_lock(&s->mtx);
+	s->cfg.licence_accepted = fn;
+	s->cfg.licence_user = user;
+	for (uint32_t i = 0; i < CONV_STORE_MAX_BLOBS; i++) {
+		if (s->blobs[i].used && s->blobs[i].st == B_REFUSED) {
+			s->blobs[i].st = B_IDLE;
+		}
+	}
+	os_mutex_unlock(&s->mtx);
+}
+
 bool
 conv_model_store_add_pack(struct conv_model_store *s, const struct conv_pack *p)
 {
@@ -2341,6 +2626,7 @@ struct ref_files
 	uint32_t count;
 	const struct conv_pack_file *files[CONV_STORE_MAX_FILES];
 	const struct conv_pack_model *model; //!< for the licence gate (NULL: none found)
+	const struct conv_pack *pack;        //!< the pack @ref model is in
 	uint32_t main;                       //!< index of the "model" role file
 	struct conv_pack_file sha_only;      //!< storage for a bare-sha ref
 };
@@ -2363,6 +2649,7 @@ ref_lookup_locked(struct conv_model_store *s, const char *ref, struct ref_files 
 							out->count = 1;
 							out->files[0] = &pm->variants[v].files[f];
 							out->model = pm;
+							out->pack = &s->packs[p];
 							return true;
 						}
 					}
@@ -2401,6 +2688,7 @@ ref_lookup_locked(struct conv_model_store *s, const char *ref, struct ref_files 
 			return false;
 		}
 		out->model = pm;
+		out->pack = &s->packs[p];
 		bool have_main = false;
 		for (uint32_t f = 0; f < pv->file_count; f++) {
 			out->files[out->count] = &pv->files[f];
@@ -2468,10 +2756,39 @@ loc_init(struct xrt_conv_model_location *out)
 	}
 }
 
+/*!
+ * §5.6.3 hand-out: a model whose `local_build.sources` carry a licence is
+ * handed out only when this process's user accepted every such licence with
+ * the pack's text hash. No checker configured = not accepted (fail closed).
+ * @p licence_out (may be NULL) names the first licence that is missing. mtx held.
+ */
+static bool
+licence_refuses_locked(struct conv_model_store *s, const struct ref_files *rf, const char **licence_out)
+{
+	const struct conv_pack_build *b = conv_pack_model_build(rf->pack, rf->model);
+	for (uint32_t i = 0; b != NULL && i < b->source_count; i++) {
+		const struct conv_pack_source_license *l = &b->sources[i].license;
+		if (s->cfg.licence_accepted == NULL ||
+		    !s->cfg.licence_accepted(s->cfg.licence_user, l->id, l->text_sha256)) {
+			if (licence_out != NULL) {
+				*licence_out = l->id;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool
 policy_refuses_locked(struct conv_model_store *s, const struct ref_files *rf)
 {
-	return rf->model != NULL && !rf->model->commercial && !s->cfg.allow_research_only;
+	if (rf->model == NULL) {
+		return false;
+	}
+	if (!rf->model->commercial && !s->cfg.allow_research_only) {
+		return true;
+	}
+	return licence_refuses_locked(s, rf, NULL);
 }
 
 bool
@@ -2633,7 +2950,24 @@ conv_model_store_request(struct conv_model_store *s, const char *ref)
 	}
 	os_mutex_unlock(&s->mtx);
 	if (research_refused) {
-		U_LOG_W("[conv-store] model_request('%s') refused: research-only model and AllowResearchOnly is off", ref);
+		const char *lic = NULL;
+		os_mutex_lock(&s->mtx);
+		struct ref_files rf2;
+		if (ref_lookup_locked(s, ref, &rf2) && (rf2.model->commercial || s->cfg.allow_research_only)) {
+			(void)licence_refuses_locked(s, &rf2, &lic);
+		}
+		os_mutex_unlock(&s->mtx);
+		if (lic != NULL) {
+			U_LOG_W(
+			    "[conv-store] model_request('%s') refused: this user has not accepted licence '%s' "
+			    "(§5.6.4)",
+			    ref, lic);
+		} else {
+			U_LOG_W(
+			    "[conv-store] model_request('%s') refused: research-only model and AllowResearchOnly is "
+			    "off",
+			    ref);
+		}
 	} else if (build_locally) {
 		U_LOG_W(
 		    "[conv-store] model_request('%s'): build-locally -- never downloaded: build it locally with %s, "
@@ -2928,6 +3262,266 @@ conv_model_store_pack_summary(struct conv_model_store *s, uint32_t i, struct con
 
 /*
  *
+ * Internal API for the §5.6 builder (conv_model_store_internal.h).
+ *
+ */
+
+void
+conv_store_i_set_cancel(struct conv_model_store *s, conv_store_cancel_fn fn, void *user)
+{
+	os_mutex_lock(&s->mtx);
+	s->cancel_fn = fn;
+	s->cancel_user = user;
+	os_mutex_unlock(&s->mtx);
+}
+
+bool
+conv_store_i_cancelled(struct conv_model_store *s)
+{
+	return cancelled(s);
+}
+
+void
+conv_store_i_blob_paths(const struct conv_model_store *s, const char *sha, char *blob, char *stamp)
+{
+	blob_paths(s, sha, blob, stamp);
+}
+
+void
+conv_store_i_nonce(const struct conv_model_store *s, char *out, size_t n)
+{
+	nonce_of(s, out, n);
+}
+
+void
+conv_store_i_record_pack(struct conv_model_store *s, const struct conv_pack *p)
+{
+	(void)conv_model_store_ensure_root(s);
+	record_pack(s, p);
+}
+
+bool
+conv_store_i_hash_file(struct conv_model_store *s, const char *path, char hex[CONV_STORE_SHA_HEX], uint64_t *bytes)
+{
+	return hash_file(s, path, hex, bytes);
+}
+
+enum conv_store_blob_result
+conv_store_i_download(struct conv_model_store *s,
+                      const char *url,
+                      const struct conv_pack_auth *auth,
+                      const char *sha,
+                      uint64_t size,
+                      const char *dest,
+                      conv_store_progress_fn fn,
+                      void *user)
+{
+	char part[CONV_STORE_PATH_MAX + 8];
+	(void)snprintf(part, sizeof(part), "%s.part", dest);
+	struct sink k;
+	memset(&k, 0, sizeof(k));
+	k.limit = size;
+	k.f = fs_open(part, "wb");
+	if (k.f == NULL) {
+		U_LOG_W("[conv-store] cannot write %s", part);
+		return CONV_STORE_BLOB_IO;
+	}
+	u_sha256_init(&k.h);
+	struct xfer x = {s, NULL, sha, size, 0, 0, fn, user};
+	xfer_progress(&x, 0, true);
+	const struct conv_pack_auth *a = auth != NULL && auth->kind != CONV_PACK_AUTH_NONE ? auth : NULL;
+	enum conv_store_blob_result r = fetch_url(s, url, a, &k, &x);
+	const bool closed = fclose(k.f) == 0;
+	if (r == CONV_STORE_BLOB_OK && !closed) {
+		r = CONV_STORE_BLOB_IO;
+	}
+	if (r == CONV_STORE_BLOB_OK) {
+		xfer_progress(&x, k.written, true);
+		uint8_t d[32];
+		u_sha256_final(&k.h, d);
+		char hex[CONV_STORE_SHA_HEX];
+		for (int i = 0; i < 32; i++) {
+			(void)snprintf(hex + i * 2, 3, "%02x", d[i]);
+		}
+		if (k.written != size || strcmp(hex, sha) != 0) {
+			U_LOG_W("[conv-store] source download %.12s… failed verification (%llu of %llu bytes%s)", sha,
+			        (unsigned long long)k.written, (unsigned long long)size,
+			        k.written == size ? ", wrong hash" : "");
+			r = CONV_STORE_BLOB_BAD_DOWNLOAD;
+		}
+	} else if (k.over) {
+		r = CONV_STORE_BLOB_BAD_DOWNLOAD;
+	}
+	if (r != CONV_STORE_BLOB_OK) {
+		(void)fs_remove(part);
+		return r;
+	}
+	(void)fs_remove(dest);
+	if (fs_rename_noreplace(part, dest) != 0) {
+		(void)fs_remove(part);
+		return CONV_STORE_BLOB_IO;
+	}
+	return CONV_STORE_BLOB_OK;
+}
+
+enum conv_store_blob_result
+conv_store_i_ingest(struct conv_model_store *s, const char *path, const char *sha, uint64_t size)
+{
+	if (!conv_model_store_ensure_root(s)) {
+		return CONV_STORE_BLOB_IO;
+	}
+	char blob[CONV_STORE_PATH_MAX], stamp[CONV_STORE_PATH_MAX];
+	blob_paths(s, sha, blob, stamp);
+	struct fs_stat st;
+	fs_stat(blob, &st);
+	if (st.exists && st.size == size && fs_exists(stamp) && !load_needs_hash(s, blob)) {
+		// Already in the store (another build, a mirror): keep it, drop ours.
+		(void)fs_remove(path);
+		remember_verified(s, sha, size);
+		return CONV_STORE_BLOB_OK;
+	}
+	if (st.exists) {
+		// Not trusted as it is: the entry check decides, and a bad one is deleted.
+		const enum conv_store_blob_result r = check_present(s, sha, size, blob, stamp);
+		if (r == CONV_STORE_BLOB_OK) {
+			(void)fs_remove(path);
+			return r;
+		}
+		if (r != CONV_STORE_BLOB_TAMPERED) {
+			return r;
+		}
+	}
+	(void)fs_remove(stamp);
+	const int rn = fs_rename_noreplace(path, blob);
+	if (rn == 1) {
+		(void)fs_remove(path);
+		return check_present(s, sha, size, blob, stamp);
+	}
+	if (rn != 0) {
+		return CONV_STORE_BLOB_IO;
+	}
+	// The caller hashed these bytes (the entry check); the stamp goes last.
+	if (!write_stamp(stamp, sha, size)) {
+		return CONV_STORE_BLOB_IO;
+	}
+	remember_verified(s, sha, size);
+	return CONV_STORE_BLOB_OK;
+}
+
+bool
+conv_store_i_model_on_disk(struct conv_model_store *s, const struct conv_pack_model *m)
+{
+	return model_on_disk(s, m);
+}
+
+bool
+conv_store_i_referenced_elsewhere(struct conv_model_store *s, const char *pack, const char *model, const char *sha)
+{
+	bool hit = false;
+	os_mutex_lock(&s->mtx);
+	for (uint32_t p = 0; p < s->pack_count && !hit; p++) {
+		for (uint32_t m = 0; m < s->packs[p].model_count && !hit; m++) {
+			const struct conv_pack_model *pm = &s->packs[p].models[m];
+			if (strcmp(s->packs[p].pack, pack) == 0 && strcmp(pm->name, model) == 0) {
+				continue;
+			}
+			for (uint32_t v = 0; v < pm->variant_count && !hit; v++) {
+				for (uint32_t f = 0; f < pm->variants[v].file_count && !hit; f++) {
+					hit = strcmp(pm->variants[v].files[f].sha256, sha) == 0;
+				}
+			}
+		}
+	}
+	os_mutex_unlock(&s->mtx);
+	return hit;
+}
+
+void
+conv_store_i_forget_blob(struct conv_model_store *s, const char *sha)
+{
+	os_mutex_lock(&s->mtx);
+	for (uint32_t i = 0; i < CONV_STORE_MAX_BLOBS; i++) {
+		if (s->blobs[i].used && strcmp(s->blobs[i].sha, sha) == 0 && s->blobs[i].st == B_READY) {
+			s->blobs[i].st = B_IDLE;
+			s->blobs[i].done = 0;
+		}
+	}
+	os_mutex_unlock(&s->mtx);
+}
+
+/* File-system wrappers. */
+
+bool
+conv_store_fs_exists(const char *path)
+{
+	return fs_exists(path);
+}
+
+bool
+conv_store_fs_stat(const char *path, bool *is_dir, uint64_t *size)
+{
+	struct fs_stat st;
+	fs_stat(path, &st);
+	if (is_dir != NULL) {
+		*is_dir = st.is_dir;
+	}
+	if (size != NULL) {
+		*size = st.size;
+	}
+	return st.exists;
+}
+
+FILE *
+conv_store_fs_open(const char *path, const char *mode)
+{
+	return fs_open(path, mode);
+}
+
+bool
+conv_store_fs_remove(const char *path)
+{
+	return fs_remove(path);
+}
+
+bool
+conv_store_fs_mkdir_p(const char *path)
+{
+	return fs_mkdir_p(path);
+}
+
+void
+conv_store_fs_join(char *out, size_t n, const char *a, const char *b)
+{
+	join(out, n, a, b);
+}
+
+bool
+conv_store_fs_write_text(const char *path, const char *text)
+{
+	return fs_write_text(path, text);
+}
+
+char *
+conv_store_fs_read_all(const char *path, size_t max)
+{
+	return fs_read_all(path, max);
+}
+
+void
+conv_store_fs_list(const char *dir, void (*fn)(void *user, const char *name, uint64_t size), void *user)
+{
+	fs_list(dir, fn, user);
+}
+
+int
+conv_store_fs_rename_noreplace(const char *from, const char *to)
+{
+	return fs_rename_noreplace(from, to);
+}
+
+
+/*
+ *
  * Host glue.
  *
  */
@@ -2937,6 +3531,8 @@ static struct
 	bool init;
 	struct os_mutex mtx;
 	struct conv_model_store *store;
+	conv_store_licence_fn licence_fn; //!< §5.6.3 hand-out rule (set before / after configure)
+	void *licence_user;
 } g_host_store;
 
 #ifdef XRT_OS_WINDOWS
@@ -3017,6 +3613,8 @@ conv_store_host_configure(const char *const *pack_paths,
 		}
 		cfg.allow_downloads = allow_downloads;
 		cfg.allow_research_only = allow_research_only;
+		cfg.licence_accepted = g_host_store.licence_fn;
+		cfg.licence_user = g_host_store.licence_user;
 		const char *throttle = getenv("DXR_CONV_STORE_THROTTLE_MS");
 		if (throttle != NULL) {
 			cfg.throttle_ms = (uint32_t)strtoul(throttle, NULL, 10);
@@ -3032,6 +3630,20 @@ conv_store_host_configure(const char *const *pack_paths,
 		if (pack_paths[i] != NULL && pack_paths[i][0] != '\0') {
 			(void)conv_model_store_add_pack_file(g_host_store.store, pack_paths[i]);
 		}
+	}
+	os_mutex_unlock(&g_host_store.mtx);
+}
+
+void
+conv_store_host_set_licence_check(conv_store_licence_fn fn, void *user)
+{
+	if (!host_lock()) {
+		return;
+	}
+	g_host_store.licence_fn = fn;
+	g_host_store.licence_user = user;
+	if (g_host_store.store != NULL) {
+		conv_model_store_set_licence_check(g_host_store.store, fn, user);
 	}
 	os_mutex_unlock(&g_host_store.mtx);
 }

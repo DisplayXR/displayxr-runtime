@@ -70,7 +70,7 @@ target_conv_is_policy_subkey(const char *name)
 	if (name == NULL) {
 		return false;
 	}
-	static const char *const k_names[] = {"Policy", "PreferredProvider", "Prewarm"};
+	static const char *const k_names[] = {"Policy", "PreferredProvider", "Prewarm", "LicenceAccepted"};
 	for (size_t i = 0; i < sizeof(k_names) / sizeof(k_names[0]); i++) {
 #ifdef XRT_OS_WINDOWS
 		if (_stricmp(name, k_names[i]) == 0) {
