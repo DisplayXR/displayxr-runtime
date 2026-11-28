@@ -20,6 +20,7 @@ add_library(
 			    target_viewer_host.c target_viewer_host.h
 			    target_conv_status.c target_conv_status.h
 			    target_conv_store.c
+			    target_conv_build.c target_conv_build.h
 			    target_plugin_loader.c target_plugin_loader.h
 			    target_screens.c target_screens.h
 			    target_screen_modes.c target_screen_modes.h
@@ -38,6 +39,9 @@ target_link_libraries(target_lists PRIVATE displayxr::conversion_core)
 # ADR-053 P4 (#2108): target_conv_store.c (the hosts' model store packs). Only the
 # service and the satellite host reference it, so only they pull the store in.
 target_link_libraries(target_lists PRIVATE displayxr::conversion_store)
+# §5.6.3 (target_conv_build.c): the model builder's provenance rule uses the
+# first-party signer list dxr-get and the CLI share (header only).
+target_include_directories(target_lists PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../get)
 # #1243: target_plugin_loader.c calls vk_bundle_get_abi_size() (defined in
 # aux_vk) to fingerprint-check VK DP plug-ins. Linked here so every consumer
 # of the loader resolves it; guarded because aux_vk only exists with Vulkan.

@@ -239,6 +239,10 @@ if(TARGET target_lists)
 	# (DIAG reply size, generation, CONV_* warnings, `conv list --json`), and the
 	# headless pass + selftest exit-13 path on stub providers.
 	list(APPEND tests tests_conv_snapshot)
+	# §5.6 (ADR-057 amendment 2026-11-27) -- locally built models: the store's
+	# build sequence against a fake builder, the acceptance record, the
+	# builder provenance rule; model_request never builds.
+	list(APPEND tests tests_conv_model_build)
 	# ADR-054 N6 Part 2 -- the viewer arbitration (DP > provider > nominal), the
 	# composed XR_DXR_display_info advertisement, the viewer-policy slot rule,
 	# the -tracking-provider.json router and sim_tracking's script (pure).
@@ -2272,6 +2276,73 @@ set_target_properties(tests_conv_store PROPERTIES CXX_STANDARD 17)
 # the runtime's focus fallback from the splats (provider-agnostic).
 target_link_libraries(tests_conv_lift_camera PRIVATE displayxr::conversion_store xrt-external-cjson)
 set_target_properties(tests_conv_lift_camera PROPERTIES CXX_STANDARD 17)
+
+# §5.6: locally built models. The fake builder implements the §5.6.2 command
+# line; its behaviour is chosen by the variant names the test packs ask for.
+if(TARGET tests_conv_model_build)
+	add_executable(tests_conv_fake_model_builder conv_fake_model_builder.c)
+	target_link_libraries(tests_conv_fake_model_builder PRIVATE aux_util)
+	target_link_libraries(
+		tests_conv_model_build PRIVATE target_lists displayxr::conversion_store xrt-interfaces aux_os
+		)
+	target_include_directories(tests_conv_model_build PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common)
+	set_target_properties(tests_conv_model_build PROPERTIES CXX_STANDARD 17)
+	target_compile_definitions(
+		tests_conv_model_build PRIVATE "FAKE_MODEL_BUILDER=\"$<TARGET_FILE:tests_conv_fake_model_builder>\""
+		)
+	add_dependencies(tests_conv_model_build tests_conv_fake_model_builder)
+
+	# The CLI end to end (conv_build_cli_e2e.cmake): installers and bulk fetches
+	# never build, everywhere; the build itself through the dev override, which
+	# an elevated process (the Windows CI runner) never honours -- so that half
+	# runs on POSIX only. The pack is written here with the fake builder's bytes.
+	if(TARGET cli)
+		set(_cb "${CMAKE_CURRENT_BINARY_DIR}/conv_build_cli")
+		set(_licence "Test licence: research use only.\n")
+		string(REPEAT "dxr-fake-checkpoint\n" 200 _src)
+		string(REPEAT "dxr-fake-output:a\n" 100 _out)
+		file(WRITE "${_cb}/pack/test.licence.txt" "${_licence}")
+		file(WRITE "${_cb}/pack/src/checkpoint.bin" "${_src}")
+		string(SHA256 _licence_sha "${_licence}")
+		string(SHA256 _src_sha "${_src}")
+		string(SHA256 _out_sha "${_out}")
+		string(LENGTH "${_src}" _src_len)
+		string(LENGTH "${_out}" _out_len)
+		set(_src_url "file://${_cb}/pack/src/checkpoint.bin")
+		if(WIN32)
+			set(_src_url "file:///${_cb}/pack/src/checkpoint.bin")
+		endif()
+		file(
+			WRITE "${_cb}/pack/dxr-test-build.models.json"
+			"{ \"schema\": 2, \"pack\": \"dxr-test-build\", \"provider\": \"test\", \"models\": [{\n"
+			"  \"name\": \"m-a\", \"version\": \"1.0.0\", \"task\": \"splats-mono\",\n"
+			"  \"license\": { \"spdx\": \"LicenseRef-test\", \"commercial\": false },\n"
+			"  \"local_build\": { \"script\": \"scripts/export.py\", \"deterministic\": true, \"recipe\": \"fake\",\n"
+			"    \"variant\": \"a\", \"tool\": { \"id\": \"fake-model-builder\", \"catalog_id\": \"test-builder\",\n"
+			"    \"min_version\": \"1.0.0\", \"signer\": \"first-party\" },\n"
+			"    \"sources\": [{ \"role\": \"checkpoint\", \"url\": \"${_src_url}\", \"sha256\": \"${_src_sha}\",\n"
+			"      \"size\": ${_src_len}, \"license\": { \"id\": \"test-licence\", \"name\": \"Test licence\",\n"
+			"      \"link\": \"https://example.invalid/LICENSE\", \"text\": \"test.licence.txt\",\n"
+			"      \"text_sha256\": \"${_licence_sha}\" } }],\n"
+			"    \"needs\": { \"ram_mb\": 16, \"disk_mb\": 1 } },\n"
+			"  \"variants\": [{ \"id\": \"v\", \"files\": [{ \"role\": \"model\", \"format\": \"bin\",\n"
+			"    \"sha256\": \"${_out_sha}\", \"size\": ${_out_len} }] }] }] }\n"
+			)
+		set(_fake "$<TARGET_FILE:tests_conv_fake_model_builder>")
+		if(WIN32)
+			set(_fake "")
+		endif()
+		add_test(
+			NAME conv_models_build_cli_e2e
+			COMMAND
+				${CMAKE_COMMAND} "-DCLI=$<TARGET_FILE:cli>"
+				"-DPACK=${_cb}/pack/dxr-test-build.models.json" "-DWORK=${_cb}/work"
+				"-DFAKE_BUILDER=${_fake}" "-DFAKE_ENV=DXR_MODEL_BUILDER_FAKE_MODEL_BUILDER" -P
+				${CMAKE_CURRENT_SOURCE_DIR}/conv_build_cli_e2e.cmake
+			)
+		add_dependencies(tests_conv_model_build cli)
+	endif()
+endif()
 
 # ADR-053 P1a (#2001): the conversion core's runtime half (hosts, lanes,
 # pipeline, policy, jobs) against a scriptable CPU fake provider.

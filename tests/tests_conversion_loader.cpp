@@ -423,6 +423,8 @@ TEST_CASE("conversion loader: reserved policy subkeys", "[conversion_loader]")
 	CHECK(target_conversion_plugin_is_reserved_subkey("PreferredProvider"));
 	CHECK(target_conversion_plugin_is_reserved_subkey("PREWARM"));
 	CHECK_FALSE(target_conversion_plugin_is_reserved_subkey("Prewarmer"));
+	// §5.6.4: the per-user licence acceptance records (HKCU) are policy, never a provider row.
+	CHECK(target_conversion_plugin_is_reserved_subkey("LicenceAccepted"));
 	CHECK_FALSE(target_conversion_plugin_is_reserved_subkey("sim-conversion"));
 	CHECK_FALSE(target_conversion_plugin_is_reserved_subkey(""));
 	CHECK_FALSE(target_conversion_plugin_is_reserved_subkey(nullptr));
@@ -430,7 +432,7 @@ TEST_CASE("conversion loader: reserved policy subkeys", "[conversion_loader]")
 	while (target_conversion_plugin_reserved_subkeys[n] != nullptr) {
 		n++;
 	}
-	CHECK(n == 3);
+	CHECK(n == 4);
 }
 
 TEST_CASE("conversion loader: Hosting strings", "[conversion_loader]")

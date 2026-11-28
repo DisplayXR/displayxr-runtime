@@ -77,7 +77,9 @@ endif()
 # the store ACL) and the host-op glue both hosts put behind model_resolve /
 # model_request. Its own target: the CLI and both hosts link it, the pure
 # core does not.
-add_library(conv_store STATIC conv_model_store.c conv_model_store.h
+add_library(conv_store STATIC conv_model_store.c conv_model_store.h conv_model_store_internal.h
+	# §5.6 (ADR-057 amendment 2026-11-27): locally built models, the signed builder.
+	conv_model_build.c conv_model_build.h
 	# ADR-057 S1: facts JSON + the convenience camera-block writer (CLI, tests).
 	conv_camera_block.c conv_camera_block.h
 	# XR_DXR_lift spec 6: the runtime's focus of a splat cloud (camera-block fallback).

@@ -8,6 +8,7 @@
  * @ingroup targets_common
  */
 
+#include "target_conv_build.h"
 #include "target_conv_status.h"
 #include "target_conversion_plugin_loader.h"
 
@@ -37,6 +38,8 @@ target_conv_store_configure(const struct xrt_conversion_plugin_entry *entries,
 			n++;
 		}
 	}
+	// §5.6.3 hand-out: a model under a source licence goes only to a user who accepted it.
+	conv_store_host_set_licence_check(target_conv_licence_accepted, NULL);
 	conv_store_host_configure(ptrs, n, policy == NULL || policy->allow_downloads,
 	                          policy != NULL && policy->allow_research_only);
 }

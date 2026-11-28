@@ -66,6 +66,8 @@
 #include "conversion/conv_readiness.h"
 #include "conversion/conv_select.h"
 #include "conversion/conv_model_store.h"
+#include "conversion/conv_model_build.h"
+#include "cli_conv_models_build.h"
 
 #ifdef CLI_HAVE_IPC
 #include "xrt/xrt_results.h"
@@ -1352,20 +1354,32 @@ struct store_guard
 	}
 };
 
-//! `conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]`.
+//! `conv models fetch <pack-url|path|pack-id> [--prefetch] [--model <name> ...] [--installer] [--events]`.
 int
-fetch_one(const char *src, int argc, const char **argv, conv_model_store *s, bool json)
+fetch_one(const char *src_arg, int argc, const char **argv, conv_model_store *s, bool json)
 {
 	const bool prefetch = cli_has_flag(argc, argv, "--prefetch");
 	const bool installer = cli_has_flag(argc, argv, "--installer");
-	const char *only = flag_value(argc, argv, "--model");
+	// §5.6.3: --events streams NDJSON on stdout (the Dashboard's Build); human text goes to stderr.
+	const bool events = cli_has_flag(argc, argv, "--events");
+	json = json || events;
+	const std::vector<std::string> only = cli_flag_values(argc, argv, "--model");
+	std::string src;
+	if (!cli_conv_resolve_pack(src_arg, src)) {
+		return 2;
+	}
 	std::unique_ptr<conv_pack> pack(new conv_pack());
 	char err[192];
-	if (!conv_pack_load_url(src, pack.get(), err, sizeof(err))) {
-		P("conv models fetch: %s\n", err);
+	if (!conv_pack_load_url(src.c_str(), pack.get(), err, sizeof(err))) {
+		fprintf(json ? stderr : stdout, "conv models fetch: %s\n", err);
 		return 2;
 	}
 	cJSON *o = json ? cJSON_CreateObject() : nullptr;
+	if (o != nullptr && events) {
+		// The stream's last line: {"v":1,"event":"result", ...the --json object} (§5.6.3 JSON).
+		cJSON_AddNumberToObject(o, "v", 1);
+		cJSON_AddStringToObject(o, "event", "result");
+	}
 	cJSON *arr = o != nullptr ? cJSON_AddArrayToObject(o, "models") : nullptr;
 	if (o != nullptr) {
 		cJSON_AddStringToObject(o, "pack", pack->pack);
@@ -1374,17 +1388,38 @@ fetch_one(const char *src, int argc, const char **argv, conv_model_store *s, boo
 		P("Pack '%s' (%u models) -> %s\n", pack->pack, pack->model_count, conv_model_store_root(s));
 	}
 	int failed = 0;
+	for (const std::string &name : only) {
+		if (conv_pack_find_model(pack.get(), name.c_str()) == nullptr) {
+			failed++;
+			if (arr != nullptr) {
+				cJSON *e = cJSON_CreateObject();
+				cJSON_AddStringToObject(e, "name", name.c_str());
+				cJSON_AddStringToObject(e, "result", "unknown-model");
+				cJSON_AddItemToArray(arr, e);
+			} else {
+				P("  %-28s unknown-model\n", name.c_str());
+			}
+		}
+	}
+	std::vector<std::string> to_build;
 	for (uint32_t i = 0; i < pack->model_count; i++) {
 		const conv_pack_model &m = pack->models[i];
-		const bool wanted = only != nullptr ? strcmp(only, m.name) == 0 : prefetch ? m.prefetch : true;
+		const bool named = std::find(only.begin(), only.end(), std::string(m.name)) != only.end();
+		const bool wanted = !only.empty() ? named : prefetch ? m.prefetch : true;
 		if (!wanted) {
 			continue;
 		}
 		const char *result;
 		std::string hint;
-		if (installer && !m.commercial) {
+		if (installer && m.buildable) {
+			// §5.6.3: an installer never builds.
+			result = "skipped-buildable";
+		} else if (installer && !m.commercial) {
 			// A signed installer never pre-fetches a non-commercial blob (roadmap §11.1 c).
 			result = "skipped-non-commercial";
+		} else if (m.buildable && named) {
+			to_build.emplace_back(m.name); // §5.6.3: only an explicit --model runs a build
+			continue;
 		} else {
 			const conv_store_blob_result r =
 			    conv_model_store_fetch_model(s, pack.get(), &m, nullptr, /*skip_stamped=*/installer);
@@ -1399,6 +1434,11 @@ fetch_one(const char *src, int argc, const char **argv, conv_model_store *s, boo
 				if (m.local_build[0] != '\0') {
 					hint += std::string("; its bytes are built locally by ") + m.local_build;
 				}
+			} else if (r == CONV_STORE_BLOB_LOCAL_BUILD && m.buildable) {
+				hint = std::string(
+				           "never downloaded: build it on this machine with `displayxr-cli conv models "
+				           "fetch ") +
+				       pack->pack + " --model " + m.name + "`";
 			} else if (r == CONV_STORE_BLOB_LOCAL_BUILD) {
 				hint = std::string("never downloaded: build it locally with ") + m.local_build +
 				       ", which writes it into this store";
@@ -1416,13 +1456,21 @@ fetch_one(const char *src, int argc, const char **argv, conv_model_store *s, boo
 			P("  %-28s %s%s%s\n", m.name, result, hint.empty() ? "" : "  -- ", hint.c_str());
 		}
 	}
+	failed += cli_conv_build_models(s, pack.get(), to_build, argc, argv, json, events, arr);
 	if (o != nullptr) {
 		cJSON_AddNumberToObject(o, "failed", failed);
-		char *t = cJSON_Print(o);
-		P("%s\n", t);
-		cJSON_free(t);
+		if (events) {
+			char *t = cJSON_PrintUnformatted(o);
+			P("%s\n", t);
+			cJSON_free(t);
+		} else {
+			char *t = cJSON_Print(o);
+			P("%s\n", t);
+			cJSON_free(t);
+		}
 		cJSON_Delete(o);
 	}
+	fflush(stdout);
 	return failed > 0 ? 2 : 0;
 }
 
@@ -1462,10 +1510,15 @@ cmd_models(int argc, const char **argv)
 	const char *verb = argc >= 4 && argv[3][0] != '-' ? argv[3] : "list";
 	const bool json = cli_has_flag(argc, argv, "--json");
 	if (strcmp(verb, "list") != 0 && strcmp(verb, "prune") != 0 && strcmp(verb, "verify") != 0 &&
-	    strcmp(verb, "fetch") != 0 && strcmp(verb, "init") != 0) {
+	    strcmp(verb, "fetch") != 0 && strcmp(verb, "init") != 0 && strcmp(verb, "cancel") != 0 &&
+	    strcmp(verb, "remove") != 0 && strcmp(verb, "license") != 0) {
 		P("usage: displayxr-cli conv models list|verify|prune|init [--json] [--root <dir>]\n"
-		  "       displayxr-cli conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]\n"
-		  "                                         [--allow-research-only]\n");
+		  "       displayxr-cli conv models fetch <pack> [--prefetch] [--model <name> ...] [--installer]\n"
+		  "                                         [--allow-research-only] [--accept-license <id> ...]\n"
+		  "                                         [--events] [--json]\n"
+		  "       displayxr-cli conv models cancel|remove <pack> --model <name> [--json]\n"
+		  "       displayxr-cli conv models license accept|withdraw|status <licence-id> [--pack <pack>] "
+		  "[--json]\n");
 		return 1;
 	}
 	char root[512] = "", source[64] = "";
@@ -1490,7 +1543,7 @@ cmd_models(int argc, const char **argv)
 	if (installer) {
 		snprintf(cfg.nonce, sizeof(cfg.nonce), "installer");
 	}
-	if (strcmp(verb, "fetch") == 0 && !json) {
+	if (strcmp(verb, "fetch") == 0 && !json && !cli_has_flag(argc, argv, "--events")) {
 		cfg.on_progress = fetch_progress;
 	}
 	store_guard g;
@@ -1506,6 +1559,16 @@ cmd_models(int argc, const char **argv)
 	}
 	if (strcmp(verb, "fetch") == 0) {
 		return models_fetch(argc, argv, g.s, json);
+	}
+	// §5.6.3: locally built models (cli_conv_models_build.cpp).
+	if (strcmp(verb, "cancel") == 0) {
+		return cli_conv_models_cancel(argc, argv, g.s, json);
+	}
+	if (strcmp(verb, "remove") == 0) {
+		return cli_conv_models_remove(argc, argv, g.s, json);
+	}
+	if (strcmp(verb, "license") == 0) {
+		return cli_conv_models_license(argc, argv, g.s, json);
 	}
 
 	// list / verify / prune: the registered providers' packs.
@@ -1524,12 +1587,15 @@ cmd_models(int argc, const char **argv)
 			return 0;
 		}
 		uint64_t bytes = 0;
+		// §5.6.3 step 6: stale build staging (no live lock, > 24 h, this user's) goes too.
+		const uint32_t staged = conv_model_store_clean_staging(g.s, 24ull * 3600ull);
 		const uint32_t deleted = conv_model_store_prune(g.s, &bytes);
 		if (json) {
-			P("{ \"store_root\": \"%s\", \"pruned\": %u, \"bytes\": %llu }\n", root, deleted,
-			  (unsigned long long)bytes);
+			P("{ \"store_root\": \"%s\", \"pruned\": %u, \"bytes\": %llu, \"staging_deleted\": %u }\n",
+			  root, deleted, (unsigned long long)bytes, staged);
 		} else {
-			P("Pruned %u blob(s), %s, from %s\n", deleted, mb(bytes).c_str(), root);
+			P("Pruned %u blob(s), %s, from %s%s\n", deleted, mb(bytes).c_str(), root,
+			  staged > 0 ? " (and stale build staging)" : "");
 		}
 		return 0;
 	}
@@ -1538,6 +1604,7 @@ cmd_models(int argc, const char **argv)
 	cJSON *o = cJSON_CreateObject();
 	cJSON_AddStringToObject(o, "store_root", root);
 	cJSON_AddStringToObject(o, "source", source);
+	cli_conv_models_list_root(o, g.s, &policy);
 	cJSON *ja = cJSON_AddArrayToObject(o, "packs");
 	if (!json) {
 		P("Model store: %s  (%s)\n", root, source);
@@ -1571,6 +1638,8 @@ cmd_models(int argc, const char **argv)
 			cJSON_AddStringToObject(e, "task", pm.task);
 			cJSON_AddBoolToObject(e, "commercial", pm.commercial);
 			cJSON_AddBoolToObject(e, "prefetch", pm.prefetch);
+			// §5.6.5: what the Dashboard's buildable-model row shows.
+			cli_conv_models_list_model(e, p.get(), &pm, g.s);
 			cJSON *jf = cJSON_AddArrayToObject(e, "files");
 			std::string line;
 			for (uint32_t v = 0; v < pm.variant_count; v++) {
@@ -1635,6 +1704,10 @@ usage(void)
 	P("  models list|verify|prune|init [--json] [--root <dir>]   the runtime-owned model store\n");
 	P("  models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer] [--allow-research-only]\n"
 	  "                                      the write protocol, here (research-only models need the opt-in)\n");
+	P("  models fetch <pack> --model <name> [--accept-license <id>] [--events] [--json]\n"
+	  "                                      a locally built model: runs the signed builder (§5.6)\n");
+	P("  models cancel|remove <pack> --model <name>   stop a running build / delete a model's files\n");
+	P("  models license accept|withdraw|status <licence-id>   this user's licence acceptance record\n");
 	P("  research on|off|status [--machine]  AllowResearchOnly: research-only / unknown-licence models may be\n"
 	  "                                      selected, fetched and loaded (per user; never set by an installer)\n");
 	P("  run <task> <in> [<in-right>] <out> [options]   one splat job, file to file (`conv run` for options)\n");

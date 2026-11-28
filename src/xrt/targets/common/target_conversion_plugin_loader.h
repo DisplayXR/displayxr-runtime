@@ -342,7 +342,10 @@ target_conversion_plugin_resolve_hosting(uint32_t registered, const char *env_va
  * malformed providers -- and a provider can never be registered under one of
  * these ids. One table, shared with the CLI's `conv` code. NULL-terminated.
  */
-#define XRT_CONV_RESERVED_SUBKEYS_INIT {"Policy", "PreferredProvider", "Prewarm", NULL}
+#define XRT_CONV_RESERVED_SUBKEYS_INIT                                                                                 \
+	{                                                                                                              \
+		"Policy", "PreferredProvider", "Prewarm", "LicenceAccepted", NULL                                      \
+	}
 
 //! The reserved-subkey table (see XRT_CONV_RESERVED_SUBKEYS_INIT), NULL-terminated.
 extern const char *const target_conversion_plugin_reserved_subkeys[];

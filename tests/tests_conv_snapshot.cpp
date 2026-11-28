@@ -688,6 +688,7 @@ TEST_CASE("conv headless: policy subkeys are never providers", "[conv_snapshot][
 	CHECK(target_conv_is_policy_subkey("Policy"));
 	CHECK(target_conv_is_policy_subkey("PreferredProvider"));
 	CHECK(target_conv_is_policy_subkey("Prewarm"));
+	CHECK(target_conv_is_policy_subkey("LicenceAccepted"));
 	CHECK_FALSE(target_conv_is_policy_subkey("sim-conversion"));
 	CHECK_FALSE(target_conv_is_policy_subkey(nullptr));
 }

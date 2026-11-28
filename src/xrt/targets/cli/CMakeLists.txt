@@ -76,6 +76,8 @@ add_executable(
 	cli_cmd_camera_calibration.c
 	cli_cmd_conv.cpp
 	cli_cmd_conv_run.cpp
+	cli_conv_models_build.cpp
+	cli_conv_models_build.h
 	cli_cmd_catalog.c
 	cli_component_options.c
 	cli_component_options.h
