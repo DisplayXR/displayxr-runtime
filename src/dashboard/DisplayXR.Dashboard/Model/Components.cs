@@ -632,6 +632,9 @@ public static class Components
     /// </summary>
     public const string ModuleName = "Converter";
 
+    /// <summary>What <c>lift_caps.backend</c> reads when the conversion service, not the display driver, answers.</summary>
+    public const string ConversionServiceBackend = "conversion";
+
     /// <summary>
     /// The converter the display driver reports (<c>info --json</c> <c>lift_caps</c>).
     /// <paramref name="noConverter"/> is <see cref="NoConverterLine"/>: when it is set and the display
@@ -641,7 +644,10 @@ public static class Components
     {
         var items = new List<ComponentItem>();
         var l = info.Lift;
-        bool present = l is { Probed: true, Malformed: false } && (l.Modes != 0 || l.Backend is { Length: > 0 });
+        // backend "conversion" is the runtime's conversion service answering (ipc_server_conv.c): its
+        // providers have their own section. It is not a converter in the display driver.
+        bool service = l?.Backend == ConversionServiceBackend;
+        bool present = l is { Probed: true, Malformed: false } && !service && (l.Modes != 0 || l.Backend is { Length: > 0 });
         if (l is not null && (l.Probed || l.Note.Length > 0))
         {
             var lines = new List<string>();
