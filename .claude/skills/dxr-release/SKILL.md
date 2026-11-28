@@ -93,10 +93,13 @@ for both providers on every release:
   on the runtime it was built at (ADR-063).
 
 `ultraleap` builds on a self-hosted runner that has the Ultraleap SDK, and its repo gates
-the dispatch on the repository variable `DXR_VERSIONS_BUMP=true`. `ultraleap` is not known
-to the signing provider yet, so Phase 3.5 has nothing to dispatch for it (`INST=""`): an
-unsigned provider release is **not listed in the component catalog** (every listed asset
-is signed), so teach the signing provider the component before expecting it there.
+the dispatch on the repository variable `DXR_VERSIONS_BUMP=true`. Phase 3.5 dispatches the
+signing provider's `ultraleap` recipe like any installer component; a provider without that
+recipe fails the run and the release ships unsigned, and an unsigned provider release is
+**not listed in the component catalog** (every listed asset is signed). Its installer name
+carries a build number (`DisplayXRUltraleapSetup-<ver>.<n>.exe`: CI stamps the run number,
+the signing provider stamps 0, the catalog generator picks the highest), so Step 3.5.3
+matches it by pattern and the CI asset is replaced by delete + upload, not `--clobber`.
 `leia-conversion` is signed through Phase 3.5 like any installer component once the signing
 provider's `leia-conversion` recipe is merged; a provider without it returns no
 `DisplayXRLeiaConversionSetup-<version>.exe` and the release ships unsigned.
@@ -856,6 +859,7 @@ case "$COMP" in
   leia-plugin) INST=DisplayXRLeiaSRSetup ;;
   leia-conversion) INST=DisplayXRLeiaConversionSetup ;;
   open-conversion) INST=DisplayXROpenConversionSetup ;;
+  ultraleap)   INST=DisplayXRUltraleapSetup ;;
   mcp)         INST=DisplayXRMCPSetup ;;
   gauss)       INST=DisplayXRGaussianSplatSetup ;;
   modelviewer) INST=DisplayXRModelViewerSetup ;;
@@ -891,6 +895,12 @@ if [ "$SIGNED" = yes ]; then
   # EXACTLY $WANT_EXE (no other .exe) and the bare version inside it.
   GOT_EXES=$(cd _signed 2>/dev/null && for f in *.exe; do [ -f "$f" ] && echo "$f"; done)
   SIGNED_EXE=""
+  # ultraleap is the one component whose installer name carries a build number
+  # (`<Name>-<ver>.<n>.exe`); accept exactly one such file and use its real name.
+  if [ "$COMP" = ultraleap ] && [ "$(echo "$GOT_EXES" | wc -l | tr -d ' ')" = 1 ] &&
+     echo "$GOT_EXES" | grep -Eq "^${INST}-${VER//./[.]}[.][0-9]+[.]exe\$"; then
+    WANT_EXE="$GOT_EXES"
+  fi
   if [ "$GOT_EXES" != "$WANT_EXE" ]; then
     echo "REFUSING: artifact of run $SIGN_RUN holds [${GOT_EXES//$'\n'/, }], expected exactly $WANT_EXE — another component's run? ship unsigned"; SIGNED=no
   elif ! exe_has_version "_signed/$WANT_EXE" "$VER"; then
