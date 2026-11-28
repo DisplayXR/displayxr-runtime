@@ -22,6 +22,7 @@
 
 #include "util/u_misc.h"
 #include "util/u_logging.h"
+#include "util/u_gamescope.h"
 #include "util/u_debug.h"
 
 #include "vk/vk_helpers.h"
@@ -1028,8 +1029,12 @@ struct comp_target *
 comp_window_linux_create(struct comp_compositor *c, const struct comp_window_linux_placement *place)
 {
 	const char *env = getenv("DXR_SERVICE_WINDOW_BACKEND");
-	const bool force_x11 = env != NULL && strcmp(env, "x11") == 0;
 	const bool force_wl = env != NULL && strcmp(env, "wayland") == 0;
+	// SteamOS Game Mode: gamescope's Wayland server is its own (private
+	// protocols, no fractional scale) and games live on its Xwayland, so auto
+	// means X11 there — the surface gamescope composites like any game.
+	const bool gamescope = !force_wl && u_gamescope_session();
+	const bool force_x11 = (env != NULL && strcmp(env, "x11") == 0) || gamescope;
 #ifdef XRT_HAVE_COMP_LINUX_WINDOW_WAYLAND
 	if (!force_x11 && (force_wl || comp_window_linux_wayland_available())) {
 		U_LOG_W("comp_window_linux: native Wayland service surface%s", force_wl ? " (forced)" : "");
@@ -1042,6 +1047,6 @@ comp_window_linux_create(struct comp_compositor *c, const struct comp_window_lin
 		    "backend — using X11");
 	}
 #endif
-	U_LOG_W("comp_window_linux: X11 service surface%s", force_x11 ? " (forced)" : "");
+	U_LOG_W("comp_window_linux: X11 service surface%s", gamescope ? " (gamescope)" : force_x11 ? " (forced)" : "");
 	return comp_window_linux_x11_create(c, place);
 }
