@@ -387,6 +387,7 @@ dxr_acquire_timeout_ns(void)
 #include <vulkan/vulkan_xcb.h>
 #include <X11/Xlib.h>
 #include <vulkan/vulkan_xlib.h> // Xlib surface fallback (#2322)
+#include "os/os_xlib_lock.h"
 #include <xcb/xcb.h>
 #include "comp_vk_native_window_xcb.h"
 // #902: the desktop-Linux vblank-grid source (wp_presentation / X11 Present).
@@ -410,10 +411,22 @@ target_xcb_surface_fn(struct vk_bundle *vk)
 //! The Xlib connection the Xlib-surface fallback builds on (#2322). One per
 //! process, opened on first use and kept open: every VkSurfaceKHR built on it
 //! must not outlive it, and a surface is rebuilt per session.
+//!
+//! The open runs under the runtime's Xlib lock (os_xlib_lock.h): XOpenDisplay
+//! touches Xlib's process-global state, unguarded unless the host called
+//! XInitThreads, and the in-process display hotplug sweep opens its own
+//! connections from another thread. The lock is released before any Vulkan
+//! call builds on the connection.
 static Display *
 target_xlib_display(void)
 {
-	static Display *dpy = XOpenDisplay(NULL); // C++11: initialized once, thread-safe
+	// C++11: initialized once, thread-safe.
+	static Display *dpy = [] {
+		os_xlib_lock();
+		Display *d = XOpenDisplay(NULL);
+		os_xlib_unlock();
+		return d;
+	}();
 	return dpy;
 }
 

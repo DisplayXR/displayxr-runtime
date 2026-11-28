@@ -41,6 +41,8 @@
 #include "util/u_cursor_depth.h"
 #include "util/u_logging.h"
 
+#include "os/os_xlib_lock.h"
+
 #include <dlfcn.h>
 #include <math.h>
 #include <pthread.h>
@@ -335,13 +337,22 @@ read_backing_scale(void)
 		LOOK_DLSYM(x11, open_display, "XOpenDisplay");
 		LOOK_DLSYM(x11, resources, "XResourceManagerString");
 		LOOK_DLSYM(x11, close_display, "XCloseDisplay");
-		void *dpy = open_display != NULL && resources != NULL && close_display != NULL ? open_display(NULL) : NULL;
-		if (dpy != NULL) {
-			const float dpi = u_cursor_parse_xft_dpi(resources(dpy));
-			if (dpi > 0.0f) {
-				scale = dpi / 96.0f;
+		if (open_display != NULL && resources != NULL && close_display != NULL) {
+			// XOpenDisplay / XCloseDisplay touch Xlib's process-global
+			// state, unguarded without XInitThreads: the runtime's Xlib lock
+			// keeps them off the display hotplug sweep's connections
+			// (os_xlib_lock.h). XResourceManagerString reads a field the
+			// open already filled (no request), and the parse is in memory.
+			os_xlib_lock();
+			void *dpy = open_display(NULL);
+			if (dpy != NULL) {
+				const float dpi = u_cursor_parse_xft_dpi(resources(dpy));
+				if (dpi > 0.0f) {
+					scale = dpi / 96.0f;
+				}
+				close_display(dpy);
 			}
-			close_display(dpy);
+			os_xlib_unlock();
 		}
 		// libX11 stays loaded: other code in the process may hold it too.
 	}

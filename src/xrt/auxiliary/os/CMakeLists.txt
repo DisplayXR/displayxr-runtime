@@ -73,7 +73,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# Uses CMAKE_SYSTEM_NAME (the repo idiom) rather than the LINUX variable,
 	# which only exists from CMake 3.25 and would silently evaluate FALSE here
 	# (this project requires 3.22), dropping us to the stub with no diagnostic.
-	target_sources(aux_os PRIVATE os_display_desktop_x11.c)
+	target_sources(aux_os PRIVATE os_display_desktop_x11.c os_xlib_lock.h)
 	# The device mode + compositor scale behind each X11 monitor, by connector
 	# name: Mutter DisplayConfig (libdbus dlopen'd) else DRM sysfs (#1831).
 	target_sources(aux_os PRIVATE os_display_connector_linux.h os_display_connector_linux.c)
