@@ -338,6 +338,30 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     every `<s>` seconds and log each ramp frame (`ModeSwitch trace:`), so you can verify the ramp
     without pressing keys.
 
+- **INV-2.10 — Re-read the rendering-mode table on `XrEventDataRenderingModeTableChangedDXR`.**
+  A screen's 3D mode can change while your app runs (ADR-066): the user picks another 3D mode in
+  the Dashboard or the CLI, and the runtime remaps slot 1 under an **unchanged** active index. So
+  `XrEventDataRenderingModeChangedDXR` (sent on an index change) says nothing; the runtime queues
+  `XrEventDataRenderingModeTableChangedDXR` instead (`XR_DXR_display_info` v27). On it, run the
+  same `xrEnumerateDisplayRenderingModesDXR` read you do at start-up, adopt the event's
+  `activeModeIndex`, and retile: the active mode's view count, tile grid and scale are what moved.
+  Re-read the table on `XrEventDataRenderingModeChangedDXR` too. **Never recreate the swapchain
+  here** (INV-4.9): it was sized once at the stated worst case (INV-4.2), which fits every table.
+  - Wrong: enumerate once after `xrCreateSession` and keep that copy. An app that began in a
+    1-view slot 1 ("Same as 2D") then renders one eye into every tile after a switch to Anaglyph
+    (#2852, fixed in the in-tree apps by #2875).
+  - Right: one enumerate function, called after `xrCreateSession` and from both events'
+    handlers — `EnumerateRenderingModes()` in `test_apps/handle/cube_handle_metal_macos/main.mm`;
+    Android: `enumerate_rendering_modes()` in `test_apps/zones/cube_zones_vk_android`. With
+    displayxr-common, `dxr::ModeTable::refresh()` on `dxr::DecodeRenderingModeTableChanged()`, or
+    drain events through `PollEvents()` (v2.37.0 and later), which does all of it.
+  - **Lint.** `check_displayxr_app.py` checks every leg that reads the table: **error** when the
+    leg never handles the event (no type constant, struct or `DecodeRenderingModeTableChanged`,
+    and no displayxr-common `PollEvents()` call; an app whose own CMake pins displayxr-common
+    below v2.37.0 does not get the `PollEvents()` credit); **warning** when it handles the event
+    but no enumerate, `refresh()`, or call of a function that enumerates appears in the handler
+    (a heuristic over the handler region, the same one INV-4.9 uses).
+
 ---
 
 ## 3. Views — the locate-views gotcha
@@ -526,7 +550,20 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   the session screen's two slots, but the table follows the window to other screens and other 3D
   modes (ADR-047 Amendment 10), so a window moved to a larger screen would overflow a swapchain
   sized from it. Take `max(maxAtlasWidthPixels, loop)` × `max(maxAtlasHeightPixels, loop)`; keep the
-  loop as the fallback for an older runtime (the struct then stays zero).
+  loop as the fallback for an older runtime (the struct then stays zero). A layered (array)
+  swapchain takes the `maxView*` fields. The same applies to a live 3D-mode change (ADR-066): the
+  runtime never asks you to recreate the swapchain (Amendment 2, the `RECREATE_SWAPCHAINS` bit is
+  reserved and never set), so the size you pick at start-up must already cover every table it can
+  switch to. displayxr-common's `CreateSwapchain(xr, arraySize)` does this from v2.37.0
+  (`dxr::SizeFromWorstCase`).
+
+  **Lint (WARN, advisory).** `check_displayxr_app.py` flags a leg that reads the rendering-mode
+  table, submits a projection layer and calls `xrCreateSwapchain` without naming
+  `XrDisplayRenderingWorstCaseDXR` (or `dxr::SizeFromWorstCase`), unless it creates the swapchain
+  through displayxr-common's `CreateSwapchain(XrSessionManager&, ...)`. It is a warning because a
+  text match cannot tell which `xrCreateSwapchain` is the projection one or whether the struct it
+  names reaches the size, and because an app sized from the table still runs (the runtime
+  resamples a view that overflows); it is wrong only on a larger screen or 3D mode.
 
 - **INV-4.3 — Per-tile render size = window (canvas) × scaleXY, NEVER display size.** This is
   the one you called out. `scaleX/Y` is the **active mode's** `viewScaleX/Y`.
@@ -663,6 +700,15 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `viewConfigurationType` (the event is instance-level and carries no `XrSession`), and expect at
   most one event per view configuration per second — the runtime coalesces, as the spec requires.
   Advisory rule (WARN). Ref: `#1488`.
+
+  **The same holds, with no exception, for `XR_DXR_display_info`'s mode events**
+  (`XrEventDataRenderingModeTableChangedDXR`, `XrEventDataRenderingModeChangedDXR`). ADR-066
+  Amendment 2 dropped swapchain recreation (C2/C3 are not planned): the
+  `XR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR` flag is reserved and never set, so
+  there is no case in which these handlers create a swapchain. Re-read the table (INV-2.10) and
+  move the rects inside the swapchain you sized at the stated worst case (INV-4.2). The linter
+  reports `xrCreateSwapchain` in one of these handlers as an **error**, and code that branches on
+  the reserved bit as a warning (a recreate path that can never run).
 
 - **INV-4.10 — Vulkan: keep ≥2 frames in flight, ONE `vkQueueSubmit` per frame, never wait the
   frame you just submitted.** How you feed the GPU is part of rendering correctly into the
@@ -1214,13 +1260,14 @@ macOS app (no manifest → no Android findings).
 - [ ] Window passed for handle/texture, NULL for hosted (INV-1.1); HWND kept even in texture mode (INV-1.2)
 - [ ] Display info queried once via `XrSystemProperties`, treated as static (INV-2.1)
 - [ ] Modes enumerated; active mode tracked via the *event*, not set locally (INV-2.4); per-mode state re-derived each frame (INV-2.6)
+- [ ] Table re-read on `XrEventDataRenderingModeTableChangedDXR` (and on the mode-changed event), adopting its `activeModeIndex` — or events drained through displayxr-common >= v2.37.0 `PollEvents()` (INV-2.10)
 - [ ] (MANUAL eye tracking) `XrEventDataEyeTrackingStateChangedDXR` handled — own transition + 2D mode request on loss (INV-2.8)
 - [ ] View configuration chosen at startup: N-view app begins `PRIMARY_MULTIVIEW_DXR` (when enumerated), stereo-fixed app stays on `PRIMARY_STEREO`; `xrLocateViews` into an 8-wide buffer; **render** `eyeCount` from the active mode, not 2 (INV-3.1)
 - [ ] Projection layer **submits the LOCATED count**, with the inactive tail aliased via `DxrAliasInactiveViews()` — including every 3D zone layer (INV-3.4)
-- [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
+- [ ] App swapchain sized once at the worst case the runtime states (`XrDisplayRenderingWorstCaseDXR`, mode loop as the fallback), never recreated (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
 - [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); a linear/UNORM swapchain is read as LINEAR and encoded by the runtime (display-referred bytes in it wash out); same `_SRGB`-first choice on every leg; data textures always linear (INV-4.6)
 - [ ] Whole declared `imageRect` is written — partial-tile renders clear the full tile to `(0,0,0,0)` first (or shrink the rect); no undefined pixels reach the atlas, esp. transparent-bg (INV-4.7)
-- [ ] (if `XR_EXT_view_configuration_views_change` is enabled) the handler re-enumerates and **moves `subImage.imageRect`** — no `xrCreateSwapchain` from the event; filters on `systemId` **and** `viewConfigurationType` (INV-4.9)
+- [ ] No `xrCreateSwapchain` from any event handler: the rendering-mode / mode-table events re-read and retile; (if `XR_EXT_view_configuration_views_change` is enabled) its handler re-enumerates and **moves `subImage.imageRect`**, filtering on `systemId` **and** `viewConfigurationType` (INV-4.9)
 - [ ] (Vulkan) ≥2 frames in flight, ONE `vkQueueSubmit` per frame, no wait on the frame just submitted, no `vkQueueWaitIdle`/`vkDeviceWaitIdle` on the frame path, command buffers allocated once — `dxr::VkFrameRing` (INV-4.10)
 - [ ] (texture) regions declared via display-zones — 3D zones + Local2D zones, not output-rect/surround (INV-5.1/5.3)
 - [ ] (texture) shared surface sized once to worst-case; full composite presented (INV-5.2)

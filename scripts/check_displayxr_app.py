@@ -20,6 +20,7 @@ Usage:
     check_displayxr_app.py test_apps/handle/cube_handle_d3d11_win
     check_displayxr_app.py <dir> --strict       # warnings also fail (exit 1)
     check_displayxr_app.py --list-rules         # print the rule catalog
+    check_displayxr_app.py <dir> --rules INV-2.10,INV-4.2   # only these rule ids
 
 Exit 0 = clean (no errors; warnings allowed unless --strict).
 Exit 1 = at least one error (or any warning under --strict).
@@ -59,12 +60,14 @@ RULES = {
     "F-1": "Run the frame loop from READY, gated on a 'session running' flag (not SYNCHRONIZED+); a compliant runtime only leaves READY on your first xrBeginFrame, so a SYNCHRONIZED+ gate deadlocks (black screen).",
     "INV-2.8": "Apps requesting MANUAL eye tracking SHOULD handle XrEventDataEyeTrackingStateChangedDXR (tracking loss is the app's problem in MANUAL).",
     "INV-2.9": "Apps that request rendering modes SHOULD ease the switch through displayxr-common's dxr::ModeSwitch (step() per frame, or XrSessionUpdateModeSwitch on Windows): the runtime switches in one frame and never ramps the disparity, so a direct xrRequestDisplayRenderingModeDXR on a key press snaps between full parallax and flat. Checked per leg.",
+    "INV-2.10": "Apps that read the rendering-mode table MUST handle XrEventDataRenderingModeTableChangedDXR (display_info v27) and re-read the table on it: a screen's 3D mode can change while the app runs and the active index stays the same (ADR-066). Handled for you by displayxr-common >= v2.37.0 PollEvents(). ERROR when the event is never handled; WARN (heuristic) when the handler does not appear to re-read. Checked per leg.",
     "INV-3.1": "An N-view app BEGINS XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (when enumerated; needs XR_DXR_display_info), locates into an XRT_MAX_VIEWS (8)-wide buffer and submits the active mode's viewCount. A stereo-fixed app stays on PRIMARY_STEREO and receives exactly 2. Deriving eyeCount from the rendering mode's viewCount without the opt-in is an error: PRIMARY_STEREO reports 2 and rejects viewCount>2.",
     "INV-3.4": "A projection layer carries the LOCATED view count (what xrLocateViews returned), for every view configuration type. Render only the active mode's views, then alias the inactive tail [active, located) onto view 0's subImage keeping each view's own located pose/fov (DxrAliasInactiveViews in dxr_view_config.h: test_apps/common in-tree, displayxr-common outside). Checked per leg: every platform directory of a multi-leg app must call it itself. Submitting the ACTIVE count is under-submit and xrEndFrame now refuses it (ADR-041). A 3D zone layer is a projection layer and obeys the same rule.",
+    "INV-4.2": "Size the projection swapchain ONCE at the worst case the runtime states, XrDisplayRenderingWorstCaseDXR chained on XrSystemProperties (display_info v28), falling back to the mode loop when it is zero; never recreate (ADR-066 Amendment 2). Sized for you by displayxr-common >= v2.37.0 CreateSwapchain(). Advisory (WARN) heuristic: a leg that reads the mode table, submits a projection layer and calls xrCreateSwapchain without naming the struct is flagged. Checked per leg.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
     "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode. A UNORM swapchain is read as LINEAR and encoded by the runtime (#1589), so display-referred bytes in it wash out. Checked per leg: every platform directory must choose _SRGB first.",
     "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
-    "INV-4.9": "An app that enables XR_EXT_view_configuration_views_change must not call xrCreateSwapchain from its event handler — move subImage.imageRect instead (an app sized at maxImageRect* per ADR-010 never needs to reallocate).",
+    "INV-4.9": "Never call xrCreateSwapchain from an event handler — move subImage.imageRect instead. ERROR in an XR_DXR_display_info rendering-mode / mode-table event handler (ADR-066 Amendment 2: swapchains are never recreated, no exception; branching on the reserved RECREATE_SWAPCHAINS bit is a WARN); WARN in an XR_EXT_view_configuration_views_change handler (an app sized at maxImageRect* per ADR-010 never needs to reallocate).",
     "INV-4.10": "(Vulkan) Frame-submit discipline: >=2 frames in flight, ONE vkQueueSubmit per frame per queue, never wait the fence of the frame just submitted, no vkQueueWaitIdle/vkDeviceWaitIdle on the frame path, command buffers allocated once and reset (dxr::VkFrameRing, displayxr-common >= v2.28.0). Advisory (WARN). Heuristic: per enclosing function of each vkQueueSubmit (brace-matched; +-60-line window fallback), judged only when the function is on the frame path (draw/render pass/dispatch/xrWaitFrame/xrBeginFrame/xrEndFrame, or a render/draw/frame/present name); exempt with `// dxr-lint: allow-blocking-submit <reason>` on the submit or function-header line.",
     "INV-5.9": "VK apps MUST use XR_KHR_vulkan_enable2 (the runtime creates the VkDevice via xrCreateVulkanDeviceKHR); an app-side vkCreateDevice = enable1, which forfeits the #868 weave-rate decoupling and the late-weave pacing.",
     "INV-7.x": "Capture via xrCaptureAtlasDXR — never reintroduce an app-side CaptureAtlasRegion* readback.",
@@ -863,27 +866,37 @@ def _inv49_handler_region(lines: list, idx: int) -> tuple:
 
 
 def check_views_change_realloc(root: Path, findings: list):
-    """INV-4.9 (advisory) — XR_EXT_view_configuration_views_change <-> no realloc.
+    """INV-4.9 — never reallocate a swapchain from an event handler.
 
-    An app that enables the Khronos view-size doorbell must respond by MOVING
-    ``subImage.imageRect``, not by tearing down and recreating swapchains. Every
-    DisplayXR app sizes its swapchain at ``maxImageRect*`` (ADR-010), which the
-    extension forbids the runtime from ever changing — so, in the spec's own
-    words, *an app that sized at maxImageRect* never needs to reallocate*.
-    Reallocating on the event is the LÖVR shape (``createSwapchains()`` fired
-    unconditionally from the handler) and reintroduces exactly the stutter the
-    worst-case swapchain exists to prevent (runtime#1488 Design 7 / R1).
+    Two families of event, one rule: the response to "the views / the mode
+    table changed" is to re-read and MOVE ``subImage.imageRect``, never to tear
+    down and recreate swapchains.
 
-    Conservative trigger, both halves required:
-      1. some source enables the extension (macro or the literal string), AND
-      2. ``xrCreateSwapchain`` appears inside the handler REGION of a mention of
-         ``XR_TYPE_EVENT_DATA_VIEW_CONFIGURATION_VIEWS_CHANGED_EXT`` — region as
-         defined by ``_inv49_handler_region`` above (enclosing ``case``/``if``
-         block, clamped to ±VIEWS_CHANGE_WINDOW lines).
+    1. XR_EXT_view_configuration_views_change (advisory, WARN; runtime#1488).
+       An app that enables the Khronos view-size doorbell must respond by moving
+       the rect. Every DisplayXR app sizes its swapchain at ``maxImageRect*``
+       (ADR-010), which the extension forbids the runtime from ever changing —
+       so, in the spec's own words, *an app that sized at maxImageRect* never
+       needs to reallocate*. Reallocating on the event is the LÖVR shape
+       (``createSwapchains()`` fired unconditionally from the handler).
+       Both halves required: some source enables the extension (macro or the
+       literal string), AND ``xrCreateSwapchain`` appears inside the handler
+       REGION of ``XR_TYPE_EVENT_DATA_VIEW_CONFIGURATION_VIEWS_CHANGED_EXT``.
+       An app that enables the extension and never mentions the event type does
+       not fire: ignoring the event is an explicit ``may:`` in the spec.
 
-    An app that enables the extension and never mentions the event type does not
-    fire: ignoring the event is an explicit ``may:`` in the spec, and a
-    max-sized app is correct doing nothing at all.
+    2. XR_DXR_display_info's mode events (ERROR; ADR-066 Amendment 2).
+       ``XrEventDataRenderingModeTableChangedDXR`` (v27) and
+       ``XrEventDataRenderingModeChangedDXR``. Swapchains are never recreated:
+       the app sized once at the stated worst case (INV-4.2), so every table the
+       runtime can hand it fits. There is no exception any more — the
+       RECREATE_SWAPCHAINS bit ADR-066 C2 reserved is never set (C2/C3 are not
+       planned). No extension gate: these events come with display_info itself.
+       An app that branches on the reserved bit is also flagged (WARN): it is
+       building a recreate path that can never run and should not exist.
+
+    Region as defined by ``_inv49_handler_region`` (enclosing ``case``/``if``
+    block, clamped to VIEWS_CHANGE_WINDOW lines).
     """
     files = []
     enables = False
@@ -900,27 +913,349 @@ def check_views_change_realloc(root: Path, findings: list):
             enables = True
         files.append((p, text))
 
-    if not enables:
-        return
-
     for path, text in files:
         lines = text.splitlines()
-        for m in VIEWS_CHANGE_EVENT_RE.finditer(text):
+        if enables:
+            for m in VIEWS_CHANGE_EVENT_RE.finditer(text):
+                idx = text.count("\n", 0, m.start())
+                start, end = _inv49_handler_region(lines, idx)
+                for i in range(start, end):
+                    if "xrCreateSwapchain" not in lines[i]:
+                        continue
+                    findings.append(Finding(
+                        WARN, "INV-4.9", rel(path, root), i + 1,
+                        "xrCreateSwapchain inside the XR_EXT_view_configuration_views_change "
+                        "handler — the event never requires a reallocation.",
+                        "Re-enumerate and MOVE subImage.imageRect instead. maxImageRect* is "
+                        "immutable under this extension (and under ADR-010), so a swapchain "
+                        "sized at max never needs recreating; tearing it down on every resize "
+                        "is the stutter the worst-case sizing exists to prevent.",
+                    ))
+                    break  # one finding per handler region is enough
+
+        for m in MODE_EVENT_RE.finditer(text):
             idx = text.count("\n", 0, m.start())
+            if _is_declaration_line(lines[idx]):
+                continue
             start, end = _inv49_handler_region(lines, idx)
             for i in range(start, end):
                 if "xrCreateSwapchain" not in lines[i]:
                     continue
                 findings.append(Finding(
-                    WARN, "INV-4.9", rel(path, root), i + 1,
-                    "xrCreateSwapchain inside the XR_EXT_view_configuration_views_change "
-                    "handler — the event never requires a reallocation.",
-                    "Re-enumerate and MOVE subImage.imageRect instead. maxImageRect* is "
-                    "immutable under this extension (and under ADR-010), so a swapchain "
-                    "sized at max never needs recreating; tearing it down on every resize "
-                    "is the stutter the worst-case sizing exists to prevent.",
+                    ERROR, "INV-4.9", rel(path, root), i + 1,
+                    "xrCreateSwapchain inside a rendering-mode event handler "
+                    f"({m.group(0)}) — DisplayXR never asks an app to recreate its swapchains "
+                    "(ADR-066 Amendment 2).",
+                    "Keep the swapchain. Re-read xrEnumerateDisplayRenderingModesDXR and retile: "
+                    "move each view's subImage.imageRect inside the swapchain you sized once at "
+                    "the stated worst case (XrDisplayRenderingWorstCaseDXR, INV-4.2), which every "
+                    "table the runtime can switch to fits. Recreating there is a hitch on every "
+                    "3D-mode change and races the frames still in flight.",
                 ))
-                break  # one finding per handler region is enough
+                break
+
+        for m in RECREATE_BIT_RE.finditer(text):
+            idx = text.count("\n", 0, m.start())
+            if _is_declaration_line(lines[idx]):
+                continue
+            findings.append(Finding(
+                WARN, "INV-4.9", rel(path, root), idx + 1,
+                "App branches on XR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR, a "
+                "reserved bit no runtime sets (ADR-066 Amendment 2: C2/C3 not planned).",
+                "Delete the recreate path. On XrEventDataRenderingModeTableChangedDXR re-read the "
+                "table and retile; the swapchain sized at the stated worst case (INV-4.2) already "
+                "fits every table.",
+            ))
+            break
+
+
+# ---------------------------------------------------------------------------
+# INV-2.10 / INV-4.2 — the live rendering-mode table (ADR-066).
+#
+# A screen's 3D mode can change while an app runs. The runtime remaps slot 1 and
+# queues XrEventDataRenderingModeTableChangedDXR (XR_DXR_display_info v27) under
+# an UNCHANGED active index, so XrEventDataRenderingModeChangedDXR says nothing.
+# The app must re-read the table on the event and retile (INV-2.10), into the
+# swapchain it sized ONCE at the worst case the runtime states,
+# XrDisplayRenderingWorstCaseDXR chained on XrSystemProperties (v28, INV-4.2).
+# Swapchains are never recreated (INV-4.9). Twice in one week the in-tree test
+# apps broke this: they read the table once at start-up (#2875), and sized
+# from the start-up table.
+#
+# Scope ("such an app"): a leg that READS the rendering-mode table. Reading it
+# needs XR_DXR_display_info, so a legacy app (no display_info) and a weave
+# probe that never enumerates are out of scope by construction.
+#
+# displayxr-common's session code does both from v2.37.0: PollEvents() handles
+# the table-changed event (XrSessionHandleRenderingModeTableChanged) and
+# CreateSwapchain(XrSessionManager&, ...) sizes from the worst case
+# (dxr::SizeFromWorstCase). Common usage is detected the way INV-2.8 does it —
+# by the call, since common/ itself is never linted — and refused when the app's
+# own CMake pins displayxr-common below v2.37.0.
+# ---------------------------------------------------------------------------
+MODE_EVENT_RE = re.compile(
+    r"\bXR_TYPE_EVENT_DATA_RENDERING_MODE_(?:TABLE_)?CHANGED_DXR\b"
+)
+RECREATE_BIT_RE = re.compile(r"\bXR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR\b")
+TABLE_READ_RE = re.compile(
+    MODE_ENUM_MARKER.pattern + r"|\bModeTable\b|\bXrSessionRefreshRenderingModes\b"
+)
+TABLE_EVENT_RE = re.compile(
+    r"\bXR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR\b"
+    r"|\bXrEventDataRenderingModeTableChangedDXR\b"
+    r"|\bDecodeRenderingModeTableChanged\b"
+)
+# A call (not a PFN typedef / declaration / proc-address string) of the enumerate.
+TABLE_ENUM_CALL_RE = re.compile(r"\b\w*EnumerateDisplayRenderingModes\w*\s*\(\s*[\w&*(]")
+TABLE_ENUM_DECL_RE = re.compile(
+    r"\bPFN_\w*EnumerateDisplayRenderingModes|XRAPI_\w+\s+\w*EnumerateDisplayRenderingModes"
+)
+# Other re-read spellings: displayxr-common's dxr::ModeTable::refresh() and the
+# Windows XrSessionManager wrapper.
+TABLE_REFRESH_RE = re.compile(r"(?:\.|->)\s*refresh\s*\(|\bXrSessionRefreshRenderingModes\s*\(")
+COMMON_POLL_CALL_RE = re.compile(r"\bPollEvents\s*\(|\bXrSessionHandleRenderingModeTableChanged\s*\(")
+COMMON_POLL_DEF_RE = re.compile(r"\b(?:bool|void)\s+PollEvents\s*\([^;)]*\)\s*\{")
+COMMON_SWAPCHAIN_CALL_RE = re.compile(r"(?<![\w.>:])CreateSwapchain\s*\(\s*\*?\s*\w+\s*[,)]")
+COMMON_SWAPCHAIN_DEF_RE = re.compile(r"\b\w+[\s*&]+CreateSwapchain\s*\([^;)]*\)\s*\{")
+WORST_CASE_RE = re.compile(
+    r"\bXrDisplayRenderingWorstCaseDXR\b|\bXR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR\b"
+    r"|\bSizeFromWorstCase\b"
+)
+COMMON_MIN_VERSION = (2, 37, 0)
+COMMON_PIN_RE = re.compile(
+    r"displayxr-common(?:\.git)?[\s\S]{0,600}?GIT_TAG\s+\"?v?(\d+)\.(\d+)\.(\d+)"
+)
+
+
+def _is_declaration_line(line: str) -> bool:
+    """A #define / typedef / static const line names a token without using it
+    (a vendored fallback definition, like displayxr-common's mode_table.h)."""
+    s = line.strip()
+    return s.startswith("#") or s.startswith("typedef") or s.startswith("static const")
+
+
+def common_pins(root: Path) -> dict:
+    """leg -> (version, file) of the displayxr-common release the app's own CMake
+    pins (FetchContent GIT_TAG vX.Y.Z). A pin inside a leg directory applies to
+    that leg, a pin elsewhere (key "") to every leg without its own. Empty when
+    the app pins none: an in-tree test app gets displayxr-common from
+    test_apps/common, which is kept at a current tag."""
+    pins: dict = {}
+    for p in sorted(list(root.rglob("CMakeLists.txt")) + list(root.rglob("*.cmake"))):
+        if is_excluded(p, root):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        m = COMMON_PIN_RE.search(text)
+        if m:
+            pins.setdefault(leg_of(p, root), (tuple(int(x) for x in m.groups()), rel(p, root)))
+    return pins
+
+
+def _real_calls(regex, decl_regex, text: str):
+    """Match objects for `regex` whose line is not a declaration or a
+    proc-address lookup."""
+    for m in regex.finditer(text):
+        ls = text.rfind("\n", 0, m.start()) + 1
+        le = text.find("\n", m.start())
+        line = text[ls:le if le >= 0 else len(text)]
+        if decl_regex is not None and decl_regex.search(line):
+            continue
+        if "GetInstanceProcAddr" in line:
+            continue
+        yield m
+
+
+# The enumerate is usually called through a function pointer whose name says
+# nothing (g_pfnEnumModes). Learn those names from the proc-address lookup.
+TABLE_ENUM_PROC_RE = re.compile(r'"xrEnumerateDisplayRenderingModesDXR"([^;]{0,240})')
+# Filling enumerate output: only an enumerate fills XrDisplayRenderingModeInfoDXR.
+TABLE_ENUM_BODY_RE = re.compile(r"\bXR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR\b")
+
+
+def _enum_pfn_names(leg_files) -> set:
+    names = set()
+    for _, text in leg_files:
+        for m in TABLE_ENUM_PROC_RE.finditer(text):
+            refs = re.findall(r"&\s*([\w.]+(?:->\w+)*)", m.group(1))
+            if refs:
+                names.add(re.split(r"\.|->", refs[-1])[-1])
+    return names
+
+
+def _enum_call_regex(pfn_names: set):
+    if not pfn_names:
+        return TABLE_ENUM_CALL_RE
+    alt = "|".join(re.escape(n) for n in sorted(pfn_names))
+    return re.compile(TABLE_ENUM_CALL_RE.pattern + r"|\b(?:" + alt + r")\s*\(\s*[\w&*(]")
+
+
+def _enumerating_functions(text: str, call_re) -> set:
+    """Names of the functions in `text` whose body calls the table enumerate or
+    fills its output (EnumerateRenderingModes(app) in the #2875 apps)."""
+    names = set()
+    hits = [m.start() for m in _real_calls(call_re, TABLE_ENUM_DECL_RE, text)]
+    hits += [m.start() for m in TABLE_ENUM_BODY_RE.finditer(text)]
+    if not hits:
+        return names
+    pairs = _brace_pairs(text)
+    for pos in hits:
+        fn = _enclosing_function(text, pairs, pos)
+        if fn and fn[3] and fn[3] != "<lambda>":
+            names.add(fn[3])
+    return names
+
+
+def _region_rereads(region: str, enum_fns: set, call_re) -> bool:
+    if any(True for _ in _real_calls(call_re, TABLE_ENUM_DECL_RE, region)):
+        return True
+    if TABLE_REFRESH_RE.search(region):
+        return True
+    return any(re.search(r"\b" + re.escape(n) + r"\s*\(", region) for n in enum_fns)
+
+
+def check_live_mode_table(root: Path, findings: list):
+    """INV-2.10 (rule A) and INV-4.2 (rule B), per leg (LEG_DIRS).
+
+    INV-2.10 — a leg that reads the rendering-mode table must handle
+    XrEventDataRenderingModeTableChangedDXR and re-read the table on it.
+      * ERROR when the leg never mentions the event (type constant, struct or
+        displayxr-common's DecodeRenderingModeTableChanged) and does not drain
+        events through displayxr-common's PollEvents(): it read the table once
+        and will render the start-up layout forever (#2875: one eye in every
+        tile after "Same as 2D" -> Anaglyph). The absence is certain, so this
+        is an error.
+      * WARN when it mentions the event but no handler region re-reads: no
+        enumerate call, no ModeTable::refresh(), and no call of a function that
+        itself enumerates. Heuristic (handler region = _inv49_handler_region),
+        hence advisory.
+
+    INV-4.2 — a leg that reads the table and creates its projection swapchain
+    (it submits a projection layer and calls xrCreateSwapchain) must size from
+    XrDisplayRenderingWorstCaseDXR, or create it through displayxr-common's
+    CreateSwapchain(XrSessionManager&, ...). WARN: a text match cannot see which
+    xrCreateSwapchain is the projection one, nor whether the struct it names
+    actually feeds the size; and an app that sizes from the table still runs
+    (the runtime resamples an overflowing view), it is just wrong on a larger
+    screen or 3D mode.
+    """
+    pins = common_pins(root)
+
+    legs: dict = {}
+    for path in iter_source_files(root):
+        try:
+            text = strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        legs.setdefault(leg_of(path, root), []).append((path, text))
+
+    for leg in sorted(legs):
+        leg_files = legs[leg]
+        read_loc = None
+        for path, text in leg_files:
+            m = TABLE_READ_RE.search(text)
+            if m:
+                read_loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
+                break
+        if read_loc is None:
+            continue
+        where = f"Leg '{leg}'" if leg else "App"
+        pin = pins.get(leg, pins.get(""))
+        common_ok = pin is None or pin[0] >= COMMON_MIN_VERSION
+        defines_poll = any(COMMON_POLL_DEF_RE.search(t) for _, t in leg_files)
+        uses_common_poll = (not defines_poll) and any(COMMON_POLL_CALL_RE.search(t) for _, t in leg_files)
+        defines_cs = any(COMMON_SWAPCHAIN_DEF_RE.search(t) for _, t in leg_files)
+        uses_common_cs = (not defines_cs) and any(
+            "XrSessionManager" in t for _, t in leg_files) and any(
+            COMMON_SWAPCHAIN_CALL_RE.search(t) for _, t in leg_files)
+        old_pin_note = ""
+        if pin is not None and not common_ok and (uses_common_poll or uses_common_cs):
+            old_pin_note = (f" ({pin[1]} pins displayxr-common v{'.'.join(map(str, pin[0]))}; "
+                            "its session code follows the event and sizes at the worst case only "
+                            "from v2.37.0)")
+
+        # ---- rule A: INV-2.10 ----
+        mentions = []  # (path, lines, idx)
+        for path, text in leg_files:
+            lines = text.splitlines()
+            for m in TABLE_EVENT_RE.finditer(text):
+                idx = text.count("\n", 0, m.start())
+                if _is_declaration_line(lines[idx]):
+                    continue
+                mentions.append((path, lines, idx))
+        handled_by_common = uses_common_poll and common_ok
+        if not mentions and not handled_by_common:
+            p, ln = read_loc
+            findings.append(Finding(
+                ERROR, "INV-2.10", p, ln,
+                f"{where} reads the rendering-mode table but never handles "
+                "XrEventDataRenderingModeTableChangedDXR — it reads the table once, so a live "
+                "3D-mode change (ADR-066) leaves it rendering the start-up layout (view count, "
+                f"tiles, scale){old_pin_note}.",
+                "In your xrPollEvent loop, on XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR "
+                "(XR_DXR_display_info v27) re-run the same xrEnumerateDisplayRenderingModesDXR read "
+                "you do at start-up, adopt the event's activeModeIndex and retile. Do NOT recreate "
+                "the swapchain (INV-4.9). Or drain events through displayxr-common >= v2.37.0 "
+                "PollEvents(), which does this. Reference: EnumerateRenderingModes() in "
+                "test_apps/handle/cube_handle_metal_macos/main.mm.",
+            ))
+        elif mentions and not handled_by_common:
+            call_re = _enum_call_regex(_enum_pfn_names(leg_files))
+            enum_fns = set()
+            for _, t in leg_files:
+                enum_fns |= _enumerating_functions(t, call_re)
+            rereads = False
+            for path, lines, idx in mentions:
+                start, end = _inv49_handler_region(lines, idx)
+                if _region_rereads("\n".join(lines[start:end]), enum_fns, call_re):
+                    rereads = True
+                    break
+            if not rereads:
+                path, _, idx = mentions[0]
+                findings.append(Finding(
+                    WARN, "INV-2.10", rel(path, root), idx + 1,
+                    f"{where} handles XrEventDataRenderingModeTableChangedDXR but its handler does "
+                    "not appear to re-read the rendering-mode table.",
+                    "Call xrEnumerateDisplayRenderingModesDXR (or the function that does your "
+                    "start-up read, or dxr::ModeTable::refresh) from the handler, then adopt the "
+                    "event's activeModeIndex and retile. The active index is unchanged by this "
+                    "event; the per-mode view count, tiles and scale are what moved.",
+                ))
+
+        # ---- rule B: INV-4.2 ----
+        if any(WORST_CASE_RE.search(t) for _, t in leg_files):
+            continue
+        if uses_common_cs and common_ok:
+            continue
+        if not any(SUBMITS_PROJECTION.search(t) for _, t in leg_files):
+            continue
+        create_loc = None
+        for path, text in sorted(leg_files, key=lambda pt: not TABLE_READ_RE.search(pt[1])):
+            m = CREATES_SWAPCHAIN.search(text)
+            if m:
+                create_loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
+                break
+        if create_loc is None and uses_common_cs:
+            create_loc = read_loc
+        if create_loc is None:
+            continue
+        p, ln = create_loc
+        findings.append(Finding(
+            WARN, "INV-4.2", p, ln,
+            f"{where} reads the rendering-mode table but does not size its projection swapchain "
+            "from XrDisplayRenderingWorstCaseDXR — a swapchain sized from the start-up table is "
+            "too small once the 3D mode or the window's screen changes (ADR-066, ADR-047 "
+            f"Amendment 10), and it is never recreated{old_pin_note}.",
+            "Chain XrDisplayRenderingWorstCaseDXR (XR_DXR_display_info v28) on XrSystemProperties "
+            "at xrGetSystemProperties and allocate max(maxAtlasWidthPixels, your mode loop) x "
+            "max(maxAtlasHeightPixels, your mode loop) (layered/array swapchains: the "
+            "maxView* fields); keep the mode loop as the fallback when the struct comes back zero "
+            "(older runtime). Allocate once, never recreate. Or create it through "
+            "displayxr-common >= v2.37.0 CreateSwapchain(xr, arraySize), which does this "
+            "(dxr::SizeFromWorstCase).",
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -1510,11 +1845,29 @@ def print_findings(findings: list, root: Path) -> None:
         print(f"      fix: {f.fix}")
 
 
+def lint_app(root: Path) -> list:
+    """Every check, deduplicated. `root` is the app's source directory."""
+    findings: list = []
+    scan_sources(root, findings)
+    scan_manifests(root, findings)
+    check_mcp_pairing(root, findings)
+    check_mcp_desktop_control(root, findings)
+    check_manual_tracking_event(root, findings)
+    check_mode_switch_easing(root, findings)
+    check_views_change_realloc(root, findings)
+    check_live_mode_table(root, findings)
+    check_vk_frame_discipline(root, findings)
+    check_android(root, findings)
+    return dedupe(findings)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Lint a DisplayXR app against the authoring invariants.")
     ap.add_argument("app_dir", nargs="?", help="App source directory to check.")
     ap.add_argument("--strict", action="store_true", help="Treat warnings as failures.")
     ap.add_argument("--list-rules", action="store_true", help="Print the rule catalog and exit.")
+    ap.add_argument("--rules", metavar="ID[,ID...]",
+                    help="Report only these rule ids (e.g. INV-2.10,INV-4.2); the exit code follows them.")
     args = ap.parse_args(argv)
 
     if args.list_rules:
@@ -1530,17 +1883,14 @@ def main(argv=None) -> int:
         print(f"error: {root} is not a directory", file=sys.stderr)
         return 2
 
-    findings: list = []
-    scan_sources(root, findings)
-    scan_manifests(root, findings)
-    check_mcp_pairing(root, findings)
-    check_mcp_desktop_control(root, findings)
-    check_manual_tracking_event(root, findings)
-    check_mode_switch_easing(root, findings)
-    check_views_change_realloc(root, findings)
-    check_vk_frame_discipline(root, findings)
-    check_android(root, findings)
-    findings = dedupe(findings)
+    findings = lint_app(root)
+    if args.rules:
+        wanted = {r.strip() for r in args.rules.split(",") if r.strip()}
+        unknown = sorted(wanted - set(RULES))
+        if unknown:
+            print(f"error: unknown rule id(s): {', '.join(unknown)} (see --list-rules)", file=sys.stderr)
+            return 2
+        findings = [f for f in findings if f.rule in wanted]
     print_findings(findings, root)
 
     n_err = sum(1 for f in findings if f.level == ERROR)

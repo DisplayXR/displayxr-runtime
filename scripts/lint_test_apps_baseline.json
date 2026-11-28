@@ -1,0 +1,9 @@
+{
+  "_comment": "Known findings of the gated app-linter rules on test_apps/ (scripts/lint_test_apps.py). Fix the app, then remove its entry; never add one to land a new app.",
+  "rules": [
+    "INV-2.10",
+    "INV-4.2",
+    "INV-4.9"
+  ],
+  "known": []
+}
