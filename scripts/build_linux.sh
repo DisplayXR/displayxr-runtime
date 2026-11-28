@@ -95,6 +95,13 @@
 #                                        # (handle, XR_DXR_xlib_window_binding,
 #                                        # Phase 3); running them needs a GPU + X
 #                                        # server
+#   ./scripts/build_linux.sh --bundled-cjson  # compile the bundled cJSON in
+#                                        # (hidden symbols) instead of linking
+#                                        # the system libcjson.so.1, which the
+#                                        # SteamOS base image and the Steam
+#                                        # Runtime do not have. The tarball is
+#                                        # built with it; the .deb is not (it
+#                                        # declares libcjson as a Depends).
 
 set -euo pipefail
 
@@ -110,6 +117,7 @@ RUN_TEST=ON
 BUILD_APPS=OFF
 CLEAN=OFF
 QWERTY=ON
+CJSON_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --service) SERVICE_MODE=ON ;;
@@ -119,6 +127,7 @@ for arg in "$@"; do
     --clean) CLEAN=ON ;;
     --qwerty) QWERTY=ON ;;
     --no-qwerty) QWERTY=OFF ;;
+    --bundled-cjson) CJSON_ARGS=(-DXRT_HAVE_SYSTEM_CJSON=OFF) ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -169,7 +178,8 @@ cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DXRT_BUILD_DRIVER_QWERTY=$QWERTY \
   -DXRT_FEATURE_DEBUG_GUI=OFF \
   -DXRT_FEATURE_WINDOW_PEEK=OFF \
-  -DXRT_HAVE_SDL2=OFF
+  -DXRT_HAVE_SDL2=OFF \
+  ${CJSON_ARGS[@]+"${CJSON_ARGS[@]}"}
 
 echo "=== Building runtime + displayxr-cli + sim_display plug-in ==="
 cmake --build "$BUILD_DIR"
